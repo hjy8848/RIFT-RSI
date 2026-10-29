@@ -9,6 +9,7 @@ import pytest
 from rift.runtime.config import load_production_config
 from rift.runtime.evaluator import ProductionProbeEvaluator, VerlAgentLoopBatch
 from rift.runtime.resources import ExclusivePolicyResources
+from rift.runtime.ascend_910b3 import _check_ray_socket_path
 from rift.schemas import Checkpoint, Outcome
 
 
@@ -18,6 +19,12 @@ def _config_kwargs():
         "verl_path": "configs/verl/fsdp2_vllm.yaml",
         "ascend_path": "configs/verl/ascend_910b3.yaml",
     }
+
+
+def test_ray_socket_path_guard_accepts_short_dir_and_rejects_long_dir():
+    assert _check_ray_socket_path("/tmp/r12345678") < 107
+    with pytest.raises(RuntimeError, match="AF_UNIX limit is 107"):
+        _check_ray_socket_path("/tmp/" + "x" * 100)
 
 
 def test_production_config_pins_complete_grpo_and_measured_overlay(monkeypatch):

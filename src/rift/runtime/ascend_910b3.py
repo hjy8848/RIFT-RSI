@@ -10,11 +10,28 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import tempfile
 import time
 
 
 WORLD_SIZE = 8
 VERL_COMMIT = "1876b06d0a3e4e71e06230be10af14492ca8a75b"
+RAY_AF_UNIX_PATH_LIMIT = 107
+
+
+def _check_ray_socket_path(ray_dir):
+    """Fail before Ray starts if its worst-case UNIX socket path is too long."""
+    # Match Ray's session_<timestamp>_<pid>/sockets/plasma_store naming, using
+    # ten digits for both microseconds and the largest practical PID width.
+    session = "session_9999-99-99_99-99-99_999999_9999999999"
+    path = Path(ray_dir) / session / "sockets" / "plasma_store"
+    size = len(os.fsencode(path))
+    if size > RAY_AF_UNIX_PATH_LIMIT:
+        raise RuntimeError(
+            f"Ray socket path would be {size} bytes; "
+            f"AF_UNIX limit is {RAY_AF_UNIX_PATH_LIMIT}: {path}"
+        )
+    return size
 
 
 def _resolve(value):
@@ -173,10 +190,10 @@ def _start_ray(config, run_root, *, worker_manifest_path=None, checkpoint=None):
     if resources != {"NPU": WORLD_SIZE}:
         raise RuntimeError(f"VERL selected an unexpected Ascend Ray resource map: {resources}")
     # Ray appends a timestamped session directory and Unix socket names here.
-    # The persistent run root may already be long enough to exceed AF_UNIX's
-    # 107-byte path limit, so keep Ray's ephemeral session files under /tmp.
-    ray_dir = Path("/tmp") / f"rift-ray-{os.getuid()}-{os.getpid()}"
-    ray_dir.mkdir(parents=True, exist_ok=False)
+    # Generate a short unique path and verify the worst-case socket before
+    # Ray starts, so a long persistent run root can never trigger this failure.
+    ray_dir = Path(tempfile.mkdtemp(prefix="r", dir="/tmp"))
+    _check_ray_socket_path(ray_dir)
     from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
     from omegaconf import OmegaConf
     runtime_env = get_ppo_ray_runtime_env(config)
@@ -298,6 +315,7 @@ class Ascend910B3RoleRuntime:
 
     def _construct_workers(self):
         import torch_npu  # noqa: F401 - registers the VERL Ascend platform.
+        import ray
         from verl.single_controller.ray.base import (
             RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager,
             create_colocated_worker_cls,
@@ -311,7 +329,7 @@ class Ascend910B3RoleRuntime:
             mapping={role_enum: "global_pool"}, max_colocate_count=1)
         self.resource_pool_manager.create_resource_pool()
         class_dict = {str(role_enum): RayClassWithInitArgs(
-            cls=ActorRolloutRefWorker,
+            cls=ray.remote(ActorRolloutRefWorker),
             config=self.config.actor_rollout_ref,
             distillation_config=self.config.get("distillation"),
             role=str(role_enum))}
