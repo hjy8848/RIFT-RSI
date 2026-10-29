@@ -86,6 +86,22 @@ class VerlServingAttestor:
         row = self._read(checkpoint)
         return self._active == checkpoint and row is not None and row.get('global_steps') == checkpoint_step(checkpoint)
 
+    def adopt_verified(self, checkpoint):
+        """Adopt the durable sync receipt inside an AgentLoop Ray worker.
+
+        The VERL AgentLoop runs in a separate Ray process from the host that
+        performed CheckpointEngineManager.update_weights(). The receipt binds
+        the immutable checkpoint artifact and VERL global step; generation
+        still has to acknowledge that step on every TokenOutput.
+        """
+        row = self._read(checkpoint)
+        if (row is None or not self.checkpoint_store.verify(checkpoint)
+                or row.get('global_steps') != checkpoint_step(checkpoint)
+                or row.get('sync_status') != 'verl_checkpoint_engine_update_weights_returned'):
+            return False
+        self._active = checkpoint
+        return True
+
     def verify_generation(self, checkpoint, fields):
         row = self._read(checkpoint)
         if row is None:

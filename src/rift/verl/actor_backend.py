@@ -158,6 +158,9 @@ class VerlGRPOBackend:
         after = self.checkpoint_store.publish(request.policy_before.policy,
             self.after_revision, request.policy_before.tokenizer, self.output_dir)
         if not self.checkpoint_store.verify(after): raise ValueError('after checkpoint failed verification')
+        record_saved = getattr(self.runtime_verifier, 'record_saved_checkpoint', None)
+        if callable(record_saved) and record_saved(self.role, self.worker_group, after) is not True:
+            raise ValueError('VERL runtime did not attest the checkpoint just saved by its FSDP2 worker')
         if self.checkpoint_manifest_path is not None:
             self.checkpoint_store.save_manifest(self.checkpoint_manifest_path)
         self._metric('checkpoint_verify_seconds', time.perf_counter() - verification_started,

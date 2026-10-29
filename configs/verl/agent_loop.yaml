@@ -2,4 +2,4 @@
   _target_: rift.verl.agent_loop.UsamiServiceAgentLoop
   # The worker-local factory opens trusted stores and Usami dependencies inside
   # the VERL AgentLoopWorker process. No native task object crosses DataProto.
-  rift_host_provider_factory: ???
+  rift_host_provider_factory: rift.runtime.ascend_910b3:service_host_provider_from_config
