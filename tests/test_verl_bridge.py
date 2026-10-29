@@ -2,6 +2,7 @@ import asyncio
 import sys
 import types
 from types import SimpleNamespace
+import numpy as np
 import pytest
 from rift.schemas import Checkpoint, Outcome
 from rift.verl.capture import ContinuousCapture
@@ -76,9 +77,10 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
     monkeypatch.setattr('rift.benchmark.usami.public_episode', lambda episode: SimpleNamespace(outcome=Outcome.SUCCESS))
     sink = Sink()
     class Host:
-        def __init__(self): self.sessions=[]
+        def __init__(self): self.sessions=[]; self.session_ids=[]
         async def open_rollout(self, task_ref, group_id, session_id, tokenizer, *, sampling_seed,
                                customer_seed, rollout_id, expected_checkpoint, group_size):
+            self.session_ids.append(session_id)
             session = Session(rollout_id, group_id, group_size, sampling_seed, customer_seed)
             self.sessions.append(session)
             return session, Checkpoint('service','v1','tok','weights'), Verifier(), sink
@@ -91,7 +93,7 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
             rift_request_id='request-bad', rift_mode='train', rift_group_size=2,
             rift_rollout_id='rollout-bad', rift_sampling_seed=3, rift_customer_seed=4,
             rift_expected_checkpoint={'policy':'service','revision':'v1','tokenizer':'tok','weights_digest':'weights'}))
-    result = asyncio.run(loop.run({}, rift_task_ref='opaque', uid='group', session_id=0,
+    result = asyncio.run(loop.run({}, rift_task_ref='opaque', uid='group', session_id=np.int64(0),
         rift_request_id='request-good', rift_mode='train', rift_group_size=4,
         rift_rollout_id='rollout-good', rift_sampling_seed=3, rift_customer_seed=4,
         rift_expected_checkpoint={'policy':'service','revision':'v1','tokenizer':'tok','weights_digest':'weights'}))
@@ -99,6 +101,7 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
     assert result.response_ids == [2, 3, 7, 4] and result.response_mask == [1, 1, 0, 1]
     assert result.reward_score == 1 and sink.decisions[1].tokens.prompt == (1, 2, 3, 7)
     assert host.sessions[-1].expected_group_size == 4
+    assert host.session_ids[-1] == 0 and type(host.session_ids[-1]) is int
     monkeypatch.delattr(extension, 'UsamiServiceAgentLoop', raising=False)
 
 def test_checkpoint_store_checks_all_rank_files_and_weights(tmp_path, monkeypatch):

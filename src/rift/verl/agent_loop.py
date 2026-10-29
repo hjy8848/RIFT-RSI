@@ -43,6 +43,8 @@ def __getattr__(name):
             if mode not in ('train', 'probe') or not isinstance(request_id, str) or not request_id:
                 raise ValueError('explicit request identity and train/probe mode required')
             session_id = kwargs.get('session_id')
+            if hasattr(session_id, 'item'):
+                session_id = session_id.item()
             if type(session_id) is not int or session_id < 0:
                 raise ValueError('VERL sample session_id is required')
             if mode == 'train':
