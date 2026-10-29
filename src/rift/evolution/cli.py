@@ -27,6 +27,7 @@ class EvolutionRunRuntime:
     bank_manifest_path: str | Path | None = None
     independent_test_runner: object | None = None
     test_every: int = 0
+    ability_registry_path: str | Path | None = None
 
     def __post_init__(self):
         if not isinstance(self.scheduler, EvolutionScheduler):
@@ -67,6 +68,7 @@ def execute(runtime: EvolutionRunRuntime):
         bank_updater=runtime.bank_updater,
         rounds=runtime.rounds,
         bank_manifest_path=runtime.bank_manifest_path,
+        ability_registry_path=runtime.ability_registry_path,
         independent_test_runner=runtime.independent_test_runner,
         test_every=runtime.test_every)
 

@@ -451,6 +451,24 @@ def test_designer_on_policy_capture_precedes_delayed_reward(tmp_path):
     assert store.verify_designer_action(pending.trace.tokens, cp, 'package', pending.rollout_id, 'group')
     assert not store.verify_designer_action(pending.trace.tokens, cp, 'package', pending.rollout_id, 'forged-group')
     assert not store.verify_designer_action(pending.trace.tokens, cp, 'other', pending.rollout_id, 'group')
+    from rift.abilities.records import AbilityPrompt
+    async def encode_target(summaries, *, target_ability_description):
+        assert target_ability_description == 'refund status lookup'
+        return [1, 2]
+    targeted_sampler = DesignerSampler(FakeServer(), encode_target, parse, verifier,
+        store, serialization='fixture')
+    targeted = asyncio.run(targeted_sampler.sample(
+        [PublicSummary((PublicEvent('user','request'),), Outcome.FAILURE)], cp,
+        'package-targeted', {'temperature':1.0},
+        target_ability=AbilityPrompt('A000001', 'refund status lookup')))
+    assert targeted.target_ability_id == 'A000001'
+    assert store.load_pending(targeted.rollout_id) == targeted
+    assert store.verify_designer_action(targeted.trace.tokens, cp,
+        'package-targeted', targeted.rollout_id, None, 'A000001')
+    assert not store.verify_designer_action(targeted.trace.tokens, cp,
+        'package-targeted', targeted.rollout_id, None, 'A000002')
+    assert store.verify_designer_hypothesis(targeted.rollout_id, 'hypothesis')
+    assert not store.verify_designer_hypothesis(targeted.rollout_id, 'forged hypothesis')
     from test_core import TRAIN, REPLAY, Scorer, Store, Verifier, completed, demo
     from rift.replay.bank import ReplayBank
     from rift.replay.splits import SplitRegistry

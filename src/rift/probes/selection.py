@@ -1,6 +1,7 @@
-"""Seeded random selection and freezing of independent before-update probes."""
+"""Seeded, ability-prioritized Recovery and random Retention Probe freezing."""
 from hashlib import sha256
 import random
+from dataclasses import replace
 
 from rift.banks.records import CapabilityState, EvidenceLevel, TaskEvidenceRecord
 from rift.schemas import DataPurpose
@@ -23,7 +24,8 @@ class ProbeSelector:
     def freeze(self, *, recovery_candidates, retention_candidates,
                diagnosis_identities, train_package_identities, split_registry,
                before_checkpoint, recovery_tasks, retention_tasks, seed,
-               protocol_ref, protocol_digest, frozen_at_ns=0):
+               protocol_ref, protocol_digest, frozen_at_ns=0,
+               target_ability_id=None, ability_task_refs=()):
         if type(seed) is not int or seed < 0:
             raise ValueError("non-negative integer sampling seed required")
         if type(recovery_tasks) is not int or recovery_tasks < 1 or type(retention_tasks) is not int or retention_tasks < 1:
@@ -36,22 +38,41 @@ class ProbeSelector:
         retention, retention_reasons = self._eligible(retention_candidates,
             DataPurpose.RETENTION_FEEDBACK, before_checkpoint, protocol_digest,
             split_registry, train_package_identities, tuple(diagnosis_identities) + tuple(r.identity for r in recovery))
+        if target_ability_id is not None and not target_ability_id:
+            raise ValueError("non-empty target ability ID required")
+        ability_task_refs = frozenset(ability_task_refs)
+        if ability_task_refs and target_ability_id is None:
+            raise ValueError("ability-linked failure tasks require a target ability ID")
         rng = random.Random(seed)
-        recovery_chosen = rng.sample(sorted(recovery, key=lambda r: r.task_ref), min(recovery_tasks, len(recovery)))
-        retention_chosen = rng.sample(sorted(retention, key=lambda r: r.task_ref), min(retention_tasks, len(retention)))
+        priority_candidates = [row for row in recovery if row.task_ref in ability_task_refs]
+        fallback_candidates = [row for row in recovery if row.task_ref not in ability_task_refs]
+        chosen_priority = rng.sample(sorted(priority_candidates, key=lambda r: r.task_ref),
+                                     min(recovery_tasks, len(priority_candidates)))
+        remaining = recovery_tasks - len(chosen_priority)
+        chosen_fallback = rng.sample(sorted(fallback_candidates, key=lambda r: r.task_ref),
+                                     min(remaining, len(fallback_candidates)))
+        recovery_chosen = chosen_priority + chosen_fallback
+        rng.shuffle(recovery_chosen)
+        # Retention is sampled independently so target-ability prioritization
+        # cannot change which preserved capabilities are tested.
+        retention_rng = random.Random(seed ^ 0x5EED5EED)
+        retention_chosen = retention_rng.sample(sorted(retention, key=lambda r: r.task_ref),
+                                                min(retention_tasks, len(retention)))
         if len(recovery_chosen) != recovery_tasks or len(retention_chosen) != retention_tasks:
             raise ValueError("insufficient eligible independent candidates for frozen Probe snapshots")
         recovery_probes = tuple(self._as_probe(row, protocol_ref, protocol_digest) for row in recovery_chosen)
         retention_probes = tuple(self._as_probe(row, protocol_ref, protocol_digest) for row in retention_chosen)
+        priority_refs = tuple(row.task_ref for row in chosen_priority)
         recovery_id = self._snapshot_id("recovery", seed, recovery_probes, protocol_digest,
-                                        split_registry.policy_version)
+                                        split_registry.policy_version, target_ability_id, priority_refs)
         retention_id = self._snapshot_id("retention", seed, retention_probes, protocol_digest,
                                          split_registry.policy_version)
         recovery_snapshot = ProbeSnapshot.create(snapshot_id=recovery_id,
             purpose=DataPurpose.RECOVERY_FEEDBACK, probes=recovery_probes, random_seed=seed,
             split_policy_version=split_registry.policy_version, baseline_checkpoint=before_checkpoint,
             protocol_digest=protocol_digest, candidate_count=len(recovery),
-            exclusions=tuple(sorted(recovery_reasons.items())), frozen_at_ns=frozen_at_ns)
+            exclusions=tuple(sorted(recovery_reasons.items())), frozen_at_ns=frozen_at_ns,
+            target_ability_id=target_ability_id, priority_task_refs=priority_refs)
         retention_snapshot = ProbeSnapshot.create(snapshot_id=retention_id,
             purpose=DataPurpose.RETENTION_FEEDBACK, probes=retention_probes, random_seed=seed,
             split_policy_version=split_registry.policy_version, baseline_checkpoint=before_checkpoint,
@@ -97,13 +118,20 @@ class ProbeSelector:
 
     @staticmethod
     def _as_probe(record, protocol_ref, protocol_digest):
+        # Hidden Recovery/Retention observations may be retained Host-side to
+        # support ability attribution. Frozen evaluation snapshots contain no
+        # Designer-visible summaries.
+        trials = tuple(replace(trial, public_summary=None) for trial in record.trials)
         return TaskProbe(record.task_ref, record.identity, record.purpose,
-            record.checkpoint, record.trials, protocol_ref, protocol_digest)
+            record.checkpoint, trials, protocol_ref, protocol_digest)
 
     @staticmethod
-    def _snapshot_id(label, seed, probes, protocol_digest, policy):
-        raw = "|".join((label, str(seed), protocol_digest, policy,
-                         *(p.task_ref for p in probes)))
+    def _snapshot_id(label, seed, probes, protocol_digest, policy,
+                     target_ability_id=None, priority_task_refs=()):
+        parts = (label, str(seed), protocol_digest, policy)
+        if target_ability_id is not None or priority_task_refs:
+            parts += (target_ability_id or "", *priority_task_refs)
+        raw = "|".join(parts + tuple(p.task_ref for p in probes))
         return sha256(raw.encode("utf-8")).hexdigest()[:24]
 
     @staticmethod

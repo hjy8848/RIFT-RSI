@@ -61,12 +61,16 @@ class TaskProbe:
 
 
 def _snapshot_payload(snapshot):
-    return {"snapshot_id": snapshot.snapshot_id, "purpose": snapshot.purpose.value,
+    payload = {"snapshot_id": snapshot.snapshot_id, "purpose": snapshot.purpose.value,
         "probes": [asdict(p) for p in snapshot.probes], "random_seed": snapshot.random_seed,
         "split_policy_version": snapshot.split_policy_version,
         "baseline_checkpoint": asdict(snapshot.baseline_checkpoint),
         "protocol_digest": snapshot.protocol_digest, "candidate_count": snapshot.candidate_count,
         "exclusions": snapshot.exclusions}
+    if snapshot.target_ability_id is not None or snapshot.priority_task_refs:
+        payload["target_ability_id"] = snapshot.target_ability_id
+        payload["priority_task_refs"] = snapshot.priority_task_refs
+    return payload
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,8 @@ class ProbeSnapshot:
     exclusions: tuple[tuple[str, int], ...]
     frozen_at_ns: int
     content_digest: str
+    target_ability_id: str | None = None
+    priority_task_refs: tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.purpose not in (DataPurpose.RECOVERY_FEEDBACK, DataPurpose.RETENTION_FEEDBACK):
@@ -96,6 +102,13 @@ class ProbeSnapshot:
             raise ValueError("probe snapshot contains a mismatched baseline")
         if len({p.task_ref for p in self.probes}) != len(self.probes):
             raise ValueError("duplicate probe task")
+        if ((self.target_ability_id is None and self.priority_task_refs)
+                or (self.target_ability_id is not None and not self.target_ability_id)
+                or (self.purpose is DataPurpose.RETENTION_FEEDBACK
+                    and (self.target_ability_id is not None or self.priority_task_refs))
+                or len(set(self.priority_task_refs)) != len(self.priority_task_refs)
+                or not set(self.priority_task_refs).issubset({p.task_ref for p in self.probes})):
+            raise ValueError("Recovery ability priority metadata must bind selected Probe tasks")
         expected = sha256(_canonical(_snapshot_payload(self)).encode("utf-8")).hexdigest()
         if self.content_digest != expected:
             raise ValueError("probe snapshot digest mismatch")
@@ -103,13 +116,16 @@ class ProbeSnapshot:
     @classmethod
     def create(cls, *, snapshot_id, purpose, probes, random_seed,
                split_policy_version, baseline_checkpoint, protocol_digest,
-               candidate_count, exclusions=(), frozen_at_ns=0):
+               candidate_count, exclusions=(), frozen_at_ns=0,
+               target_ability_id=None, priority_task_refs=()):
         provisional = cls.__new__(cls)
         values = dict(snapshot_id=snapshot_id, purpose=purpose, probes=tuple(probes),
             random_seed=random_seed, split_policy_version=split_policy_version,
             baseline_checkpoint=baseline_checkpoint, protocol_digest=protocol_digest,
             candidate_count=candidate_count, exclusions=tuple(exclusions),
-            frozen_at_ns=frozen_at_ns, content_digest="")
+            frozen_at_ns=frozen_at_ns, content_digest="",
+            target_ability_id=target_ability_id,
+            priority_task_refs=tuple(priority_task_refs))
         for key, value in values.items(): object.__setattr__(provisional, key, value)
         digest = sha256(_canonical(_snapshot_payload(provisional)).encode("utf-8")).hexdigest()
         values["content_digest"] = digest
@@ -117,6 +133,14 @@ class ProbeSnapshot:
 
     def verify(self):
         return sha256(_canonical(_snapshot_payload(self)).encode("utf-8")).hexdigest() == self.content_digest
+
+    @property
+    def target_ability_task_count(self):
+        return len(self.priority_task_refs)
+
+    @property
+    def random_fallback_task_count(self):
+        return len(self.probes) - self.target_ability_task_count
 
 
 @dataclass(frozen=True)

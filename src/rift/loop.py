@@ -44,9 +44,11 @@ class PendingDesignerAction:
     rollout_id: str
     tokens: Tokens
     group_id: str | None = None
+    target_ability_id: str | None = None
 
     def __post_init__(self):
-        if not self.rollout_id or not isinstance(self.tokens, Tokens):
+        if (not self.rollout_id or not isinstance(self.tokens, Tokens)
+                or (self.target_ability_id is not None and not self.target_ability_id)):
             raise ValueError('captured on-policy Designer action required')
 
 
@@ -55,6 +57,8 @@ class LoopState:
     package_id: str
     proposal_ids: tuple[str, ...]
     stage: Stage = Stage.PROPOSED
+    target_ability_id: str | None = None
+    round_index: int = 0
     task_refs: tuple[str, ...] = ()
     service_request: UpdateRequest | None = None
     service_update: CompletedUpdate | None = None
@@ -79,12 +83,19 @@ class LoopState:
     def __post_init__(self):
         if not self.package_id or not self.proposal_ids or len(set(self.proposal_ids)) != len(self.proposal_ids):
             raise ValueError('distinct proposals and package required')
+        if ((self.target_ability_id is not None and not self.target_ability_id)
+                or type(self.round_index) is not int or self.round_index < 0):
+            raise ValueError('valid target ability ID and non-negative round index required')
         if self.protocol_version != 2:
             raise ValueError('unsupported LoopState protocol version')
         if self.reward_mode not in (RewardMode.REPLAY_LOGP_V1.value, RewardMode.DUAL_BANK_OUTCOME_V1.value):
             raise ValueError('unknown Designer reward mode')
         if self.designer_action is not None and not isinstance(self.designer_action, PendingDesignerAction):
             raise ValueError('invalid pending Designer action')
+        if (self.designer_action is not None
+                and self.designer_action.target_ability_id is not None
+                and self.target_ability_id != self.designer_action.target_ability_id):
+            raise ValueError('Designer prompt target differs from the round target ability')
         if (self.expected_service is None) != (self.expected_designer is None):
             raise ValueError('both prior policy checkpoints are required')
         if self.expected_service is None and self.previous_updates:
@@ -193,7 +204,11 @@ class LoopState:
             own = [r for r in self.designer_request.rollouts if r.task_id == self.package_id]
             if (len(own) != 1 or any(r.reward_ref != self.service_update.run_id
                     or not r.response_id or r.reward_source != expected
-                    or r.reward != reward_scalar(reward) for r in own)):
+                    or r.reward != reward_scalar(reward)
+                    or (self.reward_mode == RewardMode.DUAL_BANK_OUTCOME_V1.value
+                        and (r.target_ability_id != self.target_ability_id
+                             or r.prompt_ability_id != self.designer_action.target_ability_id))
+                    for r in own)):
                 raise ValueError('Designer credit differs from verified learning reward')
         if self.designer_update and self.designer_update.request != self.designer_request:
             raise ValueError('Designer update differs from request')
@@ -219,6 +234,8 @@ class LoopState:
         if (not isinstance(recovery, ProbeSnapshot) or not isinstance(retention, ProbeSnapshot)
                 or not recovery.verify() or not retention.verify()
                 or recovery.baseline_checkpoint != retention.baseline_checkpoint
+                or recovery.target_ability_id != self.target_ability_id
+                or retention.target_ability_id is not None
                 or (self.expected_service is not None and recovery.baseline_checkpoint != self.expected_service)
                 or snapshot_verifier.verify_snapshot(recovery) is not True
                 or snapshot_verifier.verify_snapshot(retention) is not True):
@@ -302,6 +319,8 @@ class LoopState:
                     or feedback[0].group_id != self.designer_action.group_id
                     or feedback[0].update != self.service_update
                     or feedback[0].reward != self.learning_reward
+                    or feedback[0].target_ability_id != self.target_ability_id
+                    or feedback[0].prompt_ability_id != self.designer_action.target_ability_id
                     or request.policy_before != self.designer_action.checkpoint):
                 raise ValueError('Designer feedback must credit the captured action that generated this package')
         rebuilt = prepare_designer_update(request.package_id, request.policy_before, feedback,
@@ -328,6 +347,8 @@ class LoopState:
                 or update_verifier.verify_update(self.designer_update) is not True):
             raise ValueError('prior policy update evidence was not verified')
         return LoopState(package_id, tuple(proposal_ids),
+            target_ability_id=None,
+            round_index=self.round_index + 1,
             expected_service=self.service_update.policy_after,
             expected_designer=self.designer_update.policy_after,
             previous_updates=(self.service_update, self.designer_update))
@@ -354,7 +375,9 @@ class LoopState:
             token = value['tokens']
             return Rollout(Tokens(tuple(token['prompt']), tuple(token['response']), tuple(token['mask'])),
                 checkpoint(value['policy']), value['task_id'], value['episode_id'], value['reward'],
-                value['reward_source'], value.get('group_id'), value.get('response_id'), value.get('reward_ref'))
+                value['reward_source'], value.get('group_id'), value.get('response_id'),
+                value.get('reward_ref'), value.get('target_ability_id'),
+                value.get('prompt_ability_id'))
         def request(value):
             if value is None: return None
             return UpdateRequest(checkpoint(value['policy_before']), value['package_id'],
@@ -384,10 +407,12 @@ class LoopState:
         retention_after = _result_set(raw['retention_after']) if dual and raw.get('retention_after') else None
         feedback = tuple(DesignerFeedback(Tokens(tuple(row['tokens']['prompt']),
             tuple(row['tokens']['response']), tuple(row['tokens']['mask'])), update(row['update']),
-            reward(row['reward']), row['designer_rollout_id'], row.get('group_id'))
+            reward(row['reward']), row['designer_rollout_id'], row.get('group_id'),
+            row.get('target_ability_id'), row.get('prompt_ability_id'))
             for row in raw.get('designer_feedback', ()))
         state = cls(package_id=raw['package_id'], proposal_ids=tuple(raw['proposal_ids']),
             stage=Stage(raw['stage']), task_refs=tuple(raw.get('task_refs', ())),
+            target_ability_id=raw.get('target_ability_id'), round_index=raw.get('round_index', 0),
             service_request=request(raw.get('service_request')), service_update=update(raw.get('service_update')),
             replay_reward=reward(raw.get('replay_reward')), designer_request=request(raw.get('designer_request')),
             designer_update=update(raw.get('designer_update')), designer_feedback=feedback,
@@ -402,7 +427,8 @@ class LoopState:
             designer_action=(PendingDesignerAction(checkpoint(raw['designer_action']['checkpoint']),
                 raw['designer_action']['rollout_id'], Tokens(tuple(raw['designer_action']['tokens']['prompt']),
                     tuple(raw['designer_action']['tokens']['response']), tuple(raw['designer_action']['tokens']['mask'])),
-                raw['designer_action'].get('group_id')) if raw.get('designer_action') else None))
+                raw['designer_action'].get('group_id'),
+                raw['designer_action'].get('target_ability_id')) if raw.get('designer_action') else None))
         updates = (state.service_update, state.designer_update, *state.previous_updates,
                    *(item.update for item in state.designer_feedback))
         for item in updates:
@@ -439,9 +465,15 @@ class LoopState:
             if rebuilt != state.designer_request:
                 raise ValueError('persisted Designer batch differs from verified evidence')
         if state.designer_action is not None:
-            if action_verifier is None or action_verifier.verify_designer_action(
-                    state.designer_action.tokens, state.designer_action.checkpoint,
-                    state.package_id, state.designer_action.rollout_id,
-                    state.designer_action.group_id) is not True:
+            if action_verifier is None:
+                raise ValueError('persisted package-generating Designer action was not verified')
+            verify_args = (state.designer_action.tokens, state.designer_action.checkpoint,
+                state.package_id, state.designer_action.rollout_id,
+                state.designer_action.group_id)
+            verified = (action_verifier.verify_designer_action(*verify_args)
+                if state.designer_action.target_ability_id is None else
+                action_verifier.verify_designer_action(*verify_args,
+                    target_ability_id=state.designer_action.target_ability_id))
+            if verified is not True:
                 raise ValueError('persisted package-generating Designer action was not verified')
         return state

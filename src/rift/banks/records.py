@@ -72,8 +72,9 @@ class TaskEvidenceRecord:
         if any(t.task_ref != self.task_ref or t.checkpoint != self.checkpoint
                or t.protocol_digest != self.protocol_digest for t in self.trials):
             raise ValueError("task trials do not share the bound task, checkpoint and protocol")
-        if self.purpose is not DataPurpose.DIAGNOSIS and any(t.public_summary is not None for t in self.trials):
-            raise ValueError("private feedback tasks cannot carry a Designer-visible summary")
+        # PublicSummary is still Host-private in this record. Only
+        # public_projection(DIAGNOSIS) can create a Designer input; Probe
+        # snapshots strip summaries before persistence or evaluation.
         if len({t.trial_id for t in self.trials}) != len(self.trials):
             raise ValueError("duplicate task trial")
         if len({t.seed for t in self.trials}) != len(self.trials):

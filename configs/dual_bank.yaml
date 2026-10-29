@@ -15,11 +15,25 @@ banks:
   failure_threshold: 0.25
   diagnosis_limit: 8
   split_policy_version: instance_disjoint_within_family_v1
+ability_registry:
+  enabled: true
+  persistence_file: ability-registry.json
+  hypothesis_role: revisable_non_oracle_gap
+  match_policy: exact_text_then_constrained_semantic
+  ambiguous_or_low_confidence: create_provisional
+  min_match_confidence: 0.8
+  min_match_margin: 0.15
+  min_failure_link_confidence: 0.8
+  recovery_selection: linked_to_target_ability_first_then_random_fallback
+  exclude_all_designer_seen_diagnoses: true
+  embeddings: false
 probes:
-  selection: seeded_random
+  recovery_selection: target_ability_then_seeded_random_fallback
+  retention_selection: seeded_random
   recovery_tasks: 16
   retention_tasks: 16
   trials_per_task: 5
+  additional_ability_probe: false
   freeze_before_service_update: true
   reuse_exact_task_seed_protocol: true
 service:

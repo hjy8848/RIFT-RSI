@@ -61,7 +61,11 @@ class DesignerRolloutVerifier:
         return json.loads(self.capture_store._path(row.episode_id).read_text(encoding='utf-8'))
     def verify_rollout(self, row, checkpoint):
         if row.policy != checkpoint or row.response_id != row.episode_id: return False
-        if not self.capture_store.verify_designer_action(row.tokens, checkpoint, row.task_id, row.episode_id, row.group_id): return False
+        action_args = (row.tokens, checkpoint, row.task_id, row.episode_id, row.group_id)
+        verified_action = (self.capture_store.verify_designer_action(*action_args)
+            if row.prompt_ability_id is None else self.capture_store.verify_designer_action(
+                *action_args, target_ability_id=row.prompt_ability_id))
+        if not verified_action: return False
         try: record = self._record(row)
         except (OSError, ValueError, KeyError): return False
         if not unmodified_sampling(record['request'].get('sampling_params')): return False

@@ -36,7 +36,7 @@ def designer_reward_source(reward, service_update):
         raise ValueError("unsupported dual-bank credit assignment mode")
     return "dualbank:sequential:" + reward.reward_source_digest
 
-def designer_rollout(tokens, designer_checkpoint, package_id, reward, service_update, group_id=None, *, designer_rollout_id, update_verifier, reward_verifier, action_verifier):
+def designer_rollout(tokens, designer_checkpoint, package_id, reward, service_update, group_id=None, *, designer_rollout_id, update_verifier, reward_verifier, action_verifier, target_ability_id=None, prompt_ability_id=None):
     if not isinstance(reward, (ReplayReward, DualBankOutcomeReward)) or not isinstance(service_update, CompletedUpdate):
         raise ValueError("Designer credit requires a completed Service update and tagged reward evidence")
     if update_verifier.verify_update(service_update) is not True:
@@ -47,12 +47,18 @@ def designer_rollout(tokens, designer_checkpoint, package_id, reward, service_up
         raise ValueError("reward and Service update differ")
     if reward_verifier.verify_reward(reward, service_update) is not True:
         raise ValueError("Replay reward evidence was not verified")
-    if action_verifier.verify_designer_action(tokens, designer_checkpoint, package_id, designer_rollout_id, group_id) is not True:
+    action_args = (tokens, designer_checkpoint, package_id, designer_rollout_id, group_id)
+    verified_action = (action_verifier.verify_designer_action(*action_args)
+        if prompt_ability_id is None else action_verifier.verify_designer_action(
+            *action_args, target_ability_id=prompt_ability_id))
+    if verified_action is not True:
         raise ValueError("Designer action evidence was not verified")
     value = reward_scalar(reward)
     if not isfinite(value): raise ValueError("invalid reward")
     source = designer_reward_source(reward, service_update)
-    return Rollout(tokens, designer_checkpoint, package_id, designer_rollout_id, value, source, group_id, designer_rollout_id, service_update.run_id)
+    return Rollout(tokens, designer_checkpoint, package_id, designer_rollout_id,
+        value, source, group_id, designer_rollout_id, service_update.run_id,
+        target_ability_id, prompt_ability_id)
 
 def replay_source(checkpoint, snapshot_digest, normalization):
     identity = json.dumps(asdict(checkpoint), sort_keys=True, separators=(",", ":"))
@@ -87,6 +93,8 @@ class DesignerFeedback:
     reward: ReplayReward | DualBankOutcomeReward
     designer_rollout_id: str
     group_id: str | None = None
+    target_ability_id: str | None = None
+    prompt_ability_id: str | None = None
 
 def prepare_designer_update(batch_id, designer_checkpoint, feedback, *, update_verifier,
     reward_verifier, action_verifier, algorithm=None, credit_assignment_mode=None,
@@ -127,7 +135,9 @@ def prepare_designer_update(batch_id, designer_checkpoint, feedback, *, update_v
     rows = tuple(designer_rollout(item.tokens, designer_checkpoint,
         item.update.request.package_id, item.reward, item.update, item.group_id,
         designer_rollout_id=item.designer_rollout_id, update_verifier=update_verifier,
-        reward_verifier=reward_verifier, action_verifier=action_verifier) for item in feedback)
+        reward_verifier=reward_verifier, action_verifier=action_verifier,
+        target_ability_id=item.target_ability_id,
+        prompt_ability_id=item.prompt_ability_id) for item in feedback)
     comparable_designer_rollouts(rows, algorithm=algorithm,
         credit_assignment_mode=credit_assignment_mode)
     if dual_only:

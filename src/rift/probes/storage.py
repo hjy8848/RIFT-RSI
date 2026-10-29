@@ -36,7 +36,8 @@ def _snapshot(raw):
         raw["split_policy_version"], Checkpoint(**raw["baseline_checkpoint"]),
         raw["protocol_digest"], raw["candidate_count"],
         tuple((row[0], row[1]) for row in raw["exclusions"]),
-        raw["frozen_at_ns"], raw["content_digest"])
+        raw["frozen_at_ns"], raw["content_digest"],
+        raw.get("target_ability_id"), tuple(raw.get("priority_task_refs", ())))
 
 
 def _result_set(raw):

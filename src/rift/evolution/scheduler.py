@@ -1,12 +1,14 @@
 """Multi-round dual-bank scheduler over injected Designer, Usami and VERL runtimes."""
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Callable, Protocol
 
+from rift.abilities.records import AbilityAttributionRecord
+from rift.abilities.registry import AbilityRegistry
 from rift.banks.bootstrap import BootstrapResult, BootstrapRunner, BootstrapTask
-from rift.banks.core import BankManager, JsonTaskEvidenceStore
+from rift.banks.core import BankManager, JsonTaskEvidenceStore, public_projection
 from rift.banks.records import DiagnosisExperience, TaskEvidenceRecord
 from rift.banks.records import CapabilityState
 from rift.loop import LoopState, PendingDesignerAction, Stage
@@ -14,6 +16,7 @@ from rift.probes.records import ProbeSnapshot
 from rift.rewards.learning_value import RewardMode
 from rift.schemas import Checkpoint
 from rift.training.contracts import UpdateRequest
+from rift.training.records import DesignerFeedback
 from rift.verl.coordinator import prepare_dual_bank_round, run_round
 
 
@@ -36,6 +39,8 @@ class EvolutionRoundPlan:
     reward_verifier: object
     action_verifier: object
     designer_checkpoint: Checkpoint
+    target_ability_id: str
+    ability_attribution: AbilityAttributionRecord
     feedback_provider: Callable
     training_identity_resolver: Callable
     designer_batch_id: str
@@ -50,6 +55,15 @@ class EvolutionRoundPlan:
         if (self.state.designer_action.checkpoint != self.designer_checkpoint
                 or self.state.designer_action.group_id is not None
                 or self.state.package_id != self.service_request.package_id
+                or not self.target_ability_id
+                or self.state.target_ability_id != self.target_ability_id
+                or not isinstance(self.ability_attribution, AbilityAttributionRecord)
+                or self.ability_attribution.ability_id != self.target_ability_id
+                or self.ability_attribution.round_index != self.state.round_index
+                or (self.state.designer_action.target_ability_id is not None
+                    and self.state.designer_action.target_ability_id != self.target_ability_id)
+                or self.recovery_snapshot.target_ability_id != self.target_ability_id
+                or self.retention_snapshot.target_ability_id is not None
                 or self.service_request.policy_before != self.recovery_snapshot.baseline_checkpoint
                 or self.recovery_snapshot.baseline_checkpoint != self.retention_snapshot.baseline_checkpoint):
             raise ValueError('round plan package action, request and Probe baselines differ')
@@ -62,7 +76,10 @@ class EvolutionRoundPlan:
 class EvolutionPlanFactory(Protocol):
     def build(self, round_index: int, service_checkpoint: Checkpoint,
               designer_checkpoint: Checkpoint, banks: BankManager,
-              diagnosis: tuple[DiagnosisExperience, ...], previous_state: LoopState | None
+              ability_registry: AbilityRegistry,
+              diagnosis: tuple[DiagnosisExperience, ...],
+              diagnosis_records: tuple[TaskEvidenceRecord, ...],
+              previous_state: LoopState | None
               ) -> EvolutionRoundPlan: ...
 
 
@@ -121,12 +138,34 @@ class EvolutionScheduler:
                 raise ValueError('resumed round differs from the persisted Designer package action')
         else:
             state = plan.state
-            if plan.action_verifier.verify_designer_action(plan.state.designer_action.tokens,
-                    plan.designer_checkpoint, plan.state.package_id,
-                    plan.state.designer_action.rollout_id,
-                    plan.state.designer_action.group_id) is not True:
+            action_args = (plan.state.designer_action.tokens, plan.designer_checkpoint,
+                plan.state.package_id, plan.state.designer_action.rollout_id,
+                plan.state.designer_action.group_id)
+            verified_action = (plan.action_verifier.verify_designer_action(*action_args)
+                if plan.state.designer_action.target_ability_id is None else
+                plan.action_verifier.verify_designer_action(*action_args,
+                    target_ability_id=plan.state.designer_action.target_ability_id))
+            if verified_action is not True:
                 raise ValueError('round plan Designer action evidence failed verification')
             state.save(path)
+        verify_hypothesis = getattr(plan.action_verifier,
+                                    'verify_designer_hypothesis', None)
+        if (not callable(verify_hypothesis)
+                or verify_hypothesis(state.designer_action.rollout_id,
+                                     plan.ability_attribution.hypothesis) is not True):
+            raise ValueError('Ability Registry hypothesis is not bound to captured Designer output')
+
+        def target_bound_feedback(current_state):
+            rows = tuple(plan.feedback_provider(current_state))
+            captured_prompt_target = current_state.designer_action.target_ability_id
+            if any(not isinstance(row, DesignerFeedback)
+                   or row.target_ability_id not in (None, plan.target_ability_id)
+                   or row.prompt_ability_id not in (None, captured_prompt_target)
+                   for row in rows):
+                raise ValueError('Designer feedback target differs from verified round attribution')
+            return tuple(replace(row, target_ability_id=plan.target_ability_id,
+                prompt_ability_id=captured_prompt_target) for row in rows)
+
         if state.stage in (Stage.CERTIFIED, Stage.PROBES_FROZEN, Stage.BASELINE_READY, Stage.READY_FOR_TRAINING):
             state = prepare_dual_bank_round(state,
                 recovery_snapshot=plan.recovery_snapshot,
@@ -140,7 +179,7 @@ class EvolutionScheduler:
             designer_backend=plan.designer_backend, checkpoint_store=plan.checkpoint_store,
             update_verifier=plan.update_verifier, reward_verifier=plan.reward_verifier,
             action_verifier=plan.action_verifier, designer_checkpoint=plan.designer_checkpoint,
-            feedback_provider=plan.feedback_provider, designer_batch_id=plan.designer_batch_id,
+            feedback_provider=target_bound_feedback, designer_batch_id=plan.designer_batch_id,
             designer_algorithm='reinforce_baseline', probe_runner=plan.probe_runner,
             probe_evidence_store=plan.probe_evidence_store, probe_verifier=plan.probe_verifier,
             snapshot_verifier=plan.snapshot_verifier, trial_verifier=plan.trial_verifier,
@@ -153,6 +192,7 @@ class EvolutionScheduler:
     def run(self, *, bootstrap: BootstrapResult, initial_service: Checkpoint,
             initial_designer: Checkpoint, plan_factory: EvolutionPlanFactory,
             bank_updater, rounds, bank_manifest_path=None,
+            ability_registry_path=None,
             independent_test_runner=None, test_every=0):
         if not isinstance(bootstrap, BootstrapResult) or not callable(getattr(plan_factory, 'build', None)):
             raise TypeError('verified BootstrapResult and EvolutionPlanFactory required')
@@ -163,25 +203,55 @@ class EvolutionScheduler:
         banks = bootstrap.bank_manager
         self.state_root.mkdir(parents=True, exist_ok=True)
         banks_path = Path(bank_manifest_path) if bank_manifest_path else self.state_root / 'evolving-banks.json'
+        registry_path = (Path(ability_registry_path) if ability_registry_path
+                         else self.state_root / 'ability-registry.json')
+        ability_registry = (AbilityRegistry.load(registry_path) if registry_path.exists()
+                            else AbilityRegistry())
         banks.save(banks_path)
         service_checkpoint, designer_checkpoint, previous = initial_service, initial_designer, None
         completed = []
         for index in range(rounds):
-            diagnosis = banks.failure_bank.diagnosis_experiences(
+            diagnosis_records = banks.failure_bank.diagnosis_records(
                 limit=self.diagnosis_limit, seed=self.seed + index)
+            diagnosis = tuple(public_projection(row) for row in diagnosis_records)
+            for row in diagnosis_records:
+                ability_registry.mark_diagnosis_seen(row.task_ref, row.identity)
+            # Persist exposure intent before the runtime can start Designer generation.
+            ability_registry.save(registry_path)
             plan = plan_factory.build(index, service_checkpoint, designer_checkpoint,
-                                      banks, diagnosis, previous)
+                                      banks, ability_registry, diagnosis,
+                                      diagnosis_records, previous)
             if not isinstance(plan, EvolutionRoundPlan):
                 raise TypeError('plan factory must return EvolutionRoundPlan')
+            if plan.state.round_index != index:
+                raise ValueError('round plan index does not match scheduler history')
+            if plan.target_ability_id not in {row.ability_id for row in ability_registry.records}:
+                raise ValueError('round target ability was not persisted in the registry')
+            if plan.ability_attribution not in ability_registry.attributions:
+                raise ValueError('round target lacks a persisted Designer hypothesis attribution')
+            if plan.ability_attribution.round_index != index:
+                raise ValueError('Designer hypothesis attribution belongs to another round')
+            priority_refs = ability_registry.failure_task_refs(plan.target_ability_id)
+            if not set(plan.recovery_snapshot.priority_task_refs).issubset(priority_refs):
+                raise ValueError('Recovery priority tasks lack a confident target-ability link')
+            seen_diagnosis = ability_registry.seen_diagnosis_identities
+            for snapshot in (plan.recovery_snapshot, plan.retention_snapshot):
+                if any(probe.identity.overlaps_under(identity, snapshot.split_policy_version)
+                       for probe in snapshot.probes for identity in seen_diagnosis):
+                    raise ValueError('Probe snapshot overlaps a diagnosis task already shown to Designer')
             if plan.state.expected_service != (None if previous is None else service_checkpoint):
                 raise ValueError('round plan does not continue the latest Service checkpoint')
             if plan.state.expected_designer != (None if previous is None else designer_checkpoint):
                 raise ValueError('round plan does not continue the latest Designer checkpoint')
+            ability_registry.save(registry_path)
             state_path = self.state_root / f'round-{index:06d}.json'
             result = self.execute_round(plan, state_path)
             if result.stage is not Stage.DESIGNER_TRAINING_COMPLETED:
                 raise ValueError('round did not complete both verified policy updates')
             bank_updater(result, banks)
+            ability_registry.record_round(result, update_verifier=plan.update_verifier,
+                                          reward_verifier=plan.reward_verifier)
+            ability_registry.save(registry_path)
             banks.save(banks_path)
             completed.append(result)
             service_checkpoint, designer_checkpoint = result.service_update.policy_after, result.designer_update.policy_after

@@ -73,14 +73,18 @@ class FailureBank:
         return tuple(self._rows.values())
 
     def diagnosis_experiences(self, *, limit, seed):
-        rows = [r for r in self.records if r.purpose is DataPurpose.DIAGNOSIS]
+        return tuple(public_projection(row) for row in
+                     self.diagnosis_records(limit=limit, seed=seed))
+
+    def diagnosis_records(self, *, limit, seed):
+        rows = [r for r in self.records if r.purpose is DataPurpose.DIAGNOSIS
+                and r.state(failure_threshold=self.failure_threshold) is CapabilityState.ACTIVE_WEAKNESS]
         if type(limit) is not int or limit < 1 or type(seed) is not int:
             raise ValueError("positive diagnosis limit and integer seed required")
         import random
         rng = random.Random(seed)
         chosen = rng.sample(rows, min(limit, len(rows)))
-        # Projection is the only model-facing representation.
-        return tuple(public_projection(row) for row in chosen)
+        return tuple(chosen)
 
 
 class BankManager:
