@@ -26,7 +26,13 @@ def __getattr__(name):
                 task_ref, group_id, kwargs.get('session_id'), self.tokenizer)
             if session.group_id != group_id:
                 raise ValueError('Host session does not match the sampled group')
-            group_size = kwargs.get('rift_group_size', getattr(self.rollout_config, 'n', None))
+            configured_group_size = getattr(self.rollout_config, 'n', None)
+            requested_group_size = kwargs.get('rift_group_size')
+            if (configured_group_size is not None and requested_group_size is not None
+                    and requested_group_size != configured_group_size):
+                raise ValueError('RIFT group size must match VERL rollout.n')
+            group_size = (configured_group_size if requested_group_size is None
+                          else requested_group_size)
             if group_size is not None and (type(group_size) is not int or group_size < 1):
                 raise ValueError('VERL rollout group size must be a positive integer')
             if hasattr(session, 'expected_group_size'):

@@ -12,7 +12,8 @@ actor_rollout_ref:
     strategy: fsdp2
   rollout:
     name: vllm
-    n: 2
+    # Must match training_package.grpo_group_size in configs/dual_bank.yaml.
+    n: 4
     calculate_log_probs: true
     agent:
       default_agent_loop: rift_usami_service

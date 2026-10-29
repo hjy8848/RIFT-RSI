@@ -5,9 +5,33 @@ files. An update verifier must independently establish update provenance.
 """
 import hashlib
 import json
+import stat
 from dataclasses import asdict
 from pathlib import Path
 from rift.schemas import Checkpoint
+
+_VERIFY_CACHE_VERSION = 1
+
+
+def _artifact_metadata_digest(directory):
+    """Fingerprint checkpoint paths without rereading their contents."""
+    root = Path(directory)
+    if not root.is_dir() or root.is_symlink(): raise ValueError('invalid checkpoint directory')
+    digest = hashlib.sha256()
+    entries = [root, *root.rglob('*')]
+    entries.sort(key=lambda path: '' if path == root else path.relative_to(root).as_posix())
+    for path in entries:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode): raise ValueError('checkpoint symlinks are unsupported')
+        if stat.S_ISDIR(metadata.st_mode): kind = 'directory'
+        elif stat.S_ISREG(metadata.st_mode): kind = 'file'
+        else: kind = 'other'
+        name = '' if path == root else path.relative_to(root).as_posix()
+        row = [name, kind, metadata.st_dev, metadata.st_ino, metadata.st_mode,
+               metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns]
+        encoded = json.dumps(row, separators=(',', ':')).encode('utf-8')
+        digest.update(len(encoded).to_bytes(8, 'big') + encoded)
+    return digest.hexdigest()
 
 
 def model_digest(directory, world_size):
@@ -42,11 +66,13 @@ def artifact_digest(directory):
 
 
 class FSDPCheckpointStore:
+    """Verify published checkpoint contents once per unchanged file-tree fingerprint."""
     def __init__(self, paths, *, world_size, artifact_digests=None):
         if type(world_size) is not int or world_size < 1: raise ValueError('invalid world size')
         self.paths = dict(paths)
         self.world_size = world_size
         self.artifact_digests = dict(artifact_digests or {})
+        self._verified_fingerprints = {}
         for checkpoint, path in self.paths.items():
             if checkpoint not in self.artifact_digests:
                 self.artifact_digests[checkpoint] = artifact_digest(path)
@@ -63,12 +89,23 @@ class FSDPCheckpointStore:
         try:
             root = Path(self.resolve(checkpoint))
             if not root.is_dir(): return False
+            artifact_digest_expected = self.artifact_digests[checkpoint]
+            fingerprint = _artifact_metadata_digest(root)
+            cache_entry = (_VERIFY_CACHE_VERSION, str(root), self.world_size,
+                           checkpoint.weights_digest, artifact_digest_expected, fingerprint)
+            if self._verified_fingerprints.get(checkpoint) == cache_entry:
+                return True
             for rank in range(self.world_size):
                 for kind in ('model', 'optim', 'extra_state'):
                     file = root / f'{kind}_world_size_{self.world_size}_rank_{rank}.pt'
                     if not file.is_file() or file.is_symlink() or file.stat().st_size == 0: return False
-            return (model_digest(root, self.world_size) == checkpoint.weights_digest
-                    and artifact_digest(root) == self.artifact_digests[checkpoint])
+            verified = (model_digest(root, self.world_size) == checkpoint.weights_digest
+                        and artifact_digest(root) == artifact_digest_expected)
+            if verified:
+                self._verified_fingerprints[checkpoint] = cache_entry
+            else:
+                self._verified_fingerprints.pop(checkpoint, None)
+            return verified
         except (OSError, ValueError, TypeError):
             return False
     def save_manifest(self, path):

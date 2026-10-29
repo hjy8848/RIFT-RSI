@@ -27,7 +27,7 @@ def test_capture_rejects_retokenization_and_incorrect_masks():
 def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch):
     """Stub server and session exercise the extension; no VERL/NPU execution."""
     class Base:
-        def __init__(self): self.rollout_config = SimpleNamespace(response_length=20); self.tokenizer = None
+        def __init__(self): self.rollout_config = SimpleNamespace(response_length=20, n=4); self.tokenizer = None
         async def ct_build_initial_tokens(self, messages, tools=None): return [1]
         async def ct_merge_assistant_token(self, old, output, mask, logs, assistant_logprobs=None):
             return SimpleNamespace(token_ids=old + output), mask + [1] * len(output), None
@@ -54,7 +54,7 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
     class Session:
         rollout_id = 'fake-rollout'
         group_id = 'group'
-        def __init__(self): self.n=0
+        def __init__(self): self.n=0; self.expected_group_size=None
         async def start(self): return ([{'role':'user','content':'refund'}], [])
         async def advance(self, tokens, prefix, sampling_params, token_logprobs, generation_id, serving_fields=None):
             self.n += 1
@@ -72,18 +72,26 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
     monkeypatch.setattr('rift.benchmark.usami.public_episode', lambda episode: SimpleNamespace(outcome=Outcome.SUCCESS))
     sink = Sink()
     class Host:
+        def __init__(self): self.sessions=[]
         async def open_rollout(self, task_ref, group_id, session_id, tokenizer):
-            return Session(), Checkpoint('service','v1','tok','weights'), Verifier(), sink
-    loop.rift_host_provider = Host()
+            session = Session(); self.sessions.append(session)
+            return session, Checkpoint('service','v1','tok','weights'), Verifier(), sink
+    host = Host()
+    loop.rift_host_provider = host
     with pytest.raises(ValueError, match='private host objects'):
         asyncio.run(loop.run({}, rift_task_ref='opaque', uid='group', rift_session=Session()))
+    with pytest.raises(ValueError, match='RIFT group size must match VERL rollout.n'):
+        asyncio.run(loop.run({}, rift_task_ref='opaque', uid='group', session_id=0,
+                             rift_group_size=2))
     result = asyncio.run(loop.run({}, rift_task_ref='opaque', uid='group', session_id=0))
     assert loop.server_manager.inputs == [[1], [1, 2, 3, 7]]
     assert result.response_ids == [2, 3, 7, 4] and result.response_mask == [1, 1, 0, 1]
     assert result.reward_score == 1 and sink.decisions[1].tokens.prompt == (1, 2, 3, 7)
+    assert host.sessions[-1].expected_group_size == 4
     monkeypatch.delattr(extension, 'UsamiServiceAgentLoop', raising=False)
 
-def test_checkpoint_store_checks_all_rank_files_and_weights(tmp_path):
+def test_checkpoint_store_checks_all_rank_files_and_weights(tmp_path, monkeypatch):
+    from rift.verl import checkpoints
     from rift.verl.checkpoints import FSDPCheckpointStore, model_digest
     checkpoint_path = tmp_path / 'checkpoint'; checkpoint_path.mkdir()
     for rank in range(2):
@@ -91,7 +99,21 @@ def test_checkpoint_store_checks_all_rank_files_and_weights(tmp_path):
             (checkpoint_path / f'{kind}_world_size_2_rank_{rank}.pt').write_bytes(f'{kind}-{rank}'.encode())
     checkpoint = Checkpoint('service', 'v1', 'tok', model_digest(checkpoint_path, 2))
     store = FSDPCheckpointStore({checkpoint: checkpoint_path}, world_size=2)
+    full_hash_calls = {'model': 0, 'artifact': 0}
+    original_model_digest = checkpoints.model_digest
+    original_artifact_digest = checkpoints.artifact_digest
+    def counted_model_digest(*args):
+        full_hash_calls['model'] += 1
+        return original_model_digest(*args)
+    def counted_artifact_digest(*args):
+        full_hash_calls['artifact'] += 1
+        return original_artifact_digest(*args)
+    monkeypatch.setattr(checkpoints, 'model_digest', counted_model_digest)
+    monkeypatch.setattr(checkpoints, 'artifact_digest', counted_artifact_digest)
     assert store.verify(checkpoint)
+    assert full_hash_calls == {'model': 1, 'artifact': 1}
+    assert store.verify(checkpoint)
+    assert full_hash_calls == {'model': 1, 'artifact': 1}
     manifest = tmp_path / 'checkpoints.json'; store.save_manifest(manifest)
     assert FSDPCheckpointStore.load_manifest(manifest).verify(checkpoint)
     (checkpoint_path / 'optim_world_size_2_rank_1.pt').write_bytes(b'changed')
