@@ -66,6 +66,7 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.actor.ppo_mini_batch_size = WORLD_SIZE
     config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu = 1
     config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu = 8192
+    config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu = 1
     config.actor_rollout_ref.actor.optim.lr = 1.0e-6
     config.actor_rollout_ref.actor.optim.total_training_steps = 1
     config.actor_rollout_ref.actor.checkpoint.save_contents = ["model", "optimizer", "extra"]
