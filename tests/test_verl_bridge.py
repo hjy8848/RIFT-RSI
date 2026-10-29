@@ -98,24 +98,24 @@ def test_checkpoint_store_checks_all_rank_files_and_weights(tmp_path, monkeypatc
         for kind in ('model', 'optim', 'extra_state'):
             (checkpoint_path / f'{kind}_world_size_2_rank_{rank}.pt').write_bytes(f'{kind}-{rank}'.encode())
     checkpoint = Checkpoint('service', 'v1', 'tok', model_digest(checkpoint_path, 2))
+    full_hash_calls = {'content': 0}
+    original_content_digests = checkpoints._checkpoint_content_digests
+    def counted_content_digests(*args):
+        full_hash_calls['content'] += 1
+        return original_content_digests(*args)
+    monkeypatch.setattr(checkpoints, '_checkpoint_content_digests', counted_content_digests)
     store = FSDPCheckpointStore({checkpoint: checkpoint_path}, world_size=2)
-    full_hash_calls = {'model': 0, 'artifact': 0}
-    original_model_digest = checkpoints.model_digest
-    original_artifact_digest = checkpoints.artifact_digest
-    def counted_model_digest(*args):
-        full_hash_calls['model'] += 1
-        return original_model_digest(*args)
-    def counted_artifact_digest(*args):
-        full_hash_calls['artifact'] += 1
-        return original_artifact_digest(*args)
-    monkeypatch.setattr(checkpoints, 'model_digest', counted_model_digest)
-    monkeypatch.setattr(checkpoints, 'artifact_digest', counted_artifact_digest)
+    assert full_hash_calls['content'] == 1
     assert store.verify(checkpoint)
-    assert full_hash_calls == {'model': 1, 'artifact': 1}
+    assert full_hash_calls['content'] == 1
     assert store.verify(checkpoint)
-    assert full_hash_calls == {'model': 1, 'artifact': 1}
+    assert full_hash_calls['content'] == 1
     manifest = tmp_path / 'checkpoints.json'; store.save_manifest(manifest)
     assert FSDPCheckpointStore.load_manifest(manifest).verify(checkpoint)
+    assert full_hash_calls['content'] == 1
+    fresh_store = FSDPCheckpointStore({checkpoint: checkpoint_path}, world_size=2)
+    assert fresh_store.verify(checkpoint)
+    assert full_hash_calls['content'] == 1
     (checkpoint_path / 'optim_world_size_2_rank_1.pt').write_bytes(b'changed')
     assert not store.verify(checkpoint)
     with pytest.raises(ValueError, match='manifest'):
@@ -126,6 +126,26 @@ def test_checkpoint_store_checks_all_rank_files_and_weights(tmp_path, monkeypatc
     assert not store.verify(checkpoint)
     (checkpoint_path / 'optim_world_size_2_rank_1.pt').unlink()
     assert not store.verify(checkpoint)
+
+
+def test_checkpoint_publish_hashes_model_and_artifacts_once(tmp_path, monkeypatch):
+    from rift.verl import checkpoints
+    checkpoint_path = tmp_path / 'published'; checkpoint_path.mkdir()
+    for kind in ('model', 'optim', 'extra_state'):
+        (checkpoint_path / f'{kind}_world_size_1_rank_0.pt').write_bytes(kind.encode())
+    calls = {'content': 0}
+    original = checkpoints._checkpoint_content_digests
+    def counted(*args):
+        calls['content'] += 1
+        return original(*args)
+    monkeypatch.setattr(checkpoints, '_checkpoint_content_digests', counted)
+    store = checkpoints.FSDPCheckpointStore({}, world_size=1)
+    checkpoint = store.publish('service', '2', 'tok', checkpoint_path)
+    assert calls['content'] == 1
+    monkeypatch.setattr(checkpoints, 'model_digest', lambda *_: pytest.fail('model shards rehashed'))
+    monkeypatch.setattr(checkpoints, 'artifact_digest', lambda *_: pytest.fail('checkpoint rehashed'))
+    assert store.verify(checkpoint)
+    assert calls['content'] == 1
 
 def test_replay_batch_padding_preserves_context_and_action_mask():
     from rift.verl.scorer import padded_batch

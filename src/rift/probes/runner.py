@@ -37,24 +37,57 @@ class ProbeRunner:
         return make_result_set(snapshot, snapshot.baseline_checkpoint, "before", results)
 
     def after(self, snapshot, checkpoint):
-        if not snapshot.verify():
-            raise ValueError("frozen Probe snapshot failed verification")
-        if checkpoint == snapshot.baseline_checkpoint:
-            raise ValueError("after evaluation requires the updated Service checkpoint")
-        results = []
-        for probe in snapshot.probes:
-            trials = []
-            for seed in probe.seeds:
-                trial = self.evaluator.evaluate(probe.task_ref, checkpoint, seed,
-                                                probe.protocol_ref, snapshot.protocol_digest)
-                if (not isinstance(trial, ObservedTrial) or trial.task_ref != probe.task_ref
-                        or trial.checkpoint != checkpoint or trial.seed != seed
-                        or trial.protocol_digest != snapshot.protocol_digest
-                        or trial.public_summary is not None):
-                    raise ValueError("after evaluator returned a mismatched or public Probe record")
-                if self.trial_verifier.verify_probe_trial(trial, probe, checkpoint) is not True:
-                    raise ValueError("after Probe trial evidence failed verification")
-                trials.append(trial)
-            results.append(ProbeTaskResult(probe.task_ref, probe.identity,
-                checkpoint, tuple(trials), snapshot.protocol_digest, "after"))
-        return make_result_set(snapshot, checkpoint, "after", results)
+        return self.after_many((snapshot,), checkpoint)[0]
+
+    def after_many(self, snapshots, checkpoint):
+        """Evaluate frozen Recovery/Retention jobs in one VERL-compatible batch."""
+        snapshots = tuple(snapshots)
+        if not snapshots:
+            raise ValueError("at least one frozen Probe snapshot is required")
+        requests = []
+        owners = []
+        for snapshot_index, snapshot in enumerate(snapshots):
+            if not snapshot.verify():
+                raise ValueError("frozen Probe snapshot failed verification")
+            if checkpoint == snapshot.baseline_checkpoint:
+                raise ValueError("after evaluation requires the updated Service checkpoint")
+            for probe in snapshot.probes:
+                for seed in probe.seeds:
+                    requests.append((probe.task_ref, checkpoint, seed,
+                                     probe.protocol_ref, snapshot.protocol_digest))
+                    owners.append((snapshot_index, probe))
+
+        # Optional production extension: submit this sequence to one VERL
+        # Agent Loop batch. Results must preserve request order.
+        evaluate_many = getattr(self.evaluator, "evaluate_many", None)
+        if callable(evaluate_many):
+            trials = tuple(evaluate_many(tuple(requests)))
+            if len(trials) != len(requests):
+                raise ValueError("batched Probe evaluator returned an incomplete result batch")
+        else:
+            trials = tuple(self.evaluator.evaluate(*request) for request in requests)
+
+        by_snapshot = [[] for _ in snapshots]
+        by_probe = [{} for _ in snapshots]
+        for request, (snapshot_index, probe), trial in zip(requests, owners, trials):
+            task_ref, expected_checkpoint, seed, _, protocol_digest = request
+            if (not isinstance(trial, ObservedTrial) or trial.task_ref != task_ref
+                    or trial.checkpoint != expected_checkpoint or trial.seed != seed
+                    or trial.protocol_digest != protocol_digest
+                    or trial.public_summary is not None):
+                raise ValueError("after evaluator returned a mismatched or public Probe record")
+            if self.trial_verifier.verify_probe_trial(
+                    trial, probe, expected_checkpoint) is not True:
+                raise ValueError("after Probe trial evidence failed verification")
+            by_probe[snapshot_index].setdefault(probe.task_ref, []).append(trial)
+
+        for snapshot_index, snapshot in enumerate(snapshots):
+            for probe in snapshot.probes:
+                probe_trials = tuple(by_probe[snapshot_index].get(probe.task_ref, ()))
+                if len(probe_trials) != len(probe.seeds):
+                    raise ValueError("after evaluator omitted a frozen Probe seed")
+                by_snapshot[snapshot_index].append(ProbeTaskResult(
+                    probe.task_ref, probe.identity, checkpoint, probe_trials,
+                    snapshot.protocol_digest, "after"))
+        return tuple(make_result_set(snapshot, checkpoint, "after", rows)
+                     for snapshot, rows in zip(snapshots, by_snapshot))

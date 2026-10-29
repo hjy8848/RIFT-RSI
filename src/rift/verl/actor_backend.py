@@ -4,10 +4,8 @@ No worker or model is created by importing this module. The host must supply
 real rollout and update attestors; fake evidence is never accepted implicitly.
 """
 from pathlib import Path
-from rift.schemas import Checkpoint
 from rift.training.contracts import CompletedUpdate, UpdateRequest
 from rift.training.records import comparable_designer_rollouts
-from rift.verl.checkpoints import model_digest
 from rift.verl.scorer import padded_batch
 from rift.verl.serving import checkpoint_step
 from rift.verl.version import require_verl_version
@@ -45,7 +43,12 @@ def validate_request(request, role, rollout_verifier):
 
 
 class VerlGRPOBackend:
-    """One explicit full-parameter update. The caller owns the worker lifecycle."""
+    """One explicit full-parameter update. The caller owns the worker lifecycle.
+
+    A runtime may expose verify_resident_training_state() to prove that model,
+    optimizer, scheduler and RNG state are already at policy_before. Only then
+    can a resident FSDP2 worker skip restoring that checkpoint from disk.
+    """
     def __init__(self, role, worker_group, checkpoint_store, rollout_verifier,
                  run_recorder, update_verifier, runtime_verifier, weight_sync, *, output_dir, after_revision,
                  run_id, pad_token_id, mini_batch_size, epochs=1):
@@ -60,8 +63,6 @@ class VerlGRPOBackend:
     def train(self, request):
         validate_request(request, self.role, self.rollout_verifier)
         if not self.checkpoint_store.verify(request.policy_before): raise ValueError('before checkpoint failed verification')
-        if self.runtime_verifier.verify_runtime(self.role, self.worker_group, request.policy_before) is not True:
-            raise ValueError('full-parameter FSDP2 runtime or policy identity was not verified')
         if not self.run_id or not self.after_revision or self.output_dir.exists():
             raise ValueError('unique run, revision and unused checkpoint destination required')
         if (self.mini_batch_size < 1 or self.epochs < 1
@@ -70,6 +71,9 @@ class VerlGRPOBackend:
                 or self.mini_batch_size > len(request.rollouts)
                 or len(request.rollouts) % self.mini_batch_size):
             raise ValueError('rollout and mini-batch sizes must divide across the FSDP world and each other')
+        if self.runtime_verifier.verify_runtime(
+                self.role, self.worker_group, request.policy_before) is not True:
+            raise ValueError('full-parameter FSDP2 runtime or policy identity was not verified')
         before_step = checkpoint_step(request.policy_before)
         # VERL's global_steps counts outer trainer batches, not the inner
         # optimizer minibatches/epochs executed by one update_actor call.
@@ -86,7 +90,14 @@ class VerlGRPOBackend:
         from verl.utils import tensordict_utils as tu
         from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
         tensors = {key: torch.tensor(value, dtype=torch.long) for key, value in encoded.items()}
-        self.worker_group.load_checkpoint(self.checkpoint_store.resolve(request.policy_before))
+        verify_resident = getattr(self.runtime_verifier, 'verify_resident_training_state', None)
+        resident = (callable(verify_resident)
+                    and verify_resident(self.role, self.worker_group, request.policy_before) is True)
+        if not resident:
+            self.worker_group.load_checkpoint(self.checkpoint_store.resolve(request.policy_before))
+            if self.runtime_verifier.verify_runtime(
+                    self.role, self.worker_group, request.policy_before) is not True:
+                raise ValueError('restored FSDP2 actor does not match the requested checkpoint')
         proto = DataProto.from_dict(tensors=tensors)
         infer = left_right_2_no_padding(proto.to_tensordict())
         tu.assign_non_tensor(infer, calculate_entropy=False, compute_loss=False, temperature=1.0)
@@ -125,9 +136,8 @@ class VerlGRPOBackend:
             epochs=self.epochs, seed=42, dataloader_kwargs={'shuffle': False}, temperature=1.0)
         metrics = self.worker_group.update_actor(update_batch)
         self.worker_group.save_checkpoint(str(self.output_dir), global_step=after_step)
-        after = Checkpoint(request.policy_before.policy, self.after_revision, request.policy_before.tokenizer,
-                           model_digest(self.output_dir, self.checkpoint_store.world_size))
-        self.checkpoint_store.register(after, self.output_dir)
+        after = self.checkpoint_store.publish(request.policy_before.policy,
+            self.after_revision, request.policy_before.tokenizer, self.output_dir)
         if not self.checkpoint_store.verify(after): raise ValueError('after checkpoint failed verification')
         if self.runtime_verifier.verify_runtime(self.role, self.worker_group, after) is not True:
             raise ValueError('saved checkpoint does not match the full-parameter actor runtime')

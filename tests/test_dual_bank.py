@@ -105,10 +105,17 @@ class AcceptProbeEvidence:
 
 
 class ScriptedAfterEvaluator:
+    def __init__(self):
+        self.batches = []
+
     def evaluate(self, task_ref, checkpoint, seed, protocol_ref, protocol_digest):
         return ObservedTrial(task_ref, f'after-{task_ref}-{seed}', checkpoint, seed,
             Outcome.SUCCESS, protocol_digest, f'scripted-after:{task_ref}:{seed}', True,
             EvidenceLevel.SCRIPTED_USAMI)
+
+    def evaluate_many(self, requests):
+        self.batches.append(tuple(requests))
+        return tuple(self.evaluate(*request) for request in requests)
 
 
 def test_bootstrap_uses_unlabelled_bank_candidates_and_keeps_unknown_unresolved(tmp_path):
@@ -199,9 +206,13 @@ def test_scripted_probe_runner_persists_trials_but_cannot_claim_learning_reward(
         train_package_identities=(training,),
         split_registry=registry, before_checkpoint=BEFORE, recovery_tasks=1,
         retention_tasks=1, seed=3, protocol_ref='protocol-v1', protocol_digest=bootstrap.protocol_digest)
-    runner = ProbeRunner(ScriptedAfterEvaluator(), AcceptProbeEvidence())
+    evaluator = ScriptedAfterEvaluator()
+    runner = ProbeRunner(evaluator, AcceptProbeEvidence())
     recovery_before, retention_before = runner.baseline(recovery), runner.baseline(retention)
-    recovery_after, retention_after = runner.after(recovery, AFTER), runner.after(retention, AFTER)
+    recovery_after, retention_after = runner.after_many((recovery, retention), AFTER)
+    assert len(evaluator.batches) == 1
+    assert len(evaluator.batches[0]) == sum(len(probe.seeds)
+        for snapshot in (recovery, retention) for probe in snapshot.probes)
     store = JsonProbeEvidenceStore(tmp_path / 'evidence-store')
     for snapshot in (recovery, retention): store.save_snapshot(snapshot)
     for result in (recovery_before, retention_before, recovery_after, retention_after):

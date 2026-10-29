@@ -1,0 +1,12 @@
+# Opt-in VERL v0.9.1 performance overlay. Merge over fsdp2_vllm.yaml.
+# The token budget is required from a measured target run; do not guess it.
+actor_rollout_ref:
+  model:
+    use_remove_padding: true
+  actor:
+    strategy: fsdp2
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: ${oc.env:RIFT_PPO_MAX_TOKEN_LEN_PER_GPU}
+  rollout:
+    n: 4
+    calculate_log_probs: true

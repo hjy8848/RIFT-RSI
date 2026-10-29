@@ -79,8 +79,9 @@ def run_round(state, *, service_backend, designer_backend, replay_snapshot=None,
         else:
             if probe_runner is None or probe_evidence_store is None or probe_verifier is None:
                 raise ValueError('dual-bank mode requires its Probe runner, evidence store and verifier')
-            recovery_after = probe_runner.after(state.recovery_snapshot, state.service_update.policy_after)
-            retention_after = probe_runner.after(state.retention_snapshot, state.service_update.policy_after)
+            recovery_after, retention_after = probe_runner.after_many(
+                (state.recovery_snapshot, state.retention_snapshot),
+                state.service_update.policy_after)
             probe_evidence_store.save_results(recovery_after)
             probe_evidence_store.save_results(retention_after)
             state = state.probes_evaluated(recovery_after, retention_after,

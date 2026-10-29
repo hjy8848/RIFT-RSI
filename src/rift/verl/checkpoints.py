@@ -11,6 +11,7 @@ from pathlib import Path
 from rift.schemas import Checkpoint
 
 _VERIFY_CACHE_VERSION = 1
+_PROCESS_VERIFICATION_CACHE = {}
 
 
 def _artifact_metadata_digest(directory):
@@ -65,6 +66,45 @@ def artifact_digest(directory):
     return digest.hexdigest()
 
 
+def _checkpoint_content_digests(directory, world_size):
+    """Hash checkpoint files once to derive both model and artifact identities."""
+    root = Path(directory)
+    if type(world_size) is not int or world_size < 1:
+        raise ValueError('invalid world size')
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError('invalid checkpoint directory')
+    content_digests = {}
+    for path in sorted(root.rglob('*'), key=lambda p: p.relative_to(root).as_posix()):
+        if path.is_symlink():
+            raise ValueError('checkpoint symlinks are unsupported')
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError('checkpoint contains a non-regular file')
+        content = hashlib.sha256()
+        with path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                content.update(chunk)
+        content_digests[path.relative_to(root).as_posix()] = content.digest()
+
+    for rank in range(world_size):
+        for kind in ('model', 'optim', 'extra_state'):
+            name = f'{kind}_world_size_{world_size}_rank_{rank}.pt'
+            if name not in content_digests or (root / name).stat().st_size == 0:
+                raise ValueError('missing or empty checkpoint shard: ' + name)
+
+    model_hash = hashlib.sha256()
+    for rank in range(world_size):
+        name = f'model_world_size_{world_size}_rank_{rank}.pt'
+        model_hash.update(name.encode('utf-8') + b'\0' + content_digests[name])
+    artifact_hash = hashlib.sha256()
+    for name, content_digest in sorted(content_digests.items()):
+        encoded_name = name.encode('utf-8')
+        artifact_hash.update(len(encoded_name).to_bytes(8, 'big')
+                             + encoded_name + content_digest)
+    return model_hash.hexdigest(), artifact_hash.hexdigest()
+
+
 class FSDPCheckpointStore:
     """Verify published checkpoint contents once per unchanged file-tree fingerprint."""
     def __init__(self, paths, *, world_size, artifact_digests=None):
@@ -74,13 +114,48 @@ class FSDPCheckpointStore:
         self.artifact_digests = dict(artifact_digests or {})
         self._verified_fingerprints = {}
         for checkpoint, path in self.paths.items():
-            if checkpoint not in self.artifact_digests:
-                self.artifact_digests[checkpoint] = artifact_digest(path)
+            if checkpoint in self.artifact_digests:
+                continue
+            root = Path(path).resolve()
+            cache_key = (checkpoint, str(root), self.world_size)
+            cached = _PROCESS_VERIFICATION_CACHE.get(cache_key)
+            if cached is not None:
+                self.artifact_digests[checkpoint] = cached[-2]
+                continue
+            try:
+                model_hash, artifact_hash = _checkpoint_content_digests(root, self.world_size)
+            except (OSError, ValueError):
+                artifact_hash = artifact_digest(root)
+                model_hash = None
+            self.artifact_digests[checkpoint] = artifact_hash
+            if model_hash == checkpoint.weights_digest:
+                self._remember_verified(checkpoint, root)
     def register(self, checkpoint, path):
         if checkpoint in self.paths: raise ValueError('checkpoint identity already registered')
-        digest = artifact_digest(path)
+        model_hash, digest = _checkpoint_content_digests(path, self.world_size)
+        if model_hash != checkpoint.weights_digest:
+            raise ValueError('checkpoint model digest does not match its identity')
         self.paths[checkpoint] = path
         self.artifact_digests[checkpoint] = digest
+        self._remember_verified(checkpoint, path)
+    def publish(self, policy, revision, tokenizer, path):
+        """Register a just-saved checkpoint after one content-hash pass."""
+        model_hash, artifact_hash = _checkpoint_content_digests(path, self.world_size)
+        checkpoint = Checkpoint(policy, revision, tokenizer, model_hash)
+        if checkpoint in self.paths:
+            raise ValueError('checkpoint identity already registered')
+        self.paths[checkpoint] = path
+        self.artifact_digests[checkpoint] = artifact_hash
+        self._remember_verified(checkpoint, path)
+        return checkpoint
+    def _remember_verified(self, checkpoint, path):
+        root = Path(path).resolve()
+        fingerprint = _artifact_metadata_digest(root)
+        self._verified_fingerprints[checkpoint] = (
+            _VERIFY_CACHE_VERSION, str(root), self.world_size,
+            checkpoint.weights_digest, self.artifact_digests[checkpoint], fingerprint)
+        cache_key = (checkpoint, str(root), self.world_size)
+        _PROCESS_VERIFICATION_CACHE[cache_key] = self._verified_fingerprints[checkpoint]
     def resolve(self, checkpoint):
         if not isinstance(checkpoint, Checkpoint) or checkpoint not in self.paths:
             raise ValueError('checkpoint is not registered')
@@ -93,18 +168,19 @@ class FSDPCheckpointStore:
             fingerprint = _artifact_metadata_digest(root)
             cache_entry = (_VERIFY_CACHE_VERSION, str(root), self.world_size,
                            checkpoint.weights_digest, artifact_digest_expected, fingerprint)
-            if self._verified_fingerprints.get(checkpoint) == cache_entry:
+            cache_key = (checkpoint, str(root), self.world_size)
+            if (self._verified_fingerprints.get(checkpoint) == cache_entry
+                    or _PROCESS_VERIFICATION_CACHE.get(cache_key) == cache_entry):
+                self._verified_fingerprints[checkpoint] = cache_entry
                 return True
-            for rank in range(self.world_size):
-                for kind in ('model', 'optim', 'extra_state'):
-                    file = root / f'{kind}_world_size_{self.world_size}_rank_{rank}.pt'
-                    if not file.is_file() or file.is_symlink() or file.stat().st_size == 0: return False
-            verified = (model_digest(root, self.world_size) == checkpoint.weights_digest
-                        and artifact_digest(root) == artifact_digest_expected)
+            model_hash, artifact_hash = _checkpoint_content_digests(root, self.world_size)
+            verified = (model_hash == checkpoint.weights_digest
+                        and artifact_hash == artifact_digest_expected)
             if verified:
                 self._verified_fingerprints[checkpoint] = cache_entry
             else:
                 self._verified_fingerprints.pop(checkpoint, None)
+                _PROCESS_VERIFICATION_CACHE.pop(cache_key, None)
             return verified
         except (OSError, ValueError, TypeError):
             return False

@@ -9,8 +9,9 @@ from rift.training.contracts import Rollout, UpdateRequest
 from rift.verl.actor_backend import VerlServiceRLBackend, VerlDesignerRLBackend
 from rift.verl.checkpoints import FSDPCheckpointStore, model_digest
 
+@pytest.mark.parametrize('resident_state', [False, True])
 @pytest.mark.parametrize('role,algorithm', [('service', 'grpo'), ('designer', 'grpo'), ('designer', 'reinforce_plus_plus')])
-def test_mock_actor_worker_wiring(tmp_path, monkeypatch, role, algorithm):
+def test_mock_actor_worker_wiring(tmp_path, monkeypatch, role, algorithm, resident_state):
     import numpy as np
     monkeypatch.setattr('rift.verl.actor_backend.require_verl_version', lambda: None)
     class Proto:
@@ -39,7 +40,8 @@ def test_mock_actor_worker_wiring(tmp_path, monkeypatch, role, algorithm):
     checkpoint = Checkpoint(role, '1', 'tok', model_digest(before_dir, 1))
     store = FSDPCheckpointStore({checkpoint: before_dir}, world_size=1)
     class FakeWorker:
-        def load_checkpoint(self, path): self.loaded = path
+        def __init__(self): self.load_calls = 0
+        def load_checkpoint(self, path): self.loaded = path; self.load_calls += 1
         def compute_log_prob(self, batch): return {'log_probs': torch.zeros((2, 1))}
         def update_actor(self, batch):
             assert 'advantages' in batch and 'old_log_probs' in batch
@@ -50,6 +52,7 @@ def test_mock_actor_worker_wiring(tmp_path, monkeypatch, role, algorithm):
     class Verifier:
         def verify_rollout(self, row, checkpoint): return True
         def verify_group(self, rows, checkpoint): return True
+        def verify_resident_training_state(self, role, worker, checkpoint): return resident_state
         def verify_runtime(self, role, worker, checkpoint): return True
         def verify_update(self, update): return True
         def synchronize(self, worker, checkpoint): return True
@@ -64,9 +67,21 @@ def test_mock_actor_worker_wiring(tmp_path, monkeypatch, role, algorithm):
     backend = cls(FakeWorker(), store, verifier, verifier, verifier, verifier, verifier,
         output_dir=tmp_path / 'after', after_revision='2', run_id='fake-run',
         pad_token_id=0, mini_batch_size=2, epochs=2)
+    worker = backend.worker_group
     result = backend.train(request)
     assert result.request == request and result.policy_after.weights_digest != checkpoint.weights_digest
     assert result.evidence_ref == 'fake-test-evidence'
+    assert worker.load_calls == (0 if resident_state else 1)
+
+
+def test_performance_overlay_uses_verl_dynamic_batch_with_measured_budget():
+    yaml = pytest.importorskip('yaml')
+    from pathlib import Path
+    overlay = yaml.safe_load(Path('configs/verl/performance_trial.yaml').read_text())
+    actor = overlay['actor_rollout_ref']['actor']
+    assert actor['strategy'] == 'fsdp2' and actor['use_dynamic_bsz'] is True
+    assert actor['ppo_max_token_len_per_gpu'] == '${oc.env:RIFT_PPO_MAX_TOKEN_LEN_PER_GPU}'
+    assert overlay['actor_rollout_ref']['rollout']['n'] == 4
 
 def test_mock_replay_scorer_worker_preserves_action_context(monkeypatch):
     """Fake worker output is not a real checkpoint likelihood."""
