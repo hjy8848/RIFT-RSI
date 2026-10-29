@@ -1,0 +1,4 @@
+[submodule "third_party/usami"]
+	path = third_party/usami
+	url = https://github.com/hjy8848/Usami.git
+	branch = feature/rsi-core-v01
