@@ -172,8 +172,11 @@ def _start_ray(config, run_root, *, worker_manifest_path=None, checkpoint=None):
     resources = platform.ray_resource_options(WORLD_SIZE).get("resources", {})
     if resources != {"NPU": WORLD_SIZE}:
         raise RuntimeError(f"VERL selected an unexpected Ascend Ray resource map: {resources}")
-    ray_dir = Path(run_root).resolve() / "ray"
-    ray_dir.mkdir(parents=True, exist_ok=True)
+    # Ray appends a timestamped session directory and Unix socket names here.
+    # The persistent run root may already be long enough to exceed AF_UNIX's
+    # 107-byte path limit, so keep Ray's ephemeral session files under /tmp.
+    ray_dir = Path("/tmp") / f"rift-ray-{os.getuid()}-{os.getpid()}"
+    ray_dir.mkdir(parents=True, exist_ok=False)
     from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
     from omegaconf import OmegaConf
     runtime_env = get_ppo_ray_runtime_env(config)
