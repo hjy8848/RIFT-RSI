@@ -2,7 +2,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from rift.schemas import Identity, Outcome, Split, Tokens
+from rift.schemas import Checkpoint, Identity, Outcome, Split, Tokens
 from rift.replay.trajectory import Demonstration
 
 def _encoded(rows):
@@ -13,11 +13,14 @@ def _snapshot_digest(rows, training):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
 class ReplayBank:
-    def __init__(self, rows=()):
+    def __init__(self, rows=(), *, verifier):
         self._rows = []
+        self._verifier = verifier
         for row in rows: self.add(row)
     def add(self, sample):
         if not isinstance(sample, Demonstration): raise TypeError("Demonstration required")
+        if self._verifier.verify_demonstration(sample) is not True:
+            raise ValueError("replay demonstration evidence was not verified")
         if any(sample.sample_id == r.sample_id for r in self._rows): raise ValueError("duplicate sample")
         # Multiple decision samples from the same episode are allowed; different
         # episodes may not share identity keys to prevent hidden duplication.
@@ -37,14 +40,14 @@ class ReplayBank:
     def save(self, path):
         Path(path).write_text(_encoded(self._rows), encoding="utf-8")
     @classmethod
-    def load(cls, path):
-        return cls(_decode(json.loads(Path(path).read_text(encoding="utf-8"))))
+    def load(cls, path, *, verifier):
+        return cls(_decode(json.loads(Path(path).read_text(encoding="utf-8"))), verifier=verifier)
 
 def _decode(raw):
     rows = []
     for r in raw:
         i = r["identity"]; t = r["tokens"]
-        rows.append(Demonstration(r["sample_id"], Identity(i["world"], i["task"], i["family"], i["lineage"], Split(i["split"])), r["episode_id"], r["source_checkpoint"], Tokens(tuple(t["prompt"]), tuple(t["response"]), tuple(t["mask"])), Outcome(r["outcome"]), r["replay_verified"], r["evidence_kind"]))
+        rows.append(Demonstration(r["sample_id"], Identity(i["world"], i["task"], i["family"], i["lineage"], Split(i["split"])), r["episode_id"], Checkpoint(**r["source_checkpoint"]), Tokens(tuple(t["prompt"]), tuple(t["response"]), tuple(t["mask"])), Outcome(r["outcome"]), r["replay_verified"], r["evidence_kind"]))
     return rows
 
 @dataclass(frozen=True)
@@ -59,10 +62,10 @@ class Snapshot:
         if not self.verify(): raise ValueError("invalid snapshot")
         Path(path).write_text(json.dumps({"rows": json.loads(_encoded(self.rows)), "training": [asdict(i) for i in self.training], "digest": self.digest}, sort_keys=True), encoding="utf-8")
     @classmethod
-    def load(cls, path):
+    def load(cls, path, *, verifier):
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         training = tuple(Identity(i["world"], i["task"], i["family"], i["lineage"], Split(i["split"])) for i in raw["training"])
-        snapshot = cls(tuple(ReplayBank(_decode(raw["rows"]))._rows), training, raw["digest"])
+        snapshot = cls(tuple(ReplayBank(_decode(raw["rows"]), verifier=verifier)._rows), training, raw["digest"])
         if not snapshot.verify(): raise ValueError("invalid snapshot")
         return snapshot
     def verify(self):

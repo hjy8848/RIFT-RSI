@@ -12,11 +12,15 @@ class Rollout:
     reward: float
     reward_source: str
     group_id: str | None = None
+    response_id: str | None = None
+    reward_ref: str | None = None
     def __post_init__(self):
         if not all((self.task_id, self.episode_id, self.reward_source)) or not isfinite(self.reward):
             raise ValueError("rollout provenance and finite reward required")
         if self.group_id is not None and not self.group_id:
             raise ValueError("empty group ID")
+        if self.response_id == '' or self.reward_ref == '':
+            raise ValueError("empty provenance reference")
 
 @dataclass(frozen=True)
 class UpdateRequest:
@@ -34,8 +38,8 @@ class UpdateRequest:
             for r in self.rollouts:
                 if not r.group_id: raise ValueError("GRPO requires explicit groups")
                 groups.setdefault(r.group_id, []).append(r)
-            if any(len({r.episode_id for r in g}) < 2 or len({r.task_id for r in g}) != 1 for g in groups.values()):
-                raise ValueError("GRPO groups require multiple samples from the same task")
+            if any(len({r.episode_id for r in g}) < 2 or len({r.tokens.prompt for r in g}) != 1 for g in groups.values()):
+                raise ValueError("GRPO groups require distinct rollouts from the same prompt")
 
 @dataclass(frozen=True)
 class CompletedUpdate:
@@ -58,3 +62,16 @@ class PolicyScorer(Protocol):
 class CheckpointStore(Protocol):
     def resolve(self, checkpoint: Checkpoint) -> str: ...
     def verify(self, checkpoint: Checkpoint) -> bool: ...
+
+class UpdateVerifier(Protocol):
+    """Trusted backend evidence check, including the request, run and both weights.
+
+    A checkpoint's existence does not establish that a training update produced
+    it. No production verifier is provided until a trainer is integrated.
+    """
+    def verify_update(self, update: CompletedUpdate) -> bool: ...
+
+class DesignerActionVerifier(Protocol):
+    """Verify the package action tokens and generating policy against its rollout."""
+    def verify_designer_action(self, tokens: Tokens, checkpoint: Checkpoint,
+                               package_id: str, rollout_id: str) -> bool: ...

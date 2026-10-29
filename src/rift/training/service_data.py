@@ -7,6 +7,10 @@ from rift.training.records import service_rollout
 def prepare_service_update(package_id, certified_tasks, episodes, checkpoint, recorder, *, algorithm='policy_gradient'):
     from usami_v2.runtime.runner import replay_episode
     if not certified_tasks: raise ValueError('certified tasks required')
+    episodes = tuple(episodes)
+    episode_ids = [episode.record_hash for episode in episodes]
+    if len(set(episode_ids)) != len(episode_ids):
+        raise ValueError('duplicate Service episode')
     rows = []
     for episode in episodes:
         task_id = episode.task.record_hash
@@ -21,6 +25,8 @@ def prepare_service_update(package_id, certified_tasks, episodes, checkpoint, re
         for call in calls:
             tokens = recorder.tokens_for_call(call, checkpoint)
             if not isinstance(tokens, Tokens): raise ValueError('verified tokens required')
-            rows.append(service_rollout(tokens, checkpoint, task_id, episode.record_hash, outcome))
+            rows.append(service_rollout(tokens, checkpoint, task_id, episode.record_hash, outcome, response_id=call.record_hash))
     if not rows: raise ValueError('no usable verified Service rollouts')
+    if {row.task_id for row in rows} != set(certified_tasks):
+        raise ValueError('every certified task must have a usable Service rollout')
     return UpdateRequest(checkpoint, package_id, tuple(rows), algorithm)

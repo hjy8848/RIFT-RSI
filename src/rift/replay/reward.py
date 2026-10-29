@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from math import isfinite, isclose
+from typing import Protocol
 from rift.training.contracts import CompletedUpdate
 
 @dataclass(frozen=True)
@@ -24,13 +25,24 @@ class ReplayReward:
         if any(not all(isfinite(v) for v in (r.before, r.after, r.delta)) or not isclose(r.delta, r.after-r.before, abs_tol=1e-12) for r in self.samples): raise ValueError("invalid sample score")
         if not isfinite(self.mean) or not isclose(self.mean, sum(r.delta for r in self.samples)/len(self.samples), abs_tol=1e-12): raise ValueError("invalid aggregate reward")
 
-def score_update(update, snapshot, scorer, checkpoint_store, *, normalization="sum"):
+class ReplayRewardVerifier(Protocol):
+    """Verify trusted score provenance for an update and frozen replay binding."""
+    def verify_reward(self, reward: ReplayReward, update: CompletedUpdate) -> bool: ...
+
+def score_update(update, snapshot, scorer, checkpoint_store, *, update_verifier, replay_verifier, normalization="sum"):
     if not isinstance(update, CompletedUpdate): raise ValueError("completed Service update required")
+    if update_verifier.verify_update(update) is not True:
+        raise ValueError("Service update evidence was not verified")
     if not snapshot.verify(): raise ValueError("invalid replay snapshot")
-    if {r.task_id for r in update.request.rollouts} - {i.task for i in snapshot.training}: raise ValueError("training identities do not cover update")
-    if any(r.reward_source != "business_outcome_v2" for r in update.request.rollouts): raise ValueError("Service update must use business rewards")
+    if any(replay_verifier.verify_demonstration(row) is not True for row in snapshot.rows):
+        raise ValueError("replay demonstration evidence was not verified")
+    if {r.task_id for r in update.request.rollouts} != {i.task for i in snapshot.training}:
+        raise ValueError("training identities do not match the update tasks")
+    if any(r.reward_source != "business_outcome_v2" or not r.response_id or r.reward_ref != r.episode_id for r in update.request.rollouts): raise ValueError("Service update must use linked business rewards and responses")
     if normalization not in ("sum", "mean"): raise ValueError("unknown normalization")
     before = update.request.policy_before; after = update.policy_after
+    if any(r.source_checkpoint.policy != before.policy or r.source_checkpoint.tokenizer != before.tokenizer for r in snapshot.rows):
+        raise ValueError("replay tokens require the same Service policy and tokenizer")
     if not checkpoint_store.verify(before) or not checkpoint_store.verify(after):
         raise ValueError("checkpoint verification failed")
     batch = [r.tokens for r in snapshot.rows]

@@ -1,21 +1,26 @@
 from dataclasses import dataclass
-from rift.schemas import Identity, Outcome, Split, Tokens
+from typing import Protocol
+from rift.schemas import Checkpoint, Identity, Outcome, Split, Tokens
 
 @dataclass(frozen=True)
 class Demonstration:
     sample_id: str
     identity: Identity
     episode_id: str
-    source_checkpoint: str
+    source_checkpoint: Checkpoint
     tokens: Tokens
     outcome: Outcome
     replay_verified: bool
     evidence_kind: str
     def __post_init__(self):
-        if not all((self.sample_id, self.episode_id, self.source_checkpoint)):
+        if not self.sample_id or not self.episode_id or not isinstance(self.source_checkpoint, Checkpoint):
             raise ValueError("missing replay provenance")
         if self.identity.split is not Split.REPLAY or self.outcome is not Outcome.SUCCESS or self.replay_verified is not True or self.evidence_kind != "real_model":
             raise ValueError("replay needs independently verified real-model business success")
+
+class ReplayEvidenceVerifier(Protocol):
+    """Resolve and verify the source episode, decision, checkpoint and tokens."""
+    def verify_demonstration(self, sample: Demonstration) -> bool: ...
 
 class DecisionEvidenceVerifier:
     """Trusted future capture boundary; implementation must verify provenance and visibility.
@@ -48,5 +53,25 @@ def extract_demonstrations(record, identity, checkpoint, registry, verifier):
     for call in calls:
         tokens = verifier.tokens_for_call(call, checkpoint)
         if not isinstance(tokens, Tokens): raise ValueError("verified tokens required")
-        rows.append(Demonstration(call.record_hash, identity, record.record_hash, checkpoint.weights_digest, tokens, Outcome.SUCCESS, True, 'real_model'))
+        rows.append(Demonstration(call.record_hash, identity, record.record_hash, checkpoint, tokens, Outcome.SUCCESS, True, 'real_model'))
     return tuple(rows)
+
+class NativeReplayEvidenceVerifier:
+    """Rebuild a sample from its resolved native episode and trusted token capture.
+
+    The episode resolver, split registry, and decision verifier remain trusted
+    infrastructure. This class does not establish that a token verifier or model
+    source is genuine merely because it has been passed by a caller.
+    """
+    def __init__(self, episode_resolver, registry, decision_verifier):
+        self.episode_resolver = episode_resolver
+        self.registry = registry
+        self.decision_verifier = decision_verifier
+
+    def verify_demonstration(self, sample):
+        if not isinstance(sample, Demonstration): return False
+        record = self.episode_resolver(sample.episode_id)
+        if record is None or record.record_hash != sample.episode_id: return False
+        reconstructed = extract_demonstrations(record, sample.identity, sample.source_checkpoint,
+            self.registry, self.decision_verifier)
+        return sample in reconstructed
