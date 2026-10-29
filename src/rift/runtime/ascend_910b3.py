@@ -493,11 +493,12 @@ class Ascend910B3RoleRuntime:
 def initialize_checkpoint(role, model_path, output_dir, *, checkpoint_store,
                           serving_attestor, run_root, agent_loop_config=None):
     """Create and verify one true starting checkpoint through VERL's FSDP2 worker."""
+    tokenizer_id = str(Path(model_path).resolve())
     runtime = Ascend910B3RoleRuntime(role, None, model_path=model_path,
         run_root=run_root, checkpoint_store=checkpoint_store,
         serving_attestor=serving_attestor, agent_loop_config=agent_loop_config)
     try:
-        return runtime.save_initial_checkpoint(output_dir, tokenizer_id=str(model_path))
+        return runtime.save_initial_checkpoint(output_dir, tokenizer_id=tokenizer_id)
     finally:
         runtime.close()
 

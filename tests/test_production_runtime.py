@@ -12,6 +12,7 @@ from rift.runtime.resources import ExclusivePolicyResources
 from rift.runtime.ascend_910b3 import (
     _check_ray_socket_path,
     _forward_ascend_worker_environment,
+    initialize_checkpoint,
     _require_cann_atb_library,
 )
 from rift.schemas import Checkpoint, Outcome
@@ -69,6 +70,32 @@ def test_missing_cann_atb_library_fails_before_ray_with_setup_command(monkeypatc
     monkeypatch.setattr(ctypes, "CDLL", missing_library)
     with pytest.raises(RuntimeError, match="/nnal/atb/set_env\\.sh"):
         _require_cann_atb_library()
+
+
+def test_initial_checkpoint_uses_resolved_model_identity(monkeypatch, tmp_path):
+    from rift.runtime import ascend_910b3
+
+    model_path = tmp_path / "model-link"
+    seen = {}
+
+    class Runtime:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def save_initial_checkpoint(self, output_dir, *, tokenizer_id):
+            seen["tokenizer_id"] = tokenizer_id
+            return "checkpoint"
+
+        def close(self):
+            seen["closed"] = True
+
+    monkeypatch.setattr(ascend_910b3, "Ascend910B3RoleRuntime", Runtime)
+    result = initialize_checkpoint("service", model_path, tmp_path / "checkpoint",
+        checkpoint_store=None, serving_attestor=None, run_root=tmp_path)
+
+    assert result == "checkpoint"
+    assert seen["tokenizer_id"] == str(model_path.resolve())
+    assert seen["closed"] is True
 
 
 def test_production_config_pins_complete_grpo_and_measured_overlay(monkeypatch):
