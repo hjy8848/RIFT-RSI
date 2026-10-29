@@ -14,11 +14,16 @@ from rift.verl.version import require_verl_version
 
 
 def validate_request(request, role, rollout_verifier):
-    if not isinstance(request, UpdateRequest) or request.algorithm.lower() not in ('grpo', 'reinforce_plus_plus'):
+    if not isinstance(request, UpdateRequest) or request.algorithm.lower() not in ('grpo', 'reinforce_plus_plus', 'reinforce_baseline'):
         raise ValueError('unsupported on-policy advantage estimator')
     if role not in ('service', 'designer'): raise ValueError('unknown policy role')
     if role == 'service' and request.algorithm.lower() != 'grpo':
         raise ValueError('Service updates require verified same-task GRPO groups')
+    if role == 'designer' and request.reward_protocol == 'dual_bank_outcome_v1':
+        comparable_designer_rollouts(request.rollouts, algorithm=request.algorithm,
+            credit_assignment_mode=request.credit_assignment_mode)
+        if request.algorithm.lower() == 'reinforce_baseline' and request.advantage_baseline is None:
+            raise ValueError('sequential Designer policy gradient requires an explicit scalar baseline')
     for row in request.rollouts:
         if (request.algorithm.lower() == 'grpo' and not row.group_id) or not row.response_id or not row.reward_ref:
             raise ValueError('rollout, reward and group provenance are required')
@@ -34,7 +39,8 @@ def validate_request(request, role, rollout_verifier):
                 raise ValueError('Service GRPO groups must use the same task')
             if rollout_verifier.verify_group(group, request.policy_before) is not True:
                 raise ValueError('GRPO group provenance was not verified')
-    if role == 'designer': comparable_designer_rollouts(request.rollouts)
+    if role == 'designer' and request.reward_protocol != 'dual_bank_outcome_v1':
+        comparable_designer_rollouts(request.rollouts)
     return request
 
 
@@ -94,6 +100,20 @@ class VerlGRPOBackend:
         if request.algorithm.lower() == 'grpo':
             advantages, _ = compute_grpo_outcome_advantage(rewards, tensors['response_mask'],
                 np.asarray([row.group_id for row in rows], dtype=object))
+        elif request.algorithm.lower() == 'reinforce_baseline':
+            # Sequential Service baselines are nonstationary. Apply a scalar
+            # control variate directly to each captured Designer action token;
+            # do not use GRPO or batch whitening across incomparable rounds.
+            advantages = torch.zeros_like(tensors['response_mask'], dtype=torch.float32)
+            for i, row in enumerate(rows):
+                selected = torch.as_tensor(row.tokens.mask, dtype=torch.bool,
+                                           device=advantages.device)
+                width = min(selected.numel(), advantages.shape[1])
+                selected = selected[:width]
+                advantages[i, :width] = torch.where(selected,
+                    torch.full((width,), row.reward - request.advantage_baseline,
+                               dtype=torch.float32, device=advantages.device),
+                    torch.zeros((width,), dtype=torch.float32, device=advantages.device))
         else:
             from types import SimpleNamespace
             advantages, _ = compute_reinforce_plus_plus_outcome_advantage(

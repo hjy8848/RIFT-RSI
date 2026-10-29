@@ -1,7 +1,7 @@
 """Trusted in-process registry for native Usami task certificates."""
 from dataclasses import dataclass
 from datetime import timedelta
-from rift.schemas import Identity, Split
+from rift.schemas import DataPurpose, Identity, Split
 
 @dataclass(frozen=True)
 class CertifiedNativeTask:
@@ -27,9 +27,25 @@ class CertifiedTaskRegistry:
         from usami_v2.scenarios.task_certification import verify_task_certificate
         identity, task, world, profile, scenario, cert = (record.identity, record.task, record.world,
             record.profile, record.scenario, record.certificate)
-        if (not isinstance(identity, Identity) or identity.split is not Split.TRAIN
+        if not isinstance(identity, Identity): return False
+        expected = {
+            DataPurpose.TRAIN: (Split.TRAIN, ("train",)),
+            DataPurpose.DIAGNOSIS: (Split.TRAIN, ("train",)),
+            DataPurpose.RECOVERY_FEEDBACK: (Split.VALIDATION, ("validation", "heldout")),
+            DataPurpose.RETENTION_FEEDBACK: (Split.VALIDATION, ("validation", "heldout")),
+            DataPurpose.REPLAY_LOGP_FEEDBACK: (Split.REPLAY, ("train", "validation", "heldout")),
+            DataPurpose.VALIDATION: (Split.VALIDATION, ("validation",)),
+            DataPurpose.TEST: (Split.TEST, ("heldout",)),
+        }
+        purpose = identity.purpose
+        if purpose is None:
+            # Legacy training records predate logical purposes and remain readable.
+            expected_split, partitions = Split.TRAIN, ("train",)
+        else:
+            expected_split, partitions = expected[purpose]
+        if (identity.split is not expected_split
                 or not self.split_registry.contains(identity) or identity.task != task.record_hash
-                or identity.world != world.state_hash or task.partition != 'train'
+                or identity.world != world.state_hash or task.partition not in partitions
                 or task.world_hash != world.state_hash or profile.customer_id != task.customer_id
                 or scenario.customer_id != task.customer_id or cert.task_hash != task.record_hash
                 or cert.world_hash != world.state_hash or cert.status != 'CERTIFIED'
@@ -51,7 +67,13 @@ class CertifiedTaskRegistry:
         record = self._records.get(task_ref)
         if record is None or not self._check(record): raise ValueError('certified task evidence unavailable')
         return record.world, record.task, record.profile, record.external_events
-    def verify_task(self, task_ref, world, task, profile):
+    def resolve_record(self, task_ref):
+        record = self._records.get(task_ref)
+        if record is None or not self._check(record):
+            raise ValueError('certified task evidence unavailable')
+        return record
+    def verify_task(self, task_ref, world, task, profile, *, purpose=None):
         record = self._records.get(task_ref)
         return bool(record is not None and record.world == world and record.task == task
-                    and record.profile == profile and self._check(record))
+                    and record.profile == profile and self._check(record)
+                    and (purpose is None or record.identity.purpose is purpose))

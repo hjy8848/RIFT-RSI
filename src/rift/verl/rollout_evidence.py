@@ -2,7 +2,7 @@
 import json
 from rift.schemas import Outcome
 from rift.benchmark.public_feedback import service_reward
-from rift.training.records import replay_source
+from rift.training.records import designer_reward_source, reward_scalar
 
 # Actor scoring below uses the unmodified policy at temperature 1. Reject
 # sampling transformations unless their behavior-policy correction is added.
@@ -68,9 +68,11 @@ class DesignerRolloutVerifier:
         pair = self.feedback_resolver(row.reward_ref)
         if pair is None: return False
         update, reward = pair
+        reward_update_id = getattr(reward, 'update_run_id', getattr(reward, 'service_update_run_id', None))
         if (update.run_id != row.reward_ref or update.request.package_id != row.task_id
-                or reward.package_id != row.task_id or reward.update_run_id != update.run_id
-                or row.reward != reward.mean or row.reward_source != replay_source(update.request.policy_before, reward.snapshot_digest, reward.normalization)):
+                or reward.package_id != row.task_id or reward_update_id != update.run_id
+                or row.reward != reward_scalar(reward)
+                or row.reward_source != designer_reward_source(reward, update)):
             return False
         return self.update_verifier.verify_update(update) is True and self.reward_verifier.verify_reward(reward, update) is True
     def verify_group(self, rows, checkpoint):

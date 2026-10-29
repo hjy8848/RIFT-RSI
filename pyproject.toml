@@ -8,6 +8,7 @@ requires-python = ">=3.10"
 description = "Replay-grounded learning value research contracts"
 [project.scripts]
 rift-verl-round = "rift.verl.cli:main"
+rift-evolve = "rift.evolution.cli:main"
 
 [project.optional-dependencies]
 usami = ["pydantic>=2.12,<3"]

@@ -28,11 +28,21 @@ class UpdateRequest:
     package_id: str
     rollouts: tuple[Rollout, ...]
     algorithm: str
+    advantage_baseline: float | None = None
+    reward_protocol: str | None = None
+    credit_assignment_mode: str | None = None
     def __post_init__(self):
         if not self.package_id or not self.algorithm or not self.rollouts:
             raise ValueError("update requires package, algorithm and rollouts")
+        if self.advantage_baseline is not None and not isfinite(self.advantage_baseline):
+            raise ValueError("finite scalar advantage baseline required")
         if any(r.policy != self.policy_before for r in self.rollouts):
             raise ValueError("rollouts must match checkpoint")
+        if self.algorithm.lower() == "reinforce_baseline":
+            if (self.advantage_baseline is None or self.reward_protocol != "dual_bank_outcome_v1"
+                    or self.credit_assignment_mode != "sequential_curriculum"
+                    or any(r.group_id is not None for r in self.rollouts)):
+                raise ValueError("sequential REINFORCE baseline needs explicit dual-bank protocol and no fake groups")
         if self.algorithm.lower() == "grpo":
             groups = {}
             for r in self.rollouts:
@@ -40,6 +50,10 @@ class UpdateRequest:
                 groups.setdefault(r.group_id, []).append(r)
             if any(len({r.episode_id for r in g}) < 2 or len({r.tokens.prompt for r in g}) != 1 for g in groups.values()):
                 raise ValueError("GRPO groups require distinct rollouts from the same prompt")
+            if any(len({r.reward_source for r in g}) != 1 for g in groups.values()):
+                raise ValueError("GRPO group members need a common, comparable reward source")
+            if any(len({r.policy for r in g}) != 1 for g in groups.values()):
+                raise ValueError("GRPO group members must use one policy checkpoint")
 
 @dataclass(frozen=True)
 class CompletedUpdate:

@@ -1,0 +1,40 @@
+# Main Designer objective. This is configuration only; runtime factories must
+# provide trusted Usami, evidence, VERL and checkpoint adapters.
+schema_version: 1
+reward:
+  primary: dual_bank_outcome_v1
+  formula: "(recovery_after_sr - recovery_before_sr) - lambda_retention * max(0, retention_before_sr - retention_after_sr)"
+  lambda_retention: 0.5
+  min_valid_fraction: 0.8
+  unknown_outcome: exclude
+  allowed_probe_evidence: [REAL_SERVICE]
+  legacy_comparison: replay_logp_v1
+banks:
+  bootstrap_trials_per_task: 5
+  success_threshold: 0.75
+  failure_threshold: 0.25
+  diagnosis_limit: 8
+  split_policy_version: instance_disjoint_within_family_v1
+probes:
+  selection: seeded_random
+  recovery_tasks: 16
+  retention_tasks: 16
+  trials_per_task: 5
+  freeze_before_service_update: true
+  reuse_exact_task_seed_protocol: true
+service:
+  algorithm: grpo
+  full_parameter: true
+  lora_rank: 0
+  unknown_group_policy: discard_entire_group
+designer:
+  algorithm: reinforce_baseline
+  full_parameter: true
+  lora_rank: 0
+  credit_assignment: sequential_curriculum
+  scalar_advantage_baseline: 0.0
+  batch_whitening: false
+  group_id: null
+test:
+  feedback_from_test: false
+  periodic_interval_rounds: 0

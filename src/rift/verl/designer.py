@@ -5,6 +5,7 @@ from pathlib import Path
 from uuid import uuid4
 import json
 from rift.benchmark.public_feedback import PublicSummary
+from rift.banks.records import DiagnosisExperience
 from rift.schemas import Checkpoint, Tokens
 from rift.tasks import Proposal
 from rift.training.trace import ExactPolicyTrace, digest
@@ -40,6 +41,24 @@ class DesignerCaptureStore:
         with self._path(pending.rollout_id).open('x', encoding='utf-8') as stream:
             json.dump({'trace':asdict(trace), 'request':request, 'response':response,
                 'group_id':pending.group_id, 'proposals':[asdict(p) for p in pending.proposals]}, stream, sort_keys=True)
+    def load_pending(self, rollout_id):
+        """Restore an exact generated Designer action for delayed reward recovery."""
+        raw = json.loads(self._path(rollout_id).read_text(encoding='utf-8'))
+        t = raw['trace']; token = t['tokens']
+        trace = ExactPolicyTrace(t['role'], t['rollout_id'], t['decision_id'],
+            Checkpoint(**t['policy']), Tokens(tuple(token['prompt']), tuple(token['response']),
+                tuple(token['mask'])), t['request_digest'], t['response_digest'],
+            t['serialization'], t['evidence_ref'], t['package_id'])
+        proposals = tuple(Proposal(row['proposal_id'], row['hypothesis'],
+            row['public_request'], row['abstract_spec']) for row in raw['proposals'])
+        response = raw['response']
+        logprobs = response.get('log_probs')
+        pending = PendingDesignerRollout(trace.package_id, rollout_id, raw['group_id'],
+            trace.policy, proposals, trace, None if logprobs is None else tuple(logprobs))
+        if not proposals or self.verify_designer_action(trace.tokens, trace.policy,
+                trace.package_id, rollout_id, raw['group_id']) is not True:
+            raise ValueError('persisted Designer generation evidence failed verification')
+        return pending
     def verify_designer_action(self, tokens, checkpoint, package_id, rollout_id, group_id=None):
         try:
             record = json.loads(self._path(rollout_id).read_text(encoding='utf-8'))
@@ -67,7 +86,8 @@ class DesignerSampler:
         self.checkpoint_verifier, self.capture_store, self.serialization = checkpoint_verifier, capture_store, serialization
     async def sample(self, summaries, checkpoint, package_id, sampling_params, *, group_id=None,
                      group_size=None, rollout_id=None):
-        summaries = tuple(summaries)
+        summaries = tuple(row.summary if isinstance(row, DiagnosisExperience) else row
+                          for row in summaries)
         if not summaries or any(not isinstance(row, PublicSummary) for row in summaries):
             raise ValueError('Designer receives public summaries only')
         if not package_id or not self.serialization or self.checkpoint_verifier.verify(checkpoint) is not True:
