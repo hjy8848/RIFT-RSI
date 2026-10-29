@@ -52,14 +52,17 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
                 extra_fields={'global_steps':1,'min_global_steps':1,'max_global_steps':1})
     loop.server_manager = Server()
     class Session:
-        rollout_id = 'fake-rollout'
-        group_id = 'group'
-        def __init__(self): self.n=0; self.expected_group_size=None
+        def __init__(self, rollout_id='fake-rollout', group_id='group', group_size=4,
+                     sampling_seed=7, customer_seed=11):
+            self.rollout_id, self.group_id = rollout_id, group_id
+            self.sampling_seed, self.customer_seed = sampling_seed, customer_seed
+            self.sampling_scope = f'test:{rollout_id}'
+            self.n=0; self.expected_group_size=group_size
         async def start(self): return ([{'role':'user','content':'refund'}], [])
         async def advance(self, tokens, prefix, sampling_params, token_logprobs, generation_id, serving_fields=None):
             self.n += 1
             return ({'role':'assistant','content':'action'}, [{'role':'tool','content':'EVIDENCE_REQUIRED'}], self.n == 2)
-        async def finish(self): return 'episode'
+        async def finish(self): return SimpleNamespace(record_hash='e' * 64, replay_verified=True)
         def public_outcome(self, episode): return Outcome.SUCCESS
     class Verifier:
         def verify(self, checkpoint): return True
@@ -69,21 +72,29 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
     class Sink:
         attestor = Verifier()
         async def persist(self, episode, checkpoint, decisions, tokens): self.decisions = decisions
+        def evidence_ref(self, episode): return 'host-private-evidence-ref'
     monkeypatch.setattr('rift.benchmark.usami.public_episode', lambda episode: SimpleNamespace(outcome=Outcome.SUCCESS))
     sink = Sink()
     class Host:
         def __init__(self): self.sessions=[]
-        async def open_rollout(self, task_ref, group_id, session_id, tokenizer):
-            session = Session(); self.sessions.append(session)
+        async def open_rollout(self, task_ref, group_id, session_id, tokenizer, *, sampling_seed,
+                               customer_seed, rollout_id, expected_checkpoint, group_size):
+            session = Session(rollout_id, group_id, group_size, sampling_seed, customer_seed)
+            self.sessions.append(session)
             return session, Checkpoint('service','v1','tok','weights'), Verifier(), sink
     host = Host()
     loop.rift_host_provider = host
     with pytest.raises(ValueError, match='private host objects'):
         asyncio.run(loop.run({}, rift_task_ref='opaque', uid='group', rift_session=Session()))
-    with pytest.raises(ValueError, match='RIFT group size must match VERL rollout.n'):
+    with pytest.raises(ValueError, match='RIFT group size must exactly match VERL rollout.n'):
         asyncio.run(loop.run({}, rift_task_ref='opaque', uid='group', session_id=0,
-                             rift_group_size=2))
-    result = asyncio.run(loop.run({}, rift_task_ref='opaque', uid='group', session_id=0))
+            rift_request_id='request-bad', rift_mode='train', rift_group_size=2,
+            rift_rollout_id='rollout-bad', rift_sampling_seed=3, rift_customer_seed=4,
+            rift_expected_checkpoint={'policy':'service','revision':'v1','tokenizer':'tok','weights_digest':'weights'}))
+    result = asyncio.run(loop.run({}, rift_task_ref='opaque', uid='group', session_id=0,
+        rift_request_id='request-good', rift_mode='train', rift_group_size=4,
+        rift_rollout_id='rollout-good', rift_sampling_seed=3, rift_customer_seed=4,
+        rift_expected_checkpoint={'policy':'service','revision':'v1','tokenizer':'tok','weights_digest':'weights'}))
     assert loop.server_manager.inputs == [[1], [1, 2, 3, 7]]
     assert result.response_ids == [2, 3, 7, 4] and result.response_mask == [1, 1, 0, 1]
     assert result.reward_score == 1 and sink.decisions[1].tokens.prompt == (1, 2, 3, 7)
@@ -413,7 +424,7 @@ def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkey
                 return '', [SimpleNamespace(name=op.name, arguments=json.dumps({'scope_id':op.scope_id,'resource_id':op.resource_id,'params':op.params}), tool_call_id=None)]
             return '', [SimpleNamespace(name='respond_to_customer', arguments=json.dumps({'message':action.message,'present_quote_id':action.present_quote_id,'present_for':action.present_for,'subject_ids':list(action.subject_ids)}), tool_call_id=None)]
     class Base:
-        def __init__(self): self.rollout_config = SimpleNamespace(response_length=100); self.tokenizer = None
+        def __init__(self): self.rollout_config = SimpleNamespace(response_length=100, n=4); self.tokenizer = None
         async def ct_build_initial_tokens(self, messages, tools=None): return [1]
         async def ct_merge_assistant_token(self, old, output, mask, logs, assistant_logprobs=None):
             return SimpleNamespace(token_ids=old + output), mask + [1] * len(output), None
@@ -449,13 +460,17 @@ def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkey
     sink = NativeCaptureStore(tmp_path / 'captures', serialization='fake-template', attestor=ledger)
     session = NativeUsamiSession(world, refund_task(world,aliases), refund_profile(aliases), ScriptedCustomer(), FakeParser(),
         group_id='group', sampling_seed=23, sampling_scope='paired-probe-scope',
+        rollout_id='native-rollout', group_size=4, task_ref='opaque', rift_mode='train', customer_seed=91,
         budget=EpisodeBudget(max_customer_turns=3,max_service_decisions=10,max_service_tool_calls=8,max_model_calls=10))
     class Host:
-        async def open_rollout(self, task_ref, group_id, session_id, tokenizer):
+        async def open_rollout(self, task_ref, group_id, session_id, tokenizer, **kwargs):
             return session, cp, verifier, sink
     loop.rift_host_provider = Host()
     async def run():
-        output = await loop.run({'temperature':1.0}, rift_task_ref='opaque', uid='group', session_id=0)
+        output = await loop.run({'temperature':1.0}, rift_task_ref='opaque', uid='group', session_id=0,
+            rift_request_id='request-1', rift_mode='train', rift_group_size=4,
+            rift_rollout_id='native-rollout', rift_sampling_seed=23, rift_customer_seed=91,
+            rift_expected_checkpoint={'policy':'service','revision':'v1','tokenizer':'tok','weights_digest':'fake-weights'})
         episode = await session.finish()
         assert output.reward_score == 1.0 and sink.verify_trajectory(episode, cp)
         assert len(episode.model_calls) == loop.server_manager.i
@@ -568,7 +583,7 @@ def test_host_provider_resolves_private_task_inside_worker(monkeypatch):
     class Authorizer:
         def verify_task(self, ref, w, t, p): return w is world and t is task and p is profile
     class Customers:
-        def create(self, ref): return 'native-customer'
+        def create(self, ref, *, seed): return ('native-customer', seed)
     cp = Checkpoint('service','v1','tok','weights')
     class Source:
         def current(self): return cp
@@ -579,11 +594,14 @@ def test_host_provider_resolves_private_task_inside_worker(monkeypatch):
     monkeypatch.setattr(NativeUsamiSession, 'with_verl_parser', lambda *a, **kw: marker)
     provider = NativeHostProvider(Resolver(), Authorizer(), Customers(), Source(), Store(), Sink(),
         budget=object(), parser_format='qwen')
-    session, checkpoint, _, _ = asyncio.run(provider.open_rollout('opaque','group',0,None))
+    session, checkpoint, _, _ = asyncio.run(provider.open_rollout('opaque','group',0,None,
+        sampling_seed=5, customer_seed=9, rollout_id='rollout', expected_checkpoint=cp,
+        group_size=4))
     assert session is marker and checkpoint == cp
     task.partition = 'heldout'
     with pytest.raises(ValueError, match='training task'):
-        asyncio.run(provider.open_rollout('opaque','group',0,None))
+        asyncio.run(provider.open_rollout('opaque','group',0,None, sampling_seed=5,
+            customer_seed=9, rollout_id='rollout', expected_checkpoint=cp, group_size=4))
 
 def test_probe_seed_reaches_customer_and_is_checkpoint_independent(monkeypatch):
     from rift.verl.host_provider import NativeHostProvider
@@ -616,8 +634,10 @@ def test_probe_seed_reaches_customer_and_is_checkpoint_independent(monkeypatch):
         budget=object(), parser_format='qwen')
     before = Checkpoint('service','before','tok','weights-before')
     after = Checkpoint('service','after','tok','weights-after')
-    first = asyncio.run(provider.open_probe('failure-F1', before, 41, 'eval-v1', None))[0]
-    second = asyncio.run(provider.open_probe('failure-F1', after, 41, 'eval-v1', None))[0]
+    first = asyncio.run(provider.open_probe('failure-F1', before, 41, 'eval-v1', None,
+        protocol_digest='eval-digest'))[0]
+    second = asyncio.run(provider.open_probe('failure-F1', after, 41, 'eval-v1', None,
+        protocol_digest='eval-digest'))[0]
     assert customers.seeds == [41, 41]
     assert first.rollout_id != second.rollout_id
     assert first.sampling_seed == second.sampling_seed == 41

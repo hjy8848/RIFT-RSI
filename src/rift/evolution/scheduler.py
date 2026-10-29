@@ -2,7 +2,9 @@
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
+import time
 from typing import Callable, Protocol
 
 from rift.abilities.registry import AbilityRegistry
@@ -50,7 +52,11 @@ class EvolutionRoundPlan:
     min_valid_fraction: float = 0.8
 
     def __post_init__(self):
-        if (self.state.stage is not Stage.CERTIFIED or not self.state.designer_action
+        resumable_stages = {Stage.CERTIFIED, Stage.PROBES_FROZEN, Stage.BASELINE_READY,
+            Stage.READY_FOR_TRAINING, Stage.SERVICE_TRAINING_COMPLETED,
+            Stage.PROBES_EVALUATED, Stage.LEARNING_REWARDED, Stage.DESIGNER_READY,
+            Stage.DESIGNER_TRAINING_COMPLETED}
+        if (self.state.stage not in resumable_stages or not self.state.designer_action
                 or (self.state.reward_mode != RewardMode.REPLAY_LOGP_V1.value
                     and self.state.training_package is None)):
             raise ValueError('round plan must start with a certified package and its captured Designer action')
@@ -97,12 +103,13 @@ class EvolutionScheduler:
     def __init__(self, *, bootstrap_runner: BootstrapRunner,
                  task_evidence_store: JsonTaskEvidenceStore, state_root,
                  success_threshold=0.75, failure_threshold=0.25,
-                 failure_context_limit=8, seed=0):
+                 failure_context_limit=8, seed=0, metric_sink=None):
         self.bootstrap_runner = bootstrap_runner
         self.task_evidence_store = task_evidence_store
         self.state_root = Path(state_root)
         self.success_threshold, self.failure_threshold = success_threshold, failure_threshold
         self.failure_context_limit, self.seed = failure_context_limit, seed
+        self.metric_sink = metric_sink
         if type(failure_context_limit) is not int or failure_context_limit < 1 or type(seed) is not int or seed < 0:
             raise ValueError('positive failure context limit and non-negative scheduler seed required')
 
@@ -205,20 +212,54 @@ class EvolutionScheduler:
         banks_path = Path(bank_manifest_path) if bank_manifest_path else self.state_root / 'evolving-banks.json'
         registry_path = (Path(ability_registry_path) if ability_registry_path
                          else self.state_root / 'ability-registry.json')
+        if banks_path.exists():
+            from rift.banks.core import BankManager
+            banks = BankManager.load(banks_path)
+        else:
+            banks = bootstrap.bank_manager
         ability_registry = (AbilityRegistry.load(registry_path) if registry_path.exists()
                             else AbilityRegistry())
         banks.save(banks_path)
         service_checkpoint, designer_checkpoint, previous = initial_service, initial_designer, None
         completed = []
         for index in range(rounds):
+            state_path = self.state_root / f'round-{index:06d}.json'
+            finalized_path = state_path.with_name(state_path.stem + '.finalized.json')
+            if finalized_path.exists():
+                load_completed = getattr(plan_factory, 'load_completed_state', None)
+                if not callable(load_completed):
+                    raise ValueError('completed rounds require a trusted state recovery adapter')
+                restored = load_completed(state_path)
+                marker = json.loads(finalized_path.read_text(encoding='utf-8'))
+                state_digest = sha256(state_path.read_bytes()).hexdigest()
+                if (restored.stage is not Stage.DESIGNER_TRAINING_COMPLETED
+                        or restored.round_index != index
+                        or marker.get('state_digest') != state_digest
+                        or marker.get('service_checkpoint') != asdict(restored.service_update.policy_after)
+                        or marker.get('designer_checkpoint') != asdict(restored.designer_update.policy_after)):
+                    raise ValueError('round finalization marker differs from verified persisted state')
+                service_checkpoint = restored.service_update.policy_after
+                designer_checkpoint = restored.designer_update.policy_after
+                previous = restored
+                completed.append(restored)
+                continue
+            round_started = time.perf_counter()
             failure_records = banks.failure_bank.sample_records(
                 limit=self.failure_context_limit, seed=self.seed + index)
             failures = tuple(public_projection(row) for row in failure_records)
             ability_options = ability_registry.prompts()
             ability_registry.save(registry_path)
-            plan = plan_factory.build(index, service_checkpoint, designer_checkpoint,
-                                      banks, ability_registry, failures,
-                                      failure_records, ability_options, previous)
+            if state_path.exists():
+                resume = getattr(plan_factory, 'resume', None)
+                if not callable(resume):
+                    raise ValueError('an incomplete persisted round requires exact-action resume support')
+                plan = resume(index, service_checkpoint, designer_checkpoint,
+                    banks, ability_registry, failures, failure_records,
+                    ability_options, previous, state_path)
+            else:
+                plan = plan_factory.build(index, service_checkpoint, designer_checkpoint,
+                    banks, ability_registry, failures, failure_records,
+                    ability_options, previous)
             if not isinstance(plan, EvolutionRoundPlan):
                 raise TypeError('plan factory must return EvolutionRoundPlan')
             if plan.state.round_index != index:
@@ -246,7 +287,6 @@ class EvolutionScheduler:
                 raise ValueError('round plan does not continue the latest Service checkpoint')
             if plan.state.expected_designer != (None if previous is None else designer_checkpoint):
                 raise ValueError('round plan does not continue the latest Designer checkpoint')
-            state_path = self.state_root / f'round-{index:06d}.json'
             result = self.execute_round(plan, state_path)
             if result.stage is not Stage.DESIGNER_TRAINING_COMPLETED:
                 raise ValueError('round did not complete both verified policy updates')
@@ -255,6 +295,17 @@ class EvolutionScheduler:
                                           reward_verifier=plan.reward_verifier)
             ability_registry.save(registry_path)
             banks.save(banks_path)
+            if self.metric_sink is not None:
+                self.metric_sink('round_wall_time_seconds', time.perf_counter() - round_started,
+                    round_index=index, service_checkpoint=result.service_update.policy_after.revision,
+                    designer_checkpoint=result.designer_update.policy_after.revision)
+            marker = {"schema_version": 1,
+                "state_digest": sha256(state_path.read_bytes()).hexdigest(),
+                "service_checkpoint": asdict(result.service_update.policy_after),
+                "designer_checkpoint": asdict(result.designer_update.policy_after)}
+            temporary = finalized_path.with_suffix(finalized_path.suffix + '.tmp')
+            temporary.write_text(json.dumps(marker, sort_keys=True), encoding='utf-8')
+            os.replace(temporary, finalized_path)
             completed.append(result)
             service_checkpoint, designer_checkpoint = result.service_update.policy_after, result.designer_update.policy_after
             previous = result

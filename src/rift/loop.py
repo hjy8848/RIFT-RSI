@@ -3,6 +3,7 @@ from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 import json
+import os
 
 from rift.schemas import Checkpoint, Tokens
 from rift.tasks import Certification, CertificationStatus
@@ -413,7 +414,15 @@ class LoopState:
 
     def save(self, path):
         payload = {"schema_version": 4, **asdict(self)}
-        Path(path).write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding='utf-8')
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + f'.{os.getpid()}.tmp')
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+            json.dump(payload, stream, ensure_ascii=False, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
 
     @classmethod
     def load(cls, path, *, update_verifier=None, reward_verifier=None,

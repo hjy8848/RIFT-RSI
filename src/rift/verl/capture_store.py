@@ -1,6 +1,7 @@
-"""Persist and verify generation-time token evidence without storing Oracle data."""
+"""Persist host-private native Usami replay evidence and exact generation tokens."""
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 from rift.schemas import Checkpoint, Tokens
 from rift.training.trace import ExactPolicyTrace, RecordedDecisionEvidenceVerifier, digest
@@ -10,6 +11,11 @@ def _tokens(value):
     return Tokens(tuple(value['prompt']), tuple(value['response']), tuple(value['mask']))
 
 class NativeCaptureStore:
+    """Host-private native Episodes plus exact generation evidence.
+
+    EpisodeRecord includes private benchmark replay evidence and must remain in
+    this store. Designer-facing data is produced separately by public projection.
+    """
     def __init__(self, root, *, serialization, attestor):
         if not serialization: raise ValueError('serialization identity required')
         self.root = Path(root)
@@ -56,10 +62,53 @@ class NativeCaptureStore:
             raise ValueError('rollout and group provenance must remain consistent')
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = self._path(episode)
-        with path.open('x', encoding='utf-8') as stream:
-            json.dump({'episode_id':episode.record_hash, 'checkpoint':asdict(checkpoint),
-                'trajectory':asdict(trajectory), 'traces':traces,
-                'group_id':next(iter(groups)), 'rollout_id':next(iter(rollouts))}, stream, sort_keys=True)
+        payload = {'episode_id':episode.record_hash, 'checkpoint':asdict(checkpoint),
+            'trajectory':asdict(trajectory), 'traces':traces,
+            'group_id':next(iter(groups)), 'rollout_id':next(iter(rollouts)),
+            'episode_record':episode.model_dump(mode='json')}
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+            json.dump(payload, stream, sort_keys=True)
+
+    def evidence_ref(self, episode):
+        """Return the opaque host evidence reference used by ObservedTrial."""
+        return str(self._path(episode))
+
+    def resolve_episode(self, episode_id):
+        """Restore a native Usami EpisodeRecord for replay and evidence checks."""
+        if (not isinstance(episode_id, str) or len(episode_id) != 64
+                or any(ch not in '0123456789abcdef' for ch in episode_id)):
+            raise ValueError('invalid Episode ID')
+        raw = json.loads((self.root / (episode_id + '.json')).read_text(encoding='utf-8'))
+        from usami_v2.runtime.runner import EpisodeRecord
+        episode = EpisodeRecord.model_validate(raw['episode_record'])
+        if episode.record_hash != episode_id or raw.get('episode_id') != episode_id:
+            raise ValueError('stored native Episode hash does not match its reference')
+        return episode
+
+    def resolve_rollout(self, rollout_id, checkpoint):
+        """Recover one previously captured deterministic rollout after interruption."""
+        if not isinstance(rollout_id, str) or not rollout_id:
+            raise ValueError('rollout identity required')
+        if not self.root.exists():
+            return None
+        matches = []
+        for path in self.root.glob('*.json'):
+            try:
+                raw = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError) as exc:
+                raise ValueError(f'capture store contains unreadable evidence: {path.name}') from exc
+            if raw.get('rollout_id') != rollout_id:
+                continue
+            episode = self.resolve_episode(raw.get('episode_id'))
+            if (Checkpoint(**raw['checkpoint']) != checkpoint
+                    or not self.verify_trajectory(episode, checkpoint)):
+                raise ValueError('persisted rollout cannot be recovered at the requested checkpoint')
+            matches.append(episode)
+        if len(matches) > 1:
+            raise ValueError('rollout identity is bound to multiple native Episodes')
+        return matches[0] if matches else None
     def _load(self, episode, checkpoint):
         data = json.loads(self._path(episode).read_text(encoding='utf-8'))
         if data['episode_id'] != episode.record_hash or Checkpoint(**data['checkpoint']) != checkpoint:

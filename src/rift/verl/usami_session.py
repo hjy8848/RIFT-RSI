@@ -19,7 +19,8 @@ class _ParserExecutionFailure(Exception):
 class NativeUsamiSession:
     def __init__(self, world, task, profile, customer_agent, parser, *, budget, parser_schemas=None,
                  mode='reference', external_events=(), rollout_id=None, group_id=None, group_size=None,
-                 sampling_seed=None, sampling_scope=None):
+                 sampling_seed=None, sampling_scope=None, task_ref=None, rift_mode='train',
+                 customer_seed=None, protocol_ref=None, protocol_digest=None):
         self.world, self.task, self.profile, self.customer_agent = world, task, profile, customer_agent
         self.parser, self.budget, self.parser_schemas = parser, budget, parser_schemas
         self.mode, self.external_events = mode, external_events
@@ -30,6 +31,13 @@ class NativeUsamiSession:
                                           or not sampling_scope):
             raise ValueError('probe sampling seed and stable scope must be supplied together')
         self.sampling_seed, self.sampling_scope = sampling_seed, sampling_scope
+        self.task_ref, self.rift_mode = task_ref, rift_mode
+        self.customer_seed = customer_seed
+        self.protocol_ref, self.protocol_digest = protocol_ref, protocol_digest
+        if rift_mode not in ('train', 'probe'):
+            raise ValueError('RIFT episode mode must be train or probe')
+        if rift_mode == 'probe' and (not task_ref or not protocol_ref or not protocol_digest):
+            raise ValueError('Probe session must bind task and frozen evaluation protocol')
         self._parser_failure = None
         self._responses = Queue()
         self._finished = None
@@ -104,7 +112,10 @@ class NativeUsamiSession:
         call = AgentCall(role='service', request={'prompt_ids': list(prompt_ids),
             'sampling_params': dict(sampling_params), 'rollout_id': self.rollout_id,
             'group_id': self.group_id, 'group_size': self.expected_group_size,
-            'generation_id': generation_id}, response=response)
+            'generation_id': generation_id, 'rift_mode': self.rift_mode,
+            'task_ref': self.task_ref, 'sampling_seed': self.sampling_seed,
+            'customer_seed': self.customer_seed, 'protocol_ref': self.protocol_ref,
+            'protocol_digest': self.protocol_digest}, response=response)
         try:
             content, calls = await self.parser.extract_tool_calls(list(token_ids), self.parser_schemas)
             if not isinstance(content, str) or not isinstance(calls, (list, tuple)):

@@ -1,6 +1,10 @@
 """Trusted in-process registry for native Usami task certificates."""
 from dataclasses import dataclass
 from datetime import timedelta
+from hashlib import sha256
+import json
+import os
+from pathlib import Path
 from rift.schemas import DataPurpose, Identity, Split
 
 @dataclass(frozen=True)
@@ -14,15 +18,106 @@ class CertifiedNativeTask:
     external_events: tuple = ()
 
 class CertifiedTaskRegistry:
-    def __init__(self, split_registry):
+    def __init__(self, split_registry, *, storage_path=None):
         self.split_registry = split_registry
+        self.storage_path = None if storage_path is None else Path(storage_path)
         self._records = {}
+    @property
+    def task_refs(self):
+        return tuple(sorted(self._records))
     def register(self, record):
         if not isinstance(record, CertifiedNativeTask): raise TypeError('native certified task required')
         ref = record.task.record_hash
-        if ref in self._records: raise ValueError('task already registered')
+        existing = self._records.get(ref)
+        if existing is not None:
+            if existing == record and self._check(existing):
+                return existing
+            raise ValueError('TaskRef is already bound to different certified task evidence')
         if not self._check(record): raise ValueError('task or certificate is not authorized')
         self._records[ref] = record
+        try:
+            if self.storage_path is not None:
+                self.save()
+        except BaseException:
+            del self._records[ref]
+            raise
+        return record
+
+    @staticmethod
+    def _encode_record(record):
+        identity = record.identity
+        return {
+            'world': record.world.model_dump(mode='json'),
+            'task': record.task.model_dump(mode='json'),
+            'profile': record.profile.model_dump(mode='json'),
+            'scenario': record.scenario.model_dump(mode='json'),
+            'certificate': record.certificate.model_dump(mode='json'),
+            'identity': {'world': identity.world, 'task': identity.task,
+                'family': identity.family, 'lineage': identity.lineage,
+                'split': identity.split.value,
+                'purpose': None if identity.purpose is None else identity.purpose.value},
+            'external_events': [event.model_dump(mode='json') for event in record.external_events],
+        }
+
+    def save(self, path=None):
+        """Persist validated native task certificates for exact deployment recovery."""
+        target = Path(path) if path is not None else self.storage_path
+        if target is None:
+            raise ValueError('a persistent CertifiedTaskRegistry path is required')
+        entries = {ref: self._encode_record(record)
+                   for ref, record in sorted(self._records.items())}
+        canonical = json.dumps(entries, sort_keys=True, ensure_ascii=False,
+                               separators=(',', ':'))
+        payload = json.dumps({'schema_version': 1,
+            'split_policy_version': self.split_registry.policy_version,
+            'records_digest': sha256(canonical.encode('utf-8')).hexdigest(),
+            'records': entries}, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = target.with_name(target.name + f'.{os.getpid()}.tmp')
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        return sha256(payload.encode('utf-8')).hexdigest()
+
+    @classmethod
+    def load(cls, path, split_registry):
+        """Reload and re-certify every persisted native task before it is usable."""
+        source = Path(path)
+        raw = json.loads(source.read_text(encoding='utf-8'))
+        if (not isinstance(raw, dict) or raw.get('schema_version') != 1
+                or raw.get('split_policy_version') != split_registry.policy_version
+                or not isinstance(raw.get('records'), dict)):
+            raise ValueError('unsupported or mismatched CertifiedTaskRegistry store')
+        canonical = json.dumps(raw['records'], sort_keys=True, ensure_ascii=False,
+                               separators=(',', ':'))
+        if sha256(canonical.encode('utf-8')).hexdigest() != raw.get('records_digest'):
+            raise ValueError('CertifiedTaskRegistry content digest mismatch')
+        from usami_v2.commerce.models import ExternalEvent, World
+        from usami_v2.runtime.customer import CustomerProfileV3
+        from usami_v2.scenarios.task_certification import CustomerScenario, TaskCertification
+        from usami_v2.scenarios.tasks import TaskSpecV3
+        registry = cls(split_registry)
+        for task_ref, row in raw['records'].items():
+            identity_raw = row['identity']
+            identity = Identity(identity_raw['world'], identity_raw['task'],
+                identity_raw['family'], identity_raw['lineage'],
+                Split(identity_raw['split']),
+                None if identity_raw['purpose'] is None else DataPurpose(identity_raw['purpose']))
+            record = CertifiedNativeTask(
+                World.model_validate(row['world']),
+                TaskSpecV3.model_validate(row['task']),
+                CustomerProfileV3.model_validate(row['profile']),
+                CustomerScenario.model_validate(row['scenario']),
+                TaskCertification.model_validate(row['certificate']), identity,
+                tuple(ExternalEvent.model_validate(event) for event in row['external_events']))
+            if record.task.record_hash != task_ref:
+                raise ValueError('CertifiedTaskRegistry key differs from native TaskRef')
+            registry.register(record)
+        registry.storage_path = source
+        return registry
     def _check(self, record):
         from usami_v2.scenarios.task_certification import verify_task_certificate
         identity, task, world, profile, scenario, cert = (record.identity, record.task, record.world,

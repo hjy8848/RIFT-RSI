@@ -87,10 +87,14 @@ class AbilityRegistry:
                creator_rollout_id=None):
         if not description or type(round_index) is not int or round_index < 0:
             raise ValueError("ability description and non-negative creation round required")
+        return self.add(AbilityRecord(self.next_id(), description, status,
+            round_index, round_index, creator_rollout_id=creator_rollout_id))
+
+    def next_id(self):
+        """Preview the stable Host ID for a not-yet-applied Designer NEW choice."""
         number = max((int(key[1:]) for key in self._records
                       if key.startswith("A") and key[1:].isdigit()), default=0) + 1
-        return self.add(AbilityRecord(f"A{number:06d}", description, status,
-            round_index, round_index, creator_rollout_id=creator_rollout_id))
+        return f"A{number:06d}"
 
     def apply_designer_choice(self, *, ability_id, hypothesis, add_failure_task_refs,
                               remove_failure_task_refs=(), visible_failures,

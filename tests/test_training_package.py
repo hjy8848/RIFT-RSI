@@ -3,6 +3,7 @@ import json
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -366,3 +367,108 @@ def test_unverified_world_is_rejected_before_package_assembly(native_fixture, mo
             designer_action_ref='a' * 32, target_ability_id='A000001',
             designer_result=result, benchmark_pool=pool, task_registry=task_registry,
             service_checkpoint_before=checkpoint, config=config, round_index=4)
+
+
+def test_certified_task_registry_reloads_and_reverifies_native_records(tmp_path, native_fixture):
+    from rift.verl.task_registry import CertifiedTaskRegistry
+    _, _, designer_world, registry, pool, splits, _, _ = native_fixture
+    split_path = tmp_path / 'splits.json'
+    task_path = tmp_path / 'tasks.json'
+    splits.save(split_path)
+    registry.save(task_path)
+
+    restored_splits = SplitRegistry.load(split_path)
+    restored = CertifiedTaskRegistry.load(task_path, restored_splits)
+    assert restored.task_refs == registry.task_refs
+    for task in designer_world.tasks:
+        assert restored.resolve_record(task.record_hash) == registry.resolve_record(task.record_hash)
+    for task_ref in pool.task_refs:
+        assert restored.resolve_record(task_ref) == registry.resolve_record(task_ref)
+
+    existing = registry.resolve_record(designer_world.tasks[0].record_hash)
+    assert registry.register(existing) is existing
+    tampered = json.loads(task_path.read_text(encoding='utf-8'))
+    tampered['records_digest'] = '0' * 64
+    task_path.write_text(json.dumps(tampered), encoding='utf-8')
+    with pytest.raises(ValueError, match='content digest'):
+        CertifiedTaskRegistry.load(task_path, restored_splits)
+
+
+def test_production_factory_builds_runtime_without_model_or_worker_start(tmp_path, native_fixture):
+    from rift.banks.bootstrap import BootstrapResult, BootstrapRunner
+    from rift.banks.core import BankManager, JsonTaskEvidenceStore
+    from rift.evolution.cli import EvolutionRunRuntime
+    from rift.runtime.config import load_production_config
+    from rift.runtime.factory import ProductionDeployment, build_production_runtime
+    from rift.runtime.plan_factory import ProductionPlanFactory
+
+    _, host, _, task_registry, pool, split_registry, _, checkpoint = native_fixture
+
+    class BootstrapEvaluator:
+        def evaluate(self, *args): raise AssertionError('runtime assembly must not evaluate a model')
+
+    class BootstrapVerifier:
+        def verify_trial(self, *args): return True
+
+    class Resources:
+        def acquire(self, *args, **kwargs): raise AssertionError('runtime assembly must not create workers')
+
+    class TrialVerifier:
+        def verify_probe_trial(self, *args): return True
+
+    class CheckpointStore:
+        def verify(self, checkpoint): return checkpoint in (
+            checkpoint_service, checkpoint_designer)
+        def resolve(self, checkpoint): return str(checkpoint_paths[checkpoint])
+        def save_manifest(self, path):
+            Path(path).write_text('{}', encoding='utf-8')
+
+    resources = Resources()
+    checkpoint_service = checkpoint
+    checkpoint_designer = Checkpoint('designer', 'r0', 'tok-d', 'weights-d')
+    checkpoint_paths = {checkpoint_service: tmp_path / 'service-checkpoint',
+                        checkpoint_designer: tmp_path / 'designer-checkpoint'}
+    bootstrap = BootstrapResult(checkpoint, 'protocol-digest', 42, 1, (), BankManager())
+    bootstrap_runner = BootstrapRunner(BootstrapEvaluator(), BootstrapVerifier())
+    config = load_production_config(
+        rift_path='configs/dual_bank.yaml',
+        verl_path='configs/verl/fsdp2_vllm.yaml',
+        ascend_path='configs/verl/ascend_910b3.yaml')
+    run_root = tmp_path / 'run'
+    service_model = tmp_path / 'service-model'; service_model.mkdir()
+    designer_model = tmp_path / 'designer-model'; designer_model.mkdir()
+    service_tokenizer = tmp_path / 'service-tokenizer'; service_tokenizer.mkdir()
+    designer_tokenizer = tmp_path / 'designer-tokenizer'; designer_tokenizer.mkdir()
+    bootstrap_manifest = tmp_path / 'bootstrap.json'; bootstrap_manifest.write_text('{}', encoding='utf-8')
+    benchmark_manifest = tmp_path / 'benchmark.json'; benchmark_manifest.write_text('{}', encoding='utf-8')
+    task_evidence_store = JsonTaskEvidenceStore(tmp_path / 'task-evidence')
+    dependencies = {
+        'resources': resources, 'commerce_host': host, 'benchmark_pool': pool,
+        'task_registry': task_registry, 'split_registry': split_registry,
+        'task_evidence_store': task_evidence_store, 'probe_selector': object(),
+        'probe_evidence_store': SimpleNamespace(verifier=object()),
+        'capture_store': object(), 'designer_capture_store': object(),
+        'checkpoint_store': CheckpointStore(), 'update_verifier': object(),
+        'reward_verifier': object(), 'action_verifier': object(),
+        'snapshot_verifier': object(), 'trial_verifier': TrialVerifier(),
+        'freeze_order_verifier': object(), 'protocol_ref': 'eval-v1',
+        'protocol_digest': 'protocol-digest',
+    }
+    deployment = ProductionDeployment(
+        paths={'service_model': str(service_model), 'designer_model': str(designer_model),
+            'service_tokenizer': str(service_tokenizer), 'designer_tokenizer': str(designer_tokenizer),
+            'bootstrap_manifest': str(bootstrap_manifest), 'benchmark_manifest': str(benchmark_manifest),
+            'run_root': str(run_root)},
+        bootstrap=bootstrap, bootstrap_runner=bootstrap_runner,
+        initial_service=checkpoint,
+        initial_designer=checkpoint_designer,
+        resources=resources, task_evidence_store=task_evidence_store,
+        plan_dependencies=dependencies, rounds=1)
+
+    runtime = build_production_runtime(config, deployment, run_root=run_root)
+    assert isinstance(runtime, EvolutionRunRuntime)
+    assert isinstance(runtime.plan_factory, ProductionPlanFactory)
+    assert (run_root / 'task_registry' / 'certified-tasks.json').is_file()
+    assert (run_root / 'task_registry' / 'splits.json').is_file()
+    assert (run_root / 'checkpoints' / 'initial.json').is_file()
+    assert (run_root / 'metrics.jsonl').is_file()

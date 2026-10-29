@@ -1,17 +1,24 @@
 """Host-side split assignment under an explicit, versioned isolation policy."""
 import json
 from dataclasses import asdict
+import os
 from pathlib import Path
 from rift.schemas import (DataPurpose, Identity, Split, STRICT_FAMILY_DISJOINT_V1,
                           SPLIT_POLICY_VERSIONS)
 
 class SplitRegistry:
-    def __init__(self, identities=(), *, policy_version=STRICT_FAMILY_DISJOINT_V1):
+    def __init__(self, identities=(), *, policy_version=STRICT_FAMILY_DISJOINT_V1,
+                 persistence_path=None):
         if policy_version not in SPLIT_POLICY_VERSIONS:
             raise ValueError("unknown split policy version")
         self.policy_version = policy_version
+        self.persistence_path = None
         self._identities = []
         for identity in identities: self.register(identity)
+        self.persistence_path = None if persistence_path is None else Path(persistence_path)
+    @property
+    def identities(self):
+        return tuple(self._identities)
     def register(self, identity):
         if not isinstance(identity, Identity): raise TypeError("Identity required")
         for row in self._identities:
@@ -19,15 +26,27 @@ class SplitRegistry:
                 continue
             if identity.split != row.split:
                 raise ValueError("cross-split identity overlap under " + self.policy_version)
-        if identity not in self._identities: self._identities.append(identity)
+        if identity not in self._identities:
+            self._identities.append(identity)
+            try:
+                if self.persistence_path is not None:
+                    self.save()
+            except BaseException:
+                self._identities.pop()
+                raise
     def contains(self, identity):
         return identity in self._identities
-    def save(self, path):
+    def save(self, path=None):
         payload = {"schema_version": 2, "split_policy_version": self.policy_version,
                    "identities": [asdict(i) for i in self._identities]}
-        Path(path).write_text(json.dumps(payload, sort_keys=True), encoding='utf-8')
+        target = Path(path) if path is not None else self.persistence_path
+        if target is None: raise ValueError("persistent split registry path required")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + f'.{os.getpid()}.tmp')
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding='utf-8')
+        os.replace(temporary, target)
     @classmethod
-    def load(cls, path, *, policy_version=None):
+    def load(cls, path, *, policy_version=None, persistence_path=None):
         data = json.loads(Path(path).read_text(encoding='utf-8'))
         if isinstance(data, list):
             # Legacy registry files were always strict; never silently relax.
@@ -42,4 +61,4 @@ class SplitRegistry:
                                Split(i['split']),
                                None if i.get('purpose') is None else DataPurpose(i['purpose']))
                       for i in rows)
-        return cls(identities, policy_version=version)
+        return cls(identities, policy_version=version, persistence_path=persistence_path)

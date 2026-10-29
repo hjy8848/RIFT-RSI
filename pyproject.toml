@@ -13,6 +13,7 @@ rift-evolve = "rift.evolution.cli:main"
 [project.optional-dependencies]
 usami = ["pydantic>=2.12,<3"]
 test = ["pytest>=8,<9"]
+runtime = ["PyYAML>=6,<7"]
 [tool.pytest.ini_options]
 pythonpath = ["src", "third_party/usami"]
 testpaths = ["tests"]

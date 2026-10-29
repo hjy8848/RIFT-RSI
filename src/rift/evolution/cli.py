@@ -75,10 +75,37 @@ def execute(runtime: EvolutionRunRuntime):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Run RIFT dual-bank evolution using a trusted runtime factory.")
-    parser.add_argument("--runtime-factory", required=True,
-        help="Python runtime factory in module:callable form")
+    factory_group = parser.add_mutually_exclusive_group(required=True)
+    factory_group.add_argument("--runtime-factory",
+        help="legacy Python EvolutionRunRuntime factory in module:callable form")
+    factory_group.add_argument("--deployment-factory",
+        help="production binding factory in module:callable form; returns ProductionDeployment")
+    parser.add_argument("--rift-config", default="configs/dual_bank.yaml")
+    parser.add_argument("--verl-config", default="configs/verl/fsdp2_vllm.yaml")
+    parser.add_argument("--ascend-config", default="configs/verl/ascend_910b3.yaml")
+    parser.add_argument("--performance-config", default="configs/verl/performance_trial.yaml")
+    parser.add_argument("--enable-performance", action="store_true",
+        help="opt in to measured Dynamic Batch settings in the performance overlay")
+    parser.add_argument("--run-root")
     args = parser.parse_args(argv)
-    runtime = import_runtime_factory(args.runtime_factory)(args)
+    if args.runtime_factory:
+        runtime = import_runtime_factory(args.runtime_factory)(args)
+    else:
+        if not args.run_root:
+            parser.error("--run-root is required with --deployment-factory")
+        from rift.runtime.config import load_production_config
+        from rift.runtime.factory import ProductionDeployment, build_production_runtime
+        config = load_production_config(
+            rift_path=args.rift_config,
+            verl_path=args.verl_config,
+            ascend_path=args.ascend_config,
+            performance_path=args.performance_config if args.enable_performance else None,
+            enable_performance=args.enable_performance)
+        deployment_factory = import_runtime_factory(args.deployment_factory)
+        deployment = deployment_factory(args, config)
+        if not isinstance(deployment, ProductionDeployment):
+            raise TypeError("deployment factory must return ProductionDeployment")
+        runtime = build_production_runtime(config, deployment, run_root=args.run_root)
     states = execute(runtime)
     summary = {"rounds_completed": len(states),
         "last_service_revision": states[-1].service_update.policy_after.revision,

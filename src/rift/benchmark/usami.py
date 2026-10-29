@@ -1,6 +1,7 @@
 """Explicit, lazy bindings to pinned Usami commerce v2 APIs; host-only."""
 from dataclasses import dataclass
 from hashlib import sha256
+import time
 from rift.benchmark.private_evaluation import project_events, public_certification
 
 
@@ -145,7 +146,8 @@ class CommerceHost:
             proposal.proposal_id, CertificationStatus.UNKNOWN), None
 
     def certify_training_plan(self, proposal, *, world_seed, world_build_budget=None,
-                              allowed_training_hashes=(), max_candidate_challenges=32):
+                              allowed_training_hashes=(), max_candidate_challenges=32,
+                              metrics=None):
         """Build one native World, then ground and certify each native challenge in it."""
         from rift.tasks import CertificationStatus
         if not getattr(proposal, 'is_training_plan', False):
@@ -161,7 +163,11 @@ class CommerceHost:
 
         draft = ScenarioDraft.model_validate(proposal.world_draft).checked()
         spec = draft.compile(self.distribution)
+        started = time.perf_counter()
         build = build_world(spec, world_seed, world_build_budget)
+        if metrics is not None:
+            metrics('world_build_seconds', time.perf_counter() - started,
+                    proposal_id=proposal.proposal_id)
         build_verification = verify_build(spec, build)
         world_ref = sha256(f"rift-designer-world-v1:{proposal.proposal_id}:{spec.record_hash}:{world_seed}:{build.record_hash}".encode()).hexdigest()[:32]
         if build.status != 'SAT' or build_verification.get('verified') is not True:
@@ -171,6 +177,7 @@ class CommerceHost:
         worlds = ((world_ref, spec, build),)
         challenge_results, certifications, tasks = [], [], []
         for raw_challenge in proposal.challenges:
+            certification_started = time.perf_counter()
             challenge = AbstractChallenge.model_validate(raw_challenge).checked()
             grounding = ground_challenge(challenge, worlds, self.grounding_budget)
             attempts, selected_task = [], None
@@ -232,6 +239,10 @@ class CommerceHost:
                 'reasons':reasons,
                 'selected_task_ref':None if selected_task is None else selected_task.record_hash,
             })
+            if metrics is not None:
+                metrics('task_certification_seconds', time.perf_counter() - certification_started,
+                        proposal_id=proposal.proposal_id, challenge_id=challenge.task_id,
+                        candidate_count=len(attempts))
         return DesignerTrainingWorld(proposal.proposal_id, self.distribution.record_hash,
             world_ref, spec, build, build_verification, tuple(challenge_results),
             tuple(certifications), tuple(tasks))

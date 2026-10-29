@@ -118,8 +118,15 @@ class BankManager:
             raise ValueError("task evidence and membership event ID required")
         if record.identity.split is Split.TEST or record.purpose is DataPurpose.TEST:
             raise ValueError("final TEST tasks cannot enter evolving banks")
-        if any(r.task_ref == record.task_ref and r.checkpoint == record.checkpoint for r in self.records):
-            raise ValueError("duplicate task observation at checkpoint")
+        existing = next((r for r in self.records if r.task_ref == record.task_ref
+                         and r.checkpoint == record.checkpoint), None)
+        if existing is not None:
+            event = next((row for row in self.events if row.task_ref == record.task_ref
+                          and row.checkpoint == record.checkpoint), None)
+            if existing != record or event is None or event.event_id != event_id:
+                raise ValueError("conflicting or partially persisted task observation")
+            return record.state(success_threshold=self.success_bank.success_threshold,
+                                failure_threshold=self.failure_bank.failure_threshold)
         state = record.state(success_threshold=self.success_bank.success_threshold,
                              failure_threshold=self.failure_bank.failure_threshold)
         if (state is CapabilityState.MASTERED_CANDIDATE

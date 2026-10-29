@@ -53,6 +53,7 @@ def test_mock_actor_worker_wiring(tmp_path, monkeypatch, role, algorithm, reside
         def verify_rollout(self, row, checkpoint): return True
         def verify_group(self, rows, checkpoint): return True
         def verify_resident_training_state(self, role, worker, checkpoint): return resident_state
+        def verify_runtime_environment(self, role, worker): return True
         def verify_runtime(self, role, worker, checkpoint): return True
         def verify_update(self, update): return True
         def synchronize(self, worker, checkpoint): return True

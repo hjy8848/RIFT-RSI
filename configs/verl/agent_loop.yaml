@@ -1,5 +1,5 @@
 - name: rift_usami_service
   _target_: rift.verl.agent_loop.UsamiServiceAgentLoop
-  # Constructed inside each AgentLoopWorker from trusted local dependencies;
-  # there is deliberately no default/fake task resolver or capture sink.
-  rift_host_provider: ???
+  # The worker-local factory opens trusted stores and Usami dependencies inside
+  # the VERL AgentLoopWorker process. No native task object crosses DataProto.
+  rift_host_provider_factory: ???

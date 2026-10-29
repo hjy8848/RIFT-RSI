@@ -1,7 +1,8 @@
 """VERL v0.9.1 AgentLoop extension; the host session stays outside model input."""
+from dataclasses import asdict
+import json
 from uuid import uuid4
 from rift.verl.capture import ContinuousCapture
-from rift.verl.reward import verified_business_reward
 
 def __getattr__(name):
     if name != 'UsamiServiceAgentLoop':
@@ -9,8 +10,23 @@ def __getattr__(name):
     from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 
     class UsamiServiceAgentLoop(AgentLoopBase):
-        def __init__(self, *args, rift_host_provider=None, **kwargs):
+        def __init__(self, *args, rift_host_provider=None,
+                     rift_host_provider_factory=None, **kwargs):
             super().__init__(*args, **kwargs)
+            if rift_host_provider is not None and rift_host_provider_factory is not None:
+                raise ValueError('supply a worker-local Host provider or its factory, not both')
+            if rift_host_provider_factory is not None:
+                factory = rift_host_provider_factory
+                if isinstance(factory, str):
+                    if ':' not in factory:
+                        raise ValueError('Host provider factory must use module:callable syntax')
+                    module_name, name = factory.split(':', 1)
+                    import importlib
+                    factory = getattr(importlib.import_module(module_name), name, None)
+                if not callable(factory):
+                    raise ValueError('Host provider factory is not callable')
+                rift_host_provider = factory(config=self.config, tokenizer=self.tokenizer,
+                                             processor=self.processor)
             self.rift_host_provider = rift_host_provider
 
         async def run(self, sampling_params, **kwargs):
@@ -20,23 +36,52 @@ def __getattr__(name):
             if any(key in kwargs for key in ('rift_session', 'rift_checkpoint', 'rift_checkpoint_verifier', 'rift_capture_sink')):
                 raise ValueError('private host objects cannot be passed in sample fields')
             task_ref, group_id = kwargs.get('rift_task_ref'), kwargs.get('uid')
+            mode = kwargs.get('rift_mode', 'train')
+            request_id = kwargs.get('rift_request_id')
             if self.rift_host_provider is None or not isinstance(task_ref, str) or not task_ref or not isinstance(group_id, str) or not group_id:
                 raise ValueError('trusted Host provider and opaque task/group IDs are required')
-            session, checkpoint, checkpoint_verifier, sink = await self.rift_host_provider.open_rollout(
-                task_ref, group_id, kwargs.get('session_id'), self.tokenizer)
-            if session.group_id != group_id:
-                raise ValueError('Host session does not match the sampled group')
-            configured_group_size = getattr(self.rollout_config, 'n', None)
-            requested_group_size = kwargs.get('rift_group_size')
-            if (configured_group_size is not None and requested_group_size is not None
-                    and requested_group_size != configured_group_size):
-                raise ValueError('RIFT group size must match VERL rollout.n')
-            group_size = (configured_group_size if requested_group_size is None
-                          else requested_group_size)
-            if group_size is not None and (type(group_size) is not int or group_size < 1):
-                raise ValueError('VERL rollout group size must be a positive integer')
-            if hasattr(session, 'expected_group_size'):
-                session.expected_group_size = group_size
+            if mode not in ('train', 'probe') or not isinstance(request_id, str) or not request_id:
+                raise ValueError('explicit request identity and train/probe mode required')
+            session_id = kwargs.get('session_id')
+            if type(session_id) is not int or session_id < 0:
+                raise ValueError('VERL sample session_id is required')
+            if mode == 'train':
+                configured_group_size = getattr(self.rollout_config, 'n', None)
+                requested_group_size = kwargs.get('rift_group_size')
+                if (type(configured_group_size) is not int or type(requested_group_size) is not int
+                        or requested_group_size != configured_group_size):
+                    raise ValueError('RIFT group size must exactly match VERL rollout.n')
+                rollout_id = kwargs.get('rift_rollout_id')
+                sampling_seed = kwargs.get('rift_sampling_seed')
+                customer_seed = kwargs.get('rift_customer_seed')
+                if (not isinstance(rollout_id, str) or type(sampling_seed) is not int
+                        or type(customer_seed) is not int):
+                    raise ValueError('Service rollout requires preassigned IDs and independent seeds')
+                expected_checkpoint = kwargs.get('rift_expected_checkpoint')
+                session, checkpoint, checkpoint_verifier, sink = await self.rift_host_provider.open_rollout(
+                    task_ref, group_id, session_id, self.tokenizer,
+                    sampling_seed=sampling_seed, customer_seed=customer_seed,
+                    rollout_id=rollout_id, expected_checkpoint=expected_checkpoint,
+                    group_size=requested_group_size)
+                if session.group_id != group_id or session.expected_group_size != requested_group_size:
+                    raise ValueError('Host session does not match the complete sampled GRPO group')
+            else:
+                checkpoint_data = kwargs.get('rift_checkpoint')
+                seed = kwargs.get('rift_sampling_seed')
+                protocol_ref = kwargs.get('rift_protocol_ref')
+                protocol_digest = kwargs.get('rift_protocol_digest')
+                if not isinstance(checkpoint_data, (dict, str)) or type(seed) is not int:
+                    raise ValueError('Probe requires an explicit checkpoint and frozen seed')
+                from rift.schemas import Checkpoint
+                checkpoint_request = (Checkpoint(**checkpoint_data) if isinstance(checkpoint_data, dict)
+                                      else Checkpoint(**json.loads(checkpoint_data)))
+                session, checkpoint, checkpoint_verifier, sink = await self.rift_host_provider.open_probe(
+                    task_ref, checkpoint_request, seed, protocol_ref, self.tokenizer,
+                    protocol_digest=protocol_digest)
+                if checkpoint != checkpoint_request:
+                    raise ValueError('Probe Host returned a different checkpoint')
+                if not protocol_digest:
+                    raise ValueError('Probe requires the frozen protocol digest')
             if checkpoint_verifier.verify(checkpoint) is not True:
                 raise ValueError('rollout checkpoint was not verified')
             if sink.attestor.verify_serving(checkpoint) is not True:
@@ -49,7 +94,7 @@ def __getattr__(name):
                 masks, logprobs = [], None
                 logprobs_present = None
                 serving_steps = set()
-                request_id = uuid4().hex
+                model_request_id = uuid4().hex
                 while True:
                     prefix = list(capture.current)
                     generation_id = uuid4().hex
@@ -63,7 +108,7 @@ def __getattr__(name):
                         turn_sampling_params.get('seed', 0) if base_seed is None else base_seed,
                         session.rollout_id if seed_scope is None else seed_scope,
                         len(capture.decisions))
-                    output = await self.server_manager.generate(request_id=request_id, prompt_ids=prefix,
+                    output = await self.server_manager.generate(request_id=model_request_id, prompt_ids=prefix,
                                                                 sampling_params=turn_sampling_params)
                     token_ids = list(output.token_ids)
                     token_logprobs = None if output.log_probs is None else list(output.log_probs)
@@ -97,21 +142,38 @@ def __getattr__(name):
                     if len(capture.mask) >= self.rollout_config.response_length:
                         raise ValueError('rollout exceeds response budget; no truncation of evidence')
                 episode = await session.finish()
-                from rift.benchmark.usami import public_episode
-                reward = verified_business_reward(episode, lambda record: public_episode(record).outcome)
                 tokens = capture.output()
                 if logprobs is not None and len(logprobs) != len(tokens.response):
                     raise ValueError('rollout log probabilities are not aligned with response tokens')
                 if len(serving_steps) != 1:
                     raise ValueError('Service episode crossed synchronized policy revisions')
-                # Evidence persistence is a host operation, never sent to the model.
+                # Persist the native replay object and exact model tokens before
+                # deriving the public outcome. UNKNOWN remains unevaluable.
                 await sink.persist(episode, checkpoint, tuple(capture.decisions), tokens)
+                from rift.benchmark.public_feedback import service_reward
+                from rift.benchmark.usami import public_episode
+                public = public_episode(episode)
+                reward = service_reward(public.outcome) if mode == 'train' else None
+                evidence_ref = sink.evidence_ref(episode)
                 return AgentLoopOutput(prompt_ids=list(tokens.prompt), response_ids=list(tokens.response),
                     response_mask=[int(x) for x in tokens.mask], response_logprobs=logprobs,
                     reward_score=reward, num_turns=len(capture.decisions), metrics={},
                     extra_fields={'global_steps': next(iter(serving_steps)),
                                   'min_global_steps': next(iter(serving_steps)),
-                                  'max_global_steps': next(iter(serving_steps))})
+                                  'max_global_steps': next(iter(serving_steps)),
+                                  'rift_request_id': request_id,
+                                  'rift_task_ref': task_ref,
+                                  'rift_mode': mode,
+                                  'rift_episode_id': episode.record_hash,
+                                  'rift_checkpoint': json.dumps(asdict(checkpoint), sort_keys=True),
+                                  'rift_group_id': group_id if mode == 'train' else None,
+                                  'rift_seed': (kwargs.get('rift_sampling_seed') if mode == 'probe'
+                                                else kwargs.get('rift_sampling_seed')),
+                                  'rift_protocol_ref': kwargs.get('rift_protocol_ref'),
+                                  'rift_protocol_digest': kwargs.get('rift_protocol_digest'),
+                                  'rift_outcome': public.outcome.value,
+                                  'rift_replay_verified': getattr(episode, 'replay_verified', False) is True,
+                                  'rift_evidence_ref': evidence_ref})
             except BaseException:
                 if hasattr(session, 'abort'):
                     await session.abort()
