@@ -17,6 +17,40 @@ import time
 WORLD_SIZE = 8
 VERL_COMMIT = "1876b06d0a3e4e71e06230be10af14492ca8a75b"
 RAY_AF_UNIX_PATH_LIMIT = 107
+ASCEND_WORKER_ENV_KEYS = (
+    "PATH",
+    "LD_LIBRARY_PATH",
+    "ASCEND_HOME_PATH",
+    "ASCEND_OPP_PATH",
+    "ASCEND_AICPU_PATH",
+    "ASCEND_CUSTOM_PATH",
+    "ASCEND_TOOLKIT_HOME",
+)
+
+
+def _forward_ascend_worker_environment(runtime_env, environ=None):
+    """Pass the sourced CANN library paths into Ray and vLLM child workers."""
+    source = os.environ if environ is None else environ
+    worker_env = runtime_env.setdefault("env_vars", {})
+    for key in ASCEND_WORKER_ENV_KEYS:
+        value = source.get(key)
+        if value:
+            worker_env[key] = value
+    return runtime_env
+
+
+def _require_cann_atb_library():
+    """Catch a missing CANN ATB loader path before starting the Ray worker pool."""
+    import ctypes
+
+    try:
+        ctypes.CDLL("libatb.so")
+    except OSError as exc:
+        raise RuntimeError(
+            "CANN libatb.so is not loadable in the launcher environment. "
+            "Source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh before "
+            "starting RIFT so VERL and vLLM-Ascend workers inherit the CANN libraries."
+        ) from exc
 
 
 def _check_ray_socket_path(ray_dir):
@@ -199,6 +233,8 @@ def _start_ray(config, run_root, *, worker_manifest_path=None, checkpoint=None):
     from omegaconf import OmegaConf
     runtime_env = get_ppo_ray_runtime_env(config)
     runtime_env.setdefault("env_vars", {})
+    _forward_ascend_worker_environment(runtime_env)
+    _require_cann_atb_library()
     if worker_manifest_path is not None:
         from dataclasses import asdict
         runtime_env["env_vars"]["RIFT_ASCEND910B3_RUN_MANIFEST"] = str(

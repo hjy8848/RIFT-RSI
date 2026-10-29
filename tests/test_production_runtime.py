@@ -9,7 +9,11 @@ import pytest
 from rift.runtime.config import load_production_config
 from rift.runtime.evaluator import ProductionProbeEvaluator, VerlAgentLoopBatch
 from rift.runtime.resources import ExclusivePolicyResources
-from rift.runtime.ascend_910b3 import _check_ray_socket_path
+from rift.runtime.ascend_910b3 import (
+    _check_ray_socket_path,
+    _forward_ascend_worker_environment,
+    _require_cann_atb_library,
+)
 from rift.schemas import Checkpoint, Outcome
 
 
@@ -25,6 +29,40 @@ def test_ray_socket_path_guard_accepts_short_dir_and_rejects_long_dir():
     assert _check_ray_socket_path("/tmp/r12345678") < 107
     with pytest.raises(RuntimeError, match="AF_UNIX limit is 107"):
         _check_ray_socket_path("/tmp/" + "x" * 100)
+
+
+def test_ray_runtime_env_forwards_sourced_cann_paths_without_device_binding():
+    runtime_env = {"env_vars": {"VERL_KEEP": "yes"}}
+    source = {
+        "PATH": "/cann/bin:/usr/bin",
+        "LD_LIBRARY_PATH": "/cann/lib64:/cann/opp/vendors/customize/op_api/lib",
+        "ASCEND_HOME_PATH": "/usr/local/Ascend/ascend-toolkit/latest",
+        "ASCEND_OPP_PATH": "/usr/local/Ascend/ascend-toolkit/latest/opp",
+        "ASCEND_AICPU_PATH": "/usr/local/Ascend/ascend-toolkit/latest",
+        "ASCEND_CUSTOM_PATH": "/usr/local/Ascend/ascend-toolkit/latest",
+        "ASCEND_TOOLKIT_HOME": "/usr/local/Ascend/ascend-toolkit/latest",
+        "ASCEND_DEVICE_ID": "7",
+        "ASCEND_RT_VISIBLE_DEVICES": "7",
+    }
+    result = _forward_ascend_worker_environment(runtime_env, source)
+
+    assert result["env_vars"]["VERL_KEEP"] == "yes"
+    assert result["env_vars"]["LD_LIBRARY_PATH"] == source["LD_LIBRARY_PATH"]
+    assert result["env_vars"]["ASCEND_HOME_PATH"] == source["ASCEND_HOME_PATH"]
+    assert "ASCEND_DEVICE_ID" not in result["env_vars"]
+    assert "ASCEND_RT_VISIBLE_DEVICES" not in result["env_vars"]
+
+
+def test_missing_cann_atb_library_fails_before_ray_with_setup_command(monkeypatch):
+    import ctypes
+
+    def missing_library(path):
+        assert path == "libatb.so"
+        raise OSError("not found")
+
+    monkeypatch.setattr(ctypes, "CDLL", missing_library)
+    with pytest.raises(RuntimeError, match="[Ss]ource .*set_env\\.sh"):
+        _require_cann_atb_library()
 
 
 def test_production_config_pins_complete_grpo_and_measured_overlay(monkeypatch):
