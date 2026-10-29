@@ -22,7 +22,7 @@ class ReplayEvidenceVerifier(Protocol):
     """Resolve and verify the source episode, decision, checkpoint and tokens."""
     def verify_demonstration(self, sample: Demonstration) -> bool: ...
 
-class DecisionEvidenceVerifier:
+class DecisionEvidenceVerifier(Protocol):
     """Trusted future capture boundary; implementation must verify provenance and visibility.
 
     verify_source checks a real model rollout and exact checkpoint. tokens_for_call
@@ -30,10 +30,8 @@ class DecisionEvidenceVerifier:
     tokenizer, public visibility, response alignment and action mask against the
     original generation record. Missing evidence must raise, never reconstruct it.
     """
-    def verify_source(self, episode, checkpoint):
-        raise NotImplementedError
-    def tokens_for_call(self, call, checkpoint):
-        raise NotImplementedError
+    def verify_source(self, episode, checkpoint) -> bool: ...
+    def tokens_for_call(self, call, checkpoint) -> Tokens: ...
 
 def extract_demonstrations(record, identity, checkpoint, registry, verifier):
     """Host-only extraction: requires native replay and a trusted token recorder."""
