@@ -173,6 +173,17 @@ def test_native_commerce_host_certification():
     assert cert.status is CertificationStatus.CERTIFIED and cert.task_ref == task.record_hash
     assert registry.contains(identity(task, spec, build))
     assert 'rsi_core' not in sys.modules
+    from usami_v2.scenarios.task_certification import certify_task as native_certify
+    from rift.benchmark.usami import default_customer_scenario, default_customer_profile
+    from rift.verl.task_registry import CertifiedNativeTask, CertifiedTaskRegistry
+    private_scenario = default_customer_scenario(task, spec, build)
+    profile = default_customer_profile(task, spec, build)
+    native_certificate = native_certify(build.world, task, private_scenario, ProofBudget())
+    task_registry = CertifiedTaskRegistry(registry)
+    task_registry.register(CertifiedNativeTask(build.world, task, profile, private_scenario,
+        native_certificate, identity(task, spec, build)))
+    w, t, p, _ = task_registry.resolve(task.record_hash)
+    assert task_registry.verify_task(task.record_hash, w, t, p)
     import pytest
     for conflicting in (
         Identity(build.world_hash, 'other-task', 'other-family', 'other-source', Split.REPLAY),

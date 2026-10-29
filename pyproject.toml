@@ -6,6 +6,9 @@ name = "rift-rsi"
 version = "0.1.0"
 requires-python = ">=3.10"
 description = "Replay-grounded learning value research contracts"
+[project.scripts]
+rift-verl-round = "rift.verl.cli:main"
+
 [project.optional-dependencies]
 usami = ["pydantic>=2.12,<3"]
 test = ["pytest>=8,<9"]

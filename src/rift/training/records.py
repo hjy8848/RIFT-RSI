@@ -25,7 +25,7 @@ def designer_rollout(tokens, designer_checkpoint, package_id, reward, service_up
         raise ValueError("reward and Service update differ")
     if reward_verifier.verify_reward(reward, service_update) is not True:
         raise ValueError("Replay reward evidence was not verified")
-    if action_verifier.verify_designer_action(tokens, designer_checkpoint, package_id, designer_rollout_id) is not True:
+    if action_verifier.verify_designer_action(tokens, designer_checkpoint, package_id, designer_rollout_id, group_id) is not True:
         raise ValueError("Designer action evidence was not verified")
     if not isfinite(reward.mean): raise ValueError("invalid reward")
     # Source records the exact Service baseline so caller can enforce matched comparisons.
@@ -51,7 +51,7 @@ class DesignerFeedback:
     designer_rollout_id: str
     group_id: str | None = None
 
-def prepare_designer_update(batch_id, designer_checkpoint, feedback, *, update_verifier, reward_verifier, action_verifier, algorithm='policy_gradient'):
+def prepare_designer_update(batch_id, designer_checkpoint, feedback, *, update_verifier, reward_verifier, action_verifier, algorithm='reinforce_plus_plus'):
     """Accumulate package-level credit only for comparable Service baselines."""
     if not feedback:
         raise ValueError('Designer update needs package feedback')

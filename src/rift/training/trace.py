@@ -86,7 +86,7 @@ class RecordedDesignerActionVerifier:
         self.call_resolver = call_resolver
         self.attestor = attestor
 
-    def verify_designer_action(self, tokens, checkpoint, package_id, rollout_id):
+    def verify_designer_action(self, tokens, checkpoint, package_id, rollout_id, group_id=None):
         matches = [t for t in self.traces if t.role == 'designer' and t.rollout_id == rollout_id
                    and t.package_id == package_id and t.policy == checkpoint and t.tokens == tokens]
         if len(matches) != 1:
@@ -96,5 +96,5 @@ class RecordedDesignerActionVerifier:
         if call is None:
             return False
         request, response = call
-        return (trace.request_digest == digest(request) and trace.response_digest == digest(response)
+        return (request.get('group_id') == group_id and trace.request_digest == digest(request) and trace.response_digest == digest(response)
                 and self.attestor.verify_capture(trace, request, response) is True)

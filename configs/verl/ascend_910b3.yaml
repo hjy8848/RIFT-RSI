@@ -1,0 +1,17 @@
+# Target environment record; this file is not an executable trainer config.
+python: "3.12"
+platform: linux-aarch64
+cann: "9.1.0"
+torch: "2.10.0"
+torch_npu: "2.10.0.post4"
+verl: "0.9.1"
+verl_commit: 1876b06d0a3e4e71e06230be10af14492ca8a75b
+vllm: "0.23.0"
+vllm_ascend: "0.23.0"
+triton_ascend: "3.2.2"
+numpy: "1.26.4"
+transformers: "5.10.4"
+accelerator: Ascend-910B3
+devices: 8
+actor_strategy: fsdp2
+rollout_backend: vllm

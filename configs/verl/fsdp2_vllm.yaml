@@ -1,0 +1,26 @@
+# Overlay for VERL v0.9.1; model paths, datasets, host transport and capture
+# attestation must be supplied by the caller before invoking a trainer.
+actor_rollout_ref:
+  model:
+    lora_rank: 0
+  actor:
+    strategy: fsdp2
+    checkpoint:
+      save_contents: [model, optimizer, extra]
+      load_contents: [model, optimizer, extra]
+  ref:
+    strategy: fsdp2
+  rollout:
+    name: vllm
+    n: 2
+    calculate_log_probs: true
+    agent:
+      default_agent_loop: rift_usami_service
+      agent_loop_config_path: configs/verl/agent_loop.yaml
+algorithm:
+  adv_estimator: grpo
+trainer:
+  use_v1: true
+  device: npu
+  nnodes: 1
+  n_gpus_per_node: 8

@@ -1,0 +1,127 @@
+"""Explicit GRPO update against an initialized VERL 0.9.1 FSDP2 actor.
+
+No worker or model is created by importing this module. The host must supply
+real rollout and update attestors; fake evidence is never accepted implicitly.
+"""
+from pathlib import Path
+from rift.schemas import Checkpoint
+from rift.training.contracts import CompletedUpdate, UpdateRequest
+from rift.training.records import comparable_designer_rollouts
+from rift.verl.checkpoints import model_digest
+from rift.verl.scorer import padded_batch
+from rift.verl.serving import checkpoint_step
+from rift.verl.version import require_verl_version
+
+
+def validate_request(request, role, rollout_verifier):
+    if not isinstance(request, UpdateRequest) or request.algorithm.lower() not in ('grpo', 'reinforce_plus_plus'):
+        raise ValueError('unsupported on-policy advantage estimator')
+    if role not in ('service', 'designer'): raise ValueError('unknown policy role')
+    if role == 'service' and request.algorithm.lower() != 'grpo':
+        raise ValueError('Service updates require verified same-task GRPO groups')
+    for row in request.rollouts:
+        if (request.algorithm.lower() == 'grpo' and not row.group_id) or not row.response_id or not row.reward_ref:
+            raise ValueError('rollout, reward and group provenance are required')
+        if role == 'service' and (row.reward_source != 'business_outcome_v2' or row.reward_ref != row.episode_id):
+            raise ValueError('Service requires business-only outcomes')
+        if rollout_verifier.verify_rollout(row, request.policy_before) is not True:
+            raise ValueError('on-policy rollout evidence was not verified')
+    if request.algorithm.lower() == 'grpo':
+        groups = {}
+        for row in request.rollouts: groups.setdefault(row.group_id, []).append(row)
+        for group in groups.values():
+            if role == 'service' and len({r.task_id for r in group}) != 1:
+                raise ValueError('Service GRPO groups must use the same task')
+            if rollout_verifier.verify_group(group, request.policy_before) is not True:
+                raise ValueError('GRPO group provenance was not verified')
+    if role == 'designer': comparable_designer_rollouts(request.rollouts)
+    return request
+
+
+class VerlGRPOBackend:
+    """One explicit full-parameter update. The caller owns the worker lifecycle."""
+    def __init__(self, role, worker_group, checkpoint_store, rollout_verifier,
+                 run_recorder, update_verifier, runtime_verifier, weight_sync, *, output_dir, after_revision,
+                 run_id, pad_token_id, mini_batch_size, epochs=1):
+        self.role, self.worker_group = role, worker_group
+        self.checkpoint_store, self.rollout_verifier = checkpoint_store, rollout_verifier
+        self.run_recorder, self.update_verifier = run_recorder, update_verifier
+        self.runtime_verifier = runtime_verifier
+        self.weight_sync = weight_sync
+        self.output_dir, self.after_revision, self.run_id = Path(output_dir), after_revision, run_id
+        self.pad_token_id, self.mini_batch_size, self.epochs = pad_token_id, mini_batch_size, epochs
+
+    def train(self, request):
+        validate_request(request, self.role, self.rollout_verifier)
+        if not self.checkpoint_store.verify(request.policy_before): raise ValueError('before checkpoint failed verification')
+        if self.runtime_verifier.verify_runtime(self.role, self.worker_group, request.policy_before) is not True:
+            raise ValueError('full-parameter FSDP2 runtime or policy identity was not verified')
+        if not self.run_id or not self.after_revision or self.output_dir.exists():
+            raise ValueError('unique run, revision and unused checkpoint destination required')
+        if (self.mini_batch_size < 1 or self.epochs < 1
+                or self.mini_batch_size % self.checkpoint_store.world_size
+                or len(request.rollouts) % self.checkpoint_store.world_size
+                or self.mini_batch_size > len(request.rollouts)
+                or len(request.rollouts) % self.mini_batch_size):
+            raise ValueError('rollout and mini-batch sizes must divide across the FSDP world and each other')
+        before_step = checkpoint_step(request.policy_before)
+        # VERL's global_steps counts outer trainer batches, not the inner
+        # optimizer minibatches/epochs executed by one update_actor call.
+        after_step = before_step + 1
+        if self.after_revision != str(after_step):
+            raise ValueError('after checkpoint revision must equal the actual VERL optimizer step')
+        require_verl_version()
+        rows = request.rollouts
+        encoded = padded_batch([row.tokens for row in rows], self.pad_token_id)
+        import numpy as np
+        import torch
+        from verl import DataProto
+        from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage, compute_reinforce_plus_plus_outcome_advantage
+        from verl.utils import tensordict_utils as tu
+        from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+        tensors = {key: torch.tensor(value, dtype=torch.long) for key, value in encoded.items()}
+        self.worker_group.load_checkpoint(self.checkpoint_store.resolve(request.policy_before))
+        proto = DataProto.from_dict(tensors=tensors)
+        infer = left_right_2_no_padding(proto.to_tensordict())
+        tu.assign_non_tensor(infer, calculate_entropy=False, compute_loss=False, temperature=1.0)
+        result = self.worker_group.compute_log_prob(infer)
+        old = no_padding_2_padding(tu.get(result, 'log_probs'), infer).float()
+        if not torch.isfinite(old).all(): raise ValueError('nonfinite old policy log probabilities')
+        rewards = torch.zeros_like(tensors['response_mask'], dtype=torch.float32)
+        for i, row in enumerate(rows):
+            last = max(j for j, enabled in enumerate(row.tokens.mask) if enabled)
+            rewards[i, last] = row.reward
+        if request.algorithm.lower() == 'grpo':
+            advantages, _ = compute_grpo_outcome_advantage(rewards, tensors['response_mask'],
+                np.asarray([row.group_id for row in rows], dtype=object))
+        else:
+            from types import SimpleNamespace
+            advantages, _ = compute_reinforce_plus_plus_outcome_advantage(
+                rewards, tensors['response_mask'], config=SimpleNamespace(gamma=1.0))
+        tensors['old_log_probs'], tensors['advantages'] = old, advantages
+        update_batch = left_right_2_no_padding(DataProto.from_dict(tensors=tensors).to_tensordict())
+        tu.assign_non_tensor(update_batch, calculate_entropy=False, compute_loss=True,
+            global_batch_size=len(rows), mini_batch_size=self.mini_batch_size,
+            epochs=self.epochs, seed=42, dataloader_kwargs={'shuffle': False}, temperature=1.0)
+        metrics = self.worker_group.update_actor(update_batch)
+        self.worker_group.save_checkpoint(str(self.output_dir), global_step=after_step)
+        after = Checkpoint(request.policy_before.policy, self.after_revision, request.policy_before.tokenizer,
+                           model_digest(self.output_dir, self.checkpoint_store.world_size))
+        self.checkpoint_store.register(after, self.output_dir)
+        if not self.checkpoint_store.verify(after): raise ValueError('after checkpoint failed verification')
+        if self.runtime_verifier.verify_runtime(self.role, self.worker_group, after) is not True:
+            raise ValueError('saved checkpoint does not match the full-parameter actor runtime')
+        if self.weight_sync.synchronize(self.worker_group, after) is not True:
+            raise ValueError('rollout weight synchronization was not verified')
+        evidence = self.run_recorder.record_update(self.run_id, request, after, metrics)
+        completed = CompletedUpdate(request, after, self.run_id, evidence)
+        if self.update_verifier.verify_update(completed) is not True:
+            raise ValueError('completed update evidence failed verification')
+        return completed
+
+
+class VerlServiceRLBackend(VerlGRPOBackend):
+    def __init__(self, *args, **kwargs): super().__init__('service', *args, **kwargs)
+
+class VerlDesignerRLBackend(VerlGRPOBackend):
+    def __init__(self, *args, **kwargs): super().__init__('designer', *args, **kwargs)

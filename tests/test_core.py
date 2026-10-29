@@ -32,7 +32,7 @@ class Verifier:
     def verify_update(self, update): return True  # fake verifier, CPU tests only
     def verify_reward(self, reward, update): return True
     def verify_demonstration(self, sample): return True
-    def verify_designer_action(self, tokens, checkpoint, package_id, rollout_id): return True
+    def verify_designer_action(self, tokens, checkpoint, package_id, rollout_id, group_id): return True
 class Scorer:
     def score(self, checkpoint, batch):
         return [[-2., -10., -4.] if checkpoint == BEFORE else [-1., -100., -2.] for _ in batch]
@@ -274,7 +274,7 @@ def test_unverified_update_cannot_score_or_supply_designer_credit(tmp_path):
     class RejectedReward:
         def verify_reward(self, reward, update): return False
     class RejectedAction:
-        def verify_designer_action(self, tokens, checkpoint, package_id, rollout_id): return False
+        def verify_designer_action(self, tokens, checkpoint, package_id, rollout_id, group_id): return False
     with pytest.raises(ValueError, match='reward evidence'):
         designer_rollout(T, designer, 'package', reward, update, designer_rollout_id='designer1', update_verifier=Verifier(), reward_verifier=RejectedReward(), action_verifier=Verifier())
     with pytest.raises(ValueError, match='action evidence'):
