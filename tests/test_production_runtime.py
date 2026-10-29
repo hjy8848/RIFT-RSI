@@ -41,6 +41,9 @@ def test_ray_runtime_env_forwards_sourced_cann_paths_without_device_binding():
         "ASCEND_AICPU_PATH": "/usr/local/Ascend/ascend-toolkit/latest",
         "ASCEND_CUSTOM_PATH": "/usr/local/Ascend/ascend-toolkit/latest",
         "ASCEND_TOOLKIT_HOME": "/usr/local/Ascend/ascend-toolkit/latest",
+        "ATB_HOME_PATH": "/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1",
+        "ATB_STREAM_SYNC_EVERY_KERNEL_ENABLE": "0",
+        "LCCL_DETERMINISTIC": "0",
         "ASCEND_DEVICE_ID": "7",
         "ASCEND_RT_VISIBLE_DEVICES": "7",
     }
@@ -49,6 +52,9 @@ def test_ray_runtime_env_forwards_sourced_cann_paths_without_device_binding():
     assert result["env_vars"]["VERL_KEEP"] == "yes"
     assert result["env_vars"]["LD_LIBRARY_PATH"] == source["LD_LIBRARY_PATH"]
     assert result["env_vars"]["ASCEND_HOME_PATH"] == source["ASCEND_HOME_PATH"]
+    assert result["env_vars"]["ATB_HOME_PATH"] == source["ATB_HOME_PATH"]
+    assert result["env_vars"]["ATB_STREAM_SYNC_EVERY_KERNEL_ENABLE"] == "0"
+    assert result["env_vars"]["LCCL_DETERMINISTIC"] == "0"
     assert "ASCEND_DEVICE_ID" not in result["env_vars"]
     assert "ASCEND_RT_VISIBLE_DEVICES" not in result["env_vars"]
 
@@ -61,7 +67,7 @@ def test_missing_cann_atb_library_fails_before_ray_with_setup_command(monkeypatc
         raise OSError("not found")
 
     monkeypatch.setattr(ctypes, "CDLL", missing_library)
-    with pytest.raises(RuntimeError, match="[Ss]ource .*set_env\\.sh"):
+    with pytest.raises(RuntimeError, match="/nnal/atb/set_env\\.sh"):
         _require_cann_atb_library()
 
 

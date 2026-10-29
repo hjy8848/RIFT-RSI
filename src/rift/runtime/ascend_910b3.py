@@ -25,6 +25,7 @@ ASCEND_WORKER_ENV_KEYS = (
     "ASCEND_AICPU_PATH",
     "ASCEND_CUSTOM_PATH",
     "ASCEND_TOOLKIT_HOME",
+    "ATB_HOME_PATH",
 )
 
 
@@ -35,6 +36,9 @@ def _forward_ascend_worker_environment(runtime_env, environ=None):
     for key in ASCEND_WORKER_ENV_KEYS:
         value = source.get(key)
         if value:
+            worker_env[key] = value
+    for key, value in source.items():
+        if key.startswith(("ATB_", "LCCL_")) and value:
             worker_env[key] = value
     return runtime_env
 
@@ -48,8 +52,11 @@ def _require_cann_atb_library():
     except OSError as exc:
         raise RuntimeError(
             "CANN libatb.so is not loadable in the launcher environment. "
-            "Source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh before "
-            "starting RIFT so VERL and vLLM-Ascend workers inherit the CANN libraries."
+            "In order, source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh, "
+            "activate verl-v091-cann91-py312, then source "
+            "/usr/local/Ascend/nnal/atb/set_env.sh before starting RIFT. "
+            "The ATB profile adds the ABI-matched libatb.so path required by "
+            "vLLM-Ascend; VERL and vLLM workers inherit these variables."
         ) from exc
 
 
