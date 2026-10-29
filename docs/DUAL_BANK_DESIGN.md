@@ -36,10 +36,10 @@ Ability Registry 不改变双池 Reward 公式，不添加能力数量、置信�
 ## 每轮协议
 
 1. Bootstrap 用 θ₀ 对可信任务按固定协议重复 Rollout，保存每次 `SUCCESS` / `FAILURE` / `UNKNOWN`、Checkpoint 和证据。默认只建池和基线，不训练 Service，也不生成 Designer 奖励。
-2. Designer 从统一 Failure Bank 的公开失败轨迹中，选择已有 ability ID 或 `NEW`，给出 hypothesis、诊断任务引用和结构化 Usami 训练任务提案。Host 校验 ID、公开引用和原始生成记录；`NEW` 由 Host 分配稳定 ID。Grounding、Certification 和 TaskRegistry 在 Host 完成。
+2. Designer 从统一 Failure Bank 的公开失败轨迹中做出一次包级 on-policy 决策：选择已有 ability ID 或 `NEW`，给出 hypothesis、诊断任务引用、一个原生 `ScenarioDraft` 和多个原生 `AbstractChallenge`。Host 将完整输出绑定到原始 Token 记录，构建并验证一个 Usami World，再逐题执行原生 Grounding、Compilation 和 Certification。Grounding 候选按原生确定性顺序逐个尝试；`UNKNOWN`、`UNSAT` 和 `NO_MATCH` 及其原因保留，未认证任务不能进入训练。`NEW` 由 Host 分配稳定 ID。
 3. Service 更新前冻结 `RECOVERY_FEEDBACK` 与 `RETENTION_FEEDBACK`：Recovery 先随机抽取目标能力关联的合格失败任务，再随机补齐其他合格失败任务；Retention 独立随机抽取。Designer 历史上见过的失败任务允许评分。每个候选必须先取得本轮 θ_before 与协议下的可信 baseline。快照保存 split policy 版本、seed、目标 ability、优先任务引用、当前基线、协议 digest、θ_before 和内容 digest。排除本轮训练包、实质重叠实例和 TEST。
 4. Probe 快照只使用 θ_before 下、同 TaskRef、同评测协议和固定 seeds 的已验证当前基线。历史 θ₀ 失败可以在后续 θ₂ 轮继续提供 Recovery 候选资格，但必须先读取或重新执行 θ₂ 的 baseline；不能把 θ₀ 的分数当作 θ₂ 基线，也不能缺失时默认成 0。
-5. Service 在新训练包上通过 verl 0.9.1、Usami 多轮 Agent Loop 和全参数 GRPO 更新 θ_before→θ_after。UNKNOWN 或验证失败的 GRPO 成员使整个组失效。
+5. `TrainingPackage` 从本轮已认证的 Designer 任务中按配置取数，并从预先认证、冻结的 Usami TRAIN 池中按固定 seed 随机取数。默认每轮一个 World、16 个任务、8+8 混合。每个 TaskRef 对应一个同 prompt、同 checkpoint 的完整 GRPO 组；不同 TaskRef 不共组。UNKNOWN 或证据验证失败会丢弃整个组；组丢弃后实际来源比例必须仍符合配置，否则明确拒绝本轮请求。Package 保存 World/build 证据、两类 TaskRef、身份、组 ID、随机 seed、Checkpoint，以及实际 rollout、Token 和优化样本统计。Service 通过现有 verl 0.9.1、Usami 多轮 Agent Loop 和全参数 GRPO 更新 θ_before→θ_after。
 6. 在相同冻结任务、seed 和协议下用 θ_after 独立重新执行 Probe。Probe seed 传入 CustomerFactory；Service 每轮生成使用由 TaskRef、seed、protocol 组成且不依赖 checkpoint 的随机种子范围，原始 sampling 参数写入生成证据。保留新的 Episode 和 replay 证据。任务先算自己的有效试次成功率，再对任务等权平均；UNKNOWN 不计成功也不计失败，但超出有效覆盖阈值则拒绝 Reward。
 7. `G = SR(θ_after, F) - SR(θ_before, F)`，`H = SR(θ_after, S) - SR(θ_before, S)`，`R = G - λ max(0, -H)`。独立保存 G、H、R、有效率、试次和 evidence refs。
 8. 把 `R` 绑定 Designer 原始 on-policy Token、结构化能力选择、包 ID、目标 ability、Service update、两个冻结 Probe、Checkpoint 和预算。对应 ability 追加真实更新与 Recovery/Retention 评测历史。默认采用 `sequential_curriculum`：每个包从当前 θ 更新，不伪造同起点 GRPO 组；Designer 使用带显式标量基线、不开 batch whitening 的 `reinforce_baseline`。若要用 GRPO，必须执行 matched-baseline 候选并共享 θ_before、冻结 Probe、协议和预算。
@@ -55,7 +55,7 @@ Ability Registry 不改变双池 Reward 公式，不添加能力数量、置信�
 
 双池 Reward 只能由可信 Host 在已验证 `CompletedUpdate`、冻结快照和完整 before/after 试次证据上重算。奖励 verifier 从可信 evidence resolver 取回 Snapshot 和两次结果，验证 hash、用途、split、Checkpoint、task 对齐、试次数、结果来源和公式。Probe 数据不足时结果状态是 `INSUFFICIENT_EVIDENCE`，不是零奖励。
 
-旧 `ReplayReward` 继续由 `replay_logp_v1` 路径产生。Reward 类型有明确 protocol tag；混合批次必须拒绝。旧 LoopState JSON 若无协议字段，显式按 `replay_logp_v1` 加载；旧奖励不会自动迁移成双池奖励。双池状态按冻结、基线、Service 更新、Probe 完成、奖励、Designer 更新的阶段落盘，恢复时重新验证 update、snapshot 和 evidence，不能换 Probe、重复计分或重复训练。
+旧 `ReplayReward` 继续由 `replay_logp_v1` 路径产生。Reward 类型有明确 protocol tag；混合批次必须拒绝。旧 LoopState JSON 若无协议字段，显式按 `replay_logp_v1` 加载；旧奖励不会自动迁移成双池奖励。LoopState schema 4 支持一个 Designer 决策绑定多道专项任务和混合训练包；schema 1–3 继续按原单任务协议读取。双池状态按冻结、基线、Service 更新、Probe 完成、奖励、Designer 更新的阶段落盘，恢复时重新验证 update、snapshot 和 evidence，不能换 Probe、重复计分或重复训练。
 
 ## 算法和未实现边界
 

@@ -36,6 +36,15 @@ service:
   full_parameter: true
   lora_rank: 0
   unknown_group_policy: discard_entire_group
+training_package:
+  schema_version: 1
+  designer_worlds_per_round: 1
+  tasks_per_round: 16
+  designer_fraction: 0.5
+  benchmark_fraction: 0.5
+  sampling_seed: 42
+  grpo_group_size: 4
+  max_candidate_challenges: 32
 designer:
   algorithm: reinforce_baseline
   full_parameter: true

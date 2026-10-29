@@ -13,6 +13,7 @@ from rift.replay.reward import ReplayReward, SampleScore
 from rift.rewards.learning_value import DualBankOutcomeReward, RewardMode
 from rift.probes.records import ProbeResultSet, ProbeSnapshot
 from rift.probes.storage import _result_set, _snapshot
+from rift.training.package import TrainingPackage
 
 
 class Stage(str, Enum):
@@ -77,6 +78,7 @@ class LoopState:
     retention_after: ProbeResultSet | None = None
     learning_reward: DualBankOutcomeReward | None = None
     designer_action: PendingDesignerAction | None = None
+    training_package: TrainingPackage | None = None
 
     def __post_init__(self):
         if not self.package_id or not self.proposal_ids or len(set(self.proposal_ids)) != len(self.proposal_ids):
@@ -84,8 +86,19 @@ class LoopState:
         if ((self.target_ability_id is not None and not self.target_ability_id)
                 or type(self.round_index) is not int or self.round_index < 0):
             raise ValueError('valid target ability ID and non-negative round index required')
-        if self.protocol_version != 2:
+        if self.protocol_version not in (2, 3):
             raise ValueError('unsupported LoopState protocol version')
+        if self.protocol_version == 3:
+            if (self.reward_mode != RewardMode.DUAL_BANK_OUTCOME_V1.value
+                    or not isinstance(self.training_package, TrainingPackage)
+                    or self.proposal_ids != (self.training_package.proposal_id,)
+                    or self.package_id != self.training_package.package_id
+                    or self.target_ability_id != self.training_package.target_ability_id
+                    or self.designer_action is None
+                    or self.designer_action.rollout_id != self.training_package.designer_action_ref):
+                raise ValueError('package protocol must bind one dual-bank Designer decision')
+        elif self.training_package is not None:
+            raise ValueError('version 2 states cannot contain package evidence')
         if self.reward_mode not in (RewardMode.REPLAY_LOGP_V1.value, RewardMode.DUAL_BANK_OUTCOME_V1.value):
             raise ValueError('unknown Designer reward mode')
         if self.designer_action is not None and not isinstance(self.designer_action, PendingDesignerAction):
@@ -100,9 +113,14 @@ class LoopState:
             raise ValueError('prior updates do not bind the next checkpoints')
         if self.stage is Stage.PROPOSED and self.task_refs:
             raise ValueError('proposed state cannot contain tasks')
-        if self.stage is not Stage.PROPOSED and (len(self.task_refs) != len(self.proposal_ids)
-                or any(not t for t in self.task_refs)):
-            raise ValueError('certified task refs required')
+        if self.stage is not Stage.PROPOSED:
+            if self.protocol_version == 3:
+                if self.task_refs != self.training_package.task_refs:
+                    raise ValueError('package state task refs differ from frozen package')
+            elif len(self.task_refs) != len(self.proposal_ids):
+                raise ValueError('legacy certified task refs must bind each proposal')
+            if any(not t for t in self.task_refs):
+                raise ValueError('certified task refs required')
         if len(set(self.task_refs)) != len(self.task_refs):
             raise ValueError('certified tasks must be distinct')
         order = _DUAL_ORDER if self.reward_mode == RewardMode.DUAL_BANK_OUTCOME_V1.value else _LEGACY_ORDER
@@ -166,8 +184,20 @@ class LoopState:
                        or not r.response_id or r.reward_ref != r.episode_id
                        for r in self.service_request.rollouts)):
             raise ValueError('invalid Service request binding')
-        if self.service_request and {r.task_id for r in self.service_request.rollouts} != set(self.task_refs):
-            raise ValueError('Service request does not cover the certified package')
+        if self.service_request:
+            service_refs = {r.task_id for r in self.service_request.rollouts}
+            if (not service_refs or (self.training_package is None
+                    and service_refs != set(self.task_refs))
+                    or not service_refs.issubset(set(self.task_refs))):
+                raise ValueError('Service request does not cover the certified package')
+        if self.training_package is not None:
+            if self.stage.value in {Stage.READY_FOR_TRAINING.value,
+                    Stage.SERVICE_TRAINING_COMPLETED.value, Stage.PROBES_EVALUATED.value,
+                    Stage.LEARNING_REWARDED.value, Stage.DESIGNER_READY.value,
+                    Stage.DESIGNER_TRAINING_COMPLETED.value}:
+                if (self.service_request is None
+                        or not self.training_package.verify_service_request(self.service_request)):
+                    raise ValueError('persisted package statistics differ from its Service GRPO request')
         if self.expected_service is not None and self.service_request is not None and self.service_request.policy_before != self.expected_service:
             raise ValueError('Service request does not continue the prior checkpoint')
         if self.service_update and self.service_update.request != self.service_request:
@@ -217,8 +247,35 @@ class LoopState:
             raise ValueError('uncertified proposal')
         return self._next(Stage.CERTIFIED, task_refs=tuple(r.task_ref for r in results))
 
+    def certify_training_package(self, package, designer_certifications):
+        """Bind one captured Designer choice to its certified tasks and frozen mix."""
+        if self.stage is not Stage.PROPOSED or not isinstance(package, TrainingPackage):
+            raise ValueError('a proposed state and frozen TrainingPackage are required')
+        rows = tuple(designer_certifications)
+        if (self.proposal_ids != (package.proposal_id,)
+                or package.package_id != self.package_id
+                or package.target_ability_id != self.target_ability_id
+                or self.designer_action is None
+                or self.designer_action.rollout_id != package.designer_action_ref
+                or self.reward_mode not in (RewardMode.REPLAY_LOGP_V1.value,
+                                             RewardMode.DUAL_BANK_OUTCOME_V1.value)
+                or package.stats is not None
+                or len(rows) != len(package.designer_task_refs)
+                or any(not isinstance(row, Certification)
+                       or row.proposal_id != package.proposal_id
+                       or row.status is not CertificationStatus.CERTIFIED
+                       for row in rows)
+                or tuple(row.task_ref for row in rows) != package.designer_task_refs):
+            raise ValueError('Designer certifications do not bind the one frozen task package')
+        return self._next(Stage.CERTIFIED, task_refs=package.task_refs,
+            protocol_version=3, reward_mode=RewardMode.DUAL_BANK_OUTCOME_V1.value,
+            training_package=package)
+
     def freeze_probes(self, recovery, retention, *, snapshot_verifier):
-        if self.reward_mode != RewardMode.REPLAY_LOGP_V1.value or self.stage is not Stage.CERTIFIED:
+        if (self.stage is not Stage.CERTIFIED
+                or (self.reward_mode != RewardMode.REPLAY_LOGP_V1.value
+                    and not (self.protocol_version == 3
+                             and self.reward_mode == RewardMode.DUAL_BANK_OUTCOME_V1.value))):
             raise ValueError('Probe snapshots can only be frozen once after certification')
         if self.designer_action is None:
             raise ValueError('dual-bank credit requires the captured on-policy Designer action')
@@ -259,7 +316,11 @@ class LoopState:
         if (self.reward_mode == RewardMode.DUAL_BANK_OUTCOME_V1.value
                 and request.policy_before != self.recovery_snapshot.baseline_checkpoint):
             raise ValueError('Probe baseline checkpoint differs from Service training start')
-        return self._next(Stage.READY_FOR_TRAINING, service_request=request)
+        package = self.training_package
+        if package is not None:
+            package = package.record_service_request(request)
+        return self._next(Stage.READY_FOR_TRAINING, service_request=request,
+                          training_package=package)
 
     def service_completed(self, update, *, update_verifier):
         if self.stage is not Stage.READY_FOR_TRAINING or not isinstance(update, CompletedUpdate):
@@ -349,7 +410,7 @@ class LoopState:
         return replace(self, stage=stage, **updates)
 
     def save(self, path):
-        payload = {"schema_version": 3, **asdict(self)}
+        payload = {"schema_version": 4, **asdict(self)}
         Path(path).write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding='utf-8')
 
     @classmethod
@@ -359,7 +420,7 @@ class LoopState:
         if "schema_version" not in raw:
             # Legacy LoopState used only ReplayReward and has no protocol tag.
             raw = {"schema_version": 1, **raw}
-        if raw["schema_version"] not in (1, 2, 3):
+        if raw["schema_version"] not in (1, 2, 3, 4):
             raise ValueError('unsupported LoopState schema')
 
         def checkpoint(value): return None if value is None else Checkpoint(**value)
@@ -389,7 +450,7 @@ class LoopState:
                 value['binding_digest'], value['normalization'],
                 tuple(SampleScore(**row) for row in value['samples']), value['mean'])
         schema = raw['schema_version']
-        dual = schema in (2, 3) and raw.get('reward_mode') == RewardMode.DUAL_BANK_OUTCOME_V1.value
+        dual = schema in (2, 3, 4) and raw.get('reward_mode') == RewardMode.DUAL_BANK_OUTCOME_V1.value
         recovery_snapshot = _snapshot(raw['recovery_snapshot']) if dual and raw.get('recovery_snapshot') else None
         retention_snapshot = _snapshot(raw['retention_snapshot']) if dual and raw.get('retention_snapshot') else None
         recovery_before = _result_set(raw['recovery_before']) if dual and raw.get('recovery_before') else None
@@ -410,7 +471,8 @@ class LoopState:
             expected_service=checkpoint(raw.get('expected_service')),
             expected_designer=checkpoint(raw.get('expected_designer')),
             previous_updates=tuple(update(row) for row in raw.get('previous_updates', ())),
-            protocol_version=2, reward_mode=(raw.get('reward_mode') if schema in (2, 3) else RewardMode.REPLAY_LOGP_V1.value),
+            protocol_version=(raw.get('protocol_version', 2) if schema == 4 else 2),
+            reward_mode=(raw.get('reward_mode') if schema in (2, 3, 4) else RewardMode.REPLAY_LOGP_V1.value),
             recovery_snapshot=recovery_snapshot, retention_snapshot=retention_snapshot,
             recovery_before=recovery_before, retention_before=retention_before,
             recovery_after=recovery_after, retention_after=retention_after,
@@ -418,7 +480,9 @@ class LoopState:
             designer_action=(PendingDesignerAction(checkpoint(raw['designer_action']['checkpoint']),
                 raw['designer_action']['rollout_id'], Tokens(tuple(raw['designer_action']['tokens']['prompt']),
                     tuple(raw['designer_action']['tokens']['response']), tuple(raw['designer_action']['tokens']['mask'])),
-                raw['designer_action'].get('group_id')) if raw.get('designer_action') else None))
+                raw['designer_action'].get('group_id')) if raw.get('designer_action') else None),
+            training_package=(TrainingPackage.from_dict(raw['training_package'])
+                if schema == 4 and raw.get('training_package') else None))
         updates = (state.service_update, state.designer_update, *state.previous_updates,
                    *(item.update for item in state.designer_feedback))
         for item in updates:

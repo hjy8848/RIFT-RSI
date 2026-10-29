@@ -51,7 +51,8 @@ class EvolutionRoundPlan:
 
     def __post_init__(self):
         if (self.state.stage is not Stage.CERTIFIED or not self.state.designer_action
-                or self.state.reward_mode != RewardMode.REPLAY_LOGP_V1.value):
+                or (self.state.reward_mode != RewardMode.REPLAY_LOGP_V1.value
+                    and self.state.training_package is None)):
             raise ValueError('round plan must start with a certified package and its captured Designer action')
         if (self.state.designer_action.checkpoint != self.designer_checkpoint
                 or self.state.designer_action.group_id is not None
@@ -65,6 +66,11 @@ class EvolutionRoundPlan:
                 or self.service_request.policy_before != self.recovery_snapshot.baseline_checkpoint
                 or self.recovery_snapshot.baseline_checkpoint != self.retention_snapshot.baseline_checkpoint):
             raise ValueError('round plan package action, request and Probe baselines differ')
+        if self.state.training_package is not None:
+            self.state.training_package.assert_disjoint_from(self.recovery_snapshot,
+                                                             self.retention_snapshot)
+            # Validate the requested complete groups before any baseline/model work.
+            self.state.training_package.record_service_request(self.service_request)
         if (not self.designer_batch_id or not callable(self.feedback_provider)
                 or not callable(self.training_identity_resolver)
                 or not isinstance(self.designer_reward_baseline, (int, float))):
@@ -135,6 +141,10 @@ class EvolutionScheduler:
                     or state.proposal_ids != plan.state.proposal_ids
                     or state.designer_action != plan.state.designer_action):
                 raise ValueError('resumed round differs from the persisted Designer package action')
+            if plan.state.training_package is not None:
+                if (state.training_package is None or replace(state.training_package, stats=None)
+                        != replace(plan.state.training_package, stats=None)):
+                    raise ValueError('resumed package differs from the frozen Designer/Benchmark mix')
         else:
             state = plan.state
             action_args = (plan.state.designer_action.tokens, plan.designer_checkpoint,

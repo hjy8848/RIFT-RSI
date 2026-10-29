@@ -53,6 +53,9 @@ class UpdateRequest:
                 groups.setdefault(r.group_id, []).append(r)
             if any(len({r.episode_id for r in g}) < 2 or len({r.tokens.prompt for r in g}) != 1 for g in groups.values()):
                 raise ValueError("GRPO groups require distinct rollouts from the same prompt")
+            if (self.policy_before.policy.lower() == "service"
+                    and any(len({r.task_id for r in g}) != 1 for g in groups.values())):
+                raise ValueError("a GRPO group cannot mix different TaskRefs")
             if any(len({r.reward_source for r in g}) != 1 for g in groups.values()):
                 raise ValueError("GRPO group members need a common, comparable reward source")
             if any(len({r.policy for r in g}) != 1 for g in groups.values()):

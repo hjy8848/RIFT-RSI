@@ -1,5 +1,20 @@
 """Explicit, lazy bindings to pinned Usami commerce v2 APIs; host-only."""
+from dataclasses import dataclass
+from hashlib import sha256
 from rift.benchmark.private_evaluation import project_events, public_certification
+
+
+@dataclass(frozen=True)
+class DesignerTrainingWorld:
+    proposal_id: str
+    distribution_hash: str
+    world_ref: str
+    spec: object
+    build: object
+    build_verification: dict
+    challenge_results: tuple[dict, ...]
+    certifications: tuple[object, ...]
+    tasks: tuple[object, ...]
 
 def certify_native(proposal_id, world, task, customer_scenario, budget):
     from usami_v2.scenarios.task_certification import certify_task, verify_task_certificate
@@ -128,6 +143,99 @@ class CommerceHost:
             return certification, task
         return unresolved or last_rejection or Certification(
             proposal.proposal_id, CertificationStatus.UNKNOWN), None
+
+    def certify_training_plan(self, proposal, *, world_seed, world_build_budget=None,
+                              allowed_training_hashes=(), max_candidate_challenges=32):
+        """Build one native World, then ground and certify each native challenge in it."""
+        from rift.tasks import CertificationStatus
+        if not getattr(proposal, 'is_training_plan', False):
+            raise ValueError('a package-level Designer World and challenge plan is required')
+        if (type(world_seed) is not int or world_seed < 0
+                or type(max_candidate_challenges) is not int or max_candidate_challenges < 1
+                or len(proposal.challenges) > max_candidate_challenges):
+            raise ValueError('bounded World construction seed and challenge budget required')
+
+        from usami_v2.scenarios.builder import build_world, verify_build
+        from usami_v2.scenarios.designer import ScenarioDraft, TaskCapabilityUnsupported
+        from usami_v2.scenarios.grounding import AbstractChallenge, ground_challenge
+
+        draft = ScenarioDraft.model_validate(proposal.world_draft).checked()
+        spec = draft.compile(self.distribution)
+        build = build_world(spec, world_seed, world_build_budget)
+        build_verification = verify_build(spec, build)
+        world_ref = sha256(f"rift-designer-world-v1:{proposal.proposal_id}:{spec.record_hash}:{world_seed}:{build.record_hash}".encode()).hexdigest()[:32]
+        if build.status != 'SAT' or build_verification.get('verified') is not True:
+            return DesignerTrainingWorld(proposal.proposal_id, self.distribution.record_hash,
+                world_ref, spec, build, build_verification, (), (), ())
+
+        worlds = ((world_ref, spec, build),)
+        challenge_results, certifications, tasks = [], [], []
+        for raw_challenge in proposal.challenges:
+            challenge = AbstractChallenge.model_validate(raw_challenge).checked()
+            grounding = ground_challenge(challenge, worlds, self.grounding_budget)
+            attempts, selected_task = [], None
+            if grounding.candidates:
+                for index, candidate in enumerate(grounding.candidates):
+                    try:
+                        task = compile_candidate(candidate, spec, build, self.distribution,
+                                                 allowed_training_hashes)
+                    except TaskCapabilityUnsupported as exc:
+                        attempts.append({'candidate_index':index, 'task_ref':None,
+                            'status':'UNKNOWN', 'native_status':'UNSUPPORTED',
+                            'reason':str(exc), 'reason_code':exc.code})
+                        continue
+                    scenario = self.scenario_factory(task, spec, build)
+                    public_result, native_certificate = certify_native(
+                        proposal.proposal_id, build.world, task, scenario, self.proof_budget)
+                    native_status = 'UNKNOWN' if native_certificate is None else native_certificate.status
+                    reasons = () if native_certificate is None else tuple(native_certificate.blockers)
+                    attempts.append({'candidate_index':index, 'task_ref':task.record_hash,
+                        'status':public_result.status.value, 'native_status':native_status,
+                        'reason':list(reasons)})
+                    if public_result.status is not CertificationStatus.CERTIFIED:
+                        continue
+                    identity = self.identity_factory(task, spec, build)
+                    from rift.schemas import DataPurpose, Identity, Split
+                    if (not isinstance(identity, Identity) or identity.split is not Split.TRAIN
+                            or identity.purpose is not DataPurpose.TRAIN
+                            or identity.task != task.record_hash or identity.world != build.world_hash
+                            or task.partition != 'train'):
+                        raise ValueError('Designer task identity must bind this verified TRAIN World')
+                    profile = self.profile_factory(task, spec, build)
+                    from rift.verl.task_registry import CertifiedNativeTask
+                    self.registry.register(identity)
+                    self.task_registry.register(CertifiedNativeTask(
+                        build.world, task, profile, scenario, native_certificate, identity))
+                    certifications.append(public_result)
+                    tasks.append(task)
+                    selected_task = task
+                    break
+            if selected_task is not None:
+                status = 'CERTIFIED'
+                reasons = []
+            elif not grounding.candidates:
+                status = grounding.status
+                reasons = [grounding.status]
+            else:
+                native_statuses = {row['native_status'] for row in attempts}
+                status = ('UNKNOWN' if 'UNKNOWN' in native_statuses or 'UNSUPPORTED' in native_statuses
+                          else 'UNSAT')
+                reasons = [row.get('reason_code') or row.get('reason') or row['native_status']
+                           for row in attempts]
+            challenge_results.append({
+                'challenge_id':challenge.task_id,
+                'grounding_status':grounding.status,
+                'search_truncated':grounding.search_truncated,
+                'candidate_count':len(grounding.candidates),
+                'attempts':attempts,
+                'status':status,
+                'reasons':reasons,
+                'selected_task_ref':None if selected_task is None else selected_task.record_hash,
+            })
+        return DesignerTrainingWorld(proposal.proposal_id, self.distribution.record_hash,
+            world_ref, spec, build, build_verification, tuple(challenge_results),
+            tuple(certifications), tuple(tasks))
+
     def rollout(self, task, service):
         record = self.task_registry.resolve_record(task.record_hash)
         if record.task != task or not self.task_registry.verify_task(

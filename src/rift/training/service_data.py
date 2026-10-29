@@ -31,7 +31,8 @@ def prepare_service_update(package_id, certified_tasks, episodes, checkpoint, re
         raise ValueError('every certified task must have a usable Service rollout')
     return UpdateRequest(checkpoint, package_id, tuple(rows), algorithm)
 
-def prepare_service_trajectory_update(package_id, certified_tasks, episodes, checkpoint, capture_store, *, algorithm='grpo'):
+def prepare_service_trajectory_update(package_id, certified_tasks, episodes, checkpoint, capture_store, *,
+                                     algorithm='grpo', allow_partial_groups=False):
     """Build whole-episode GRPO samples from verified, generation-time captures."""
     from usami_v2.runtime.runner import replay_episode
     if algorithm.lower() != 'grpo':
@@ -71,6 +72,28 @@ def prepare_service_trajectory_update(package_id, certified_tasks, episodes, che
         for episode, task_id, outcome, tokens, _ in members:
             rows.append(service_rollout(tokens, checkpoint, task_id, episode.record_hash, outcome,
                 group, response_id=episode.record_hash))
-    if not rows or {r.task_id for r in rows} != set(certified_tasks):
+    if (not rows or (not allow_partial_groups
+                     and {row.task_id for row in rows} != set(certified_tasks))):
         raise ValueError('every certified task needs a complete known-outcome GRPO group')
     return UpdateRequest(checkpoint, package_id, tuple(rows), algorithm)
+
+def prepare_package_service_update(package, task_registry, episodes, checkpoint, capture_store):
+    """Prepare complete known-outcome GRPO groups from one frozen mixed package.
+
+    A task whose outcomes are UNKNOWN is dropped as a whole GRPO group by the
+    underlying trajectory builder. The package records the realized source mix
+    from the remaining verified groups.
+    """
+    from rift.training.package import TrainingPackage
+    if not isinstance(package, TrainingPackage):
+        raise TypeError('frozen TrainingPackage required')
+    refs = set(package.task_refs)
+    records = {ref: task_registry.resolve_record(ref) for ref in refs}
+    sources = {row.task_ref: row for row in package.task_sources}
+    if any(record.identity != sources[ref].identity
+            or record.certificate.record_hash != sources[ref].certificate_hash
+            for ref, record in records.items()):
+        raise ValueError('package TaskRefs differ from certified task identities')
+    request = prepare_service_trajectory_update(package.package_id, refs, episodes,
+        checkpoint, capture_store, algorithm='grpo', allow_partial_groups=True)
+    return request, package.record_service_request(request)

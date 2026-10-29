@@ -10,6 +10,9 @@ from rift.schemas import Checkpoint, Tokens
 from rift.tasks import Proposal
 from rift.training.trace import ExactPolicyTrace, digest
 
+def _json_value(value):
+    return json.loads(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
 @dataclass(frozen=True)
 class PendingDesignerRollout:
     package_id: str
@@ -32,11 +35,11 @@ class DesignerCaptureStore:
         visible_refs = set(request.get('visible_failure_refs', ()))
         ability_refs = {row['ability_id']: set(row['failure_task_refs'])
                         for row in request.get('ability_options', ())}
-        encoded_proposals = [asdict(row) for row in pending.proposals]
+        encoded_proposals = [_json_value(asdict(row)) for row in pending.proposals]
         for row in encoded_proposals:
             row['diagnosis_task_refs'] = list(row['diagnosis_task_refs'])
             row['remove_failure_task_refs'] = list(row['remove_failure_task_refs'])
-        response_proposals = [dict(row) for row in response.get('parsed_proposals', ())]
+        response_proposals = [_json_value(dict(row)) for row in response.get('parsed_proposals', ())]
         for row in response_proposals:
             row['diagnosis_task_refs'] = list(row['diagnosis_task_refs'])
             row['remove_failure_task_refs'] = list(row['remove_failure_task_refs'])
@@ -47,6 +50,8 @@ class DesignerCaptureStore:
                 or response['generated_token_ids'] != list(trace.tokens.response)
                 or response['log_probs'] != (None if pending.logprobs is None else list(pending.logprobs))
                 or response_proposals != encoded_proposals
+                or (any(row['world_draft'] is not None for row in encoded_proposals)
+                    and len(encoded_proposals) != 1)
                 or any((row['ability_id'] != 'NEW' and row['ability_id'] not in ability_refs)
                        or not set(row['diagnosis_task_refs']).issubset(visible_refs)
                        or not set(row['remove_failure_task_refs']).issubset(
@@ -56,7 +61,7 @@ class DesignerCaptureStore:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self._path(pending.rollout_id).open('x', encoding='utf-8') as stream:
             json.dump({'trace':asdict(trace), 'request':request, 'response':response,
-                'group_id':pending.group_id, 'proposals':[asdict(p) for p in pending.proposals]}, stream, sort_keys=True)
+                'group_id':pending.group_id, 'proposals':encoded_proposals}, stream, sort_keys=True)
     def load_pending(self, rollout_id):
         """Restore an exact generated Designer action for delayed reward recovery."""
         raw = json.loads(self._path(rollout_id).read_text(encoding='utf-8'))
@@ -66,9 +71,10 @@ class DesignerCaptureStore:
                 tuple(token['mask'])), t['request_digest'], t['response_digest'],
             t['serialization'], t['evidence_ref'], t['package_id'])
         proposals = tuple(Proposal(row['proposal_id'], row['hypothesis'],
-            row['public_request'], row['abstract_spec'], row['ability_id'],
-            tuple(row['diagnosis_task_refs']), tuple(row['remove_failure_task_refs']))
-            for row in raw['proposals'])
+            row.get('public_request', ''), row.get('abstract_spec', ''),
+            row.get('ability_id', 'NEW'), tuple(row.get('diagnosis_task_refs', ())),
+            tuple(row.get('remove_failure_task_refs', ())), row.get('world_draft'),
+            tuple(row.get('challenges', ()))) for row in raw['proposals'])
         response = raw['response']
         logprobs = response.get('log_probs')
         pending = PendingDesignerRollout(trace.package_id, rollout_id, raw['group_id'],
@@ -112,7 +118,7 @@ class DesignerCaptureStore:
                 return False
             rows = record['proposals']
             context = record['request']
-            selected = asdict(proposal)
+            selected = _json_value(asdict(proposal))
             selected['diagnosis_task_refs'] = list(selected['diagnosis_task_refs'])
             selected['remove_failure_task_refs'] = list(selected['remove_failure_task_refs'])
             if selected not in rows:
@@ -183,6 +189,8 @@ class DesignerSampler:
         proposals = tuple(await self.proposal_parser(response_ids))
         if not proposals or any(not isinstance(p, Proposal) for p in proposals) or len({p.proposal_id for p in proposals}) != len(proposals):
             raise ValueError('valid distinct structured proposals required')
+        if any(p.is_training_plan for p in proposals) and len(proposals) != 1:
+            raise ValueError('one Designer training plan must be captured as one policy decision')
         visible_refs = set(request['visible_failure_refs'])
         option_refs = {row['ability_id']: set(row['failure_task_refs'])
                        for row in request['ability_options']}
