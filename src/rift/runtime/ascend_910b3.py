@@ -57,11 +57,11 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
         config = compose(config_name="ppo_trainer")
     OmegaConf.set_struct(config, False)
     config.actor_rollout_ref.model.path = str(Path(model_path).resolve())
-    config.actor_rollout_ref.model.dtype = "bfloat16"
     config.actor_rollout_ref.model.lora_rank = 0
     config.actor_rollout_ref.model.trust_remote_code = False
     config.actor_rollout_ref.hybrid_engine = True
     config.actor_rollout_ref.actor.strategy = "fsdp2"
+    config.actor_rollout_ref.actor.fsdp_config.model_dtype = "bfloat16"
     config.actor_rollout_ref.actor.use_kl_loss = False
     config.actor_rollout_ref.actor.ppo_mini_batch_size = WORLD_SIZE
     config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu = 1
