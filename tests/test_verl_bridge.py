@@ -388,9 +388,10 @@ def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkey
     monkeypatch.delattr(extension, 'UsamiServiceAgentLoop', raising=False)
     loop = extension.UsamiServiceAgentLoop()
     class FakeServer:
-        def __init__(self): self.i = 0
+        def __init__(self): self.i = 0; self.sampling = []
         async def generate(self, request_id, *, prompt_ids, sampling_params):
             self.i += 1
+            self.sampling.append(dict(sampling_params))
             return SimpleNamespace(token_ids=[self.i+10], log_probs=None,
                 extra_fields={'global_steps':1,'min_global_steps':1,'max_global_steps':1})
     loop.server_manager = FakeServer()
@@ -405,7 +406,8 @@ def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkey
     ledger = GenerationLedger(tmp_path / 'generation-ledger', verifier)
     sink = NativeCaptureStore(tmp_path / 'captures', serialization='fake-template', attestor=ledger)
     session = NativeUsamiSession(world, refund_task(world,aliases), refund_profile(aliases), ScriptedCustomer(), FakeParser(),
-        group_id='group', budget=EpisodeBudget(max_customer_turns=3,max_service_decisions=10,max_service_tool_calls=8,max_model_calls=10))
+        group_id='group', sampling_seed=23, sampling_scope='paired-probe-scope',
+        budget=EpisodeBudget(max_customer_turns=3,max_service_decisions=10,max_service_tool_calls=8,max_model_calls=10))
     class Host:
         async def open_rollout(self, task_ref, group_id, session_id, tokenizer):
             return session, cp, verifier, sink
@@ -417,6 +419,9 @@ def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkey
         assert len(episode.model_calls) == loop.server_manager.i
         assert 0 in output.response_mask and 1 in output.response_mask
     asyncio.run(run())
+    from rift.verl.sampling import rollout_seed
+    assert [row['seed'] for row in loop.server_manager.sampling] == [
+        rollout_seed(23, 'paired-probe-scope', turn) for turn in range(loop.server_manager.i)]
     monkeypatch.delattr(extension, 'UsamiServiceAgentLoop', raising=False)
 
 def test_designer_on_policy_capture_precedes_delayed_reward(tmp_path):
@@ -537,6 +542,109 @@ def test_host_provider_resolves_private_task_inside_worker(monkeypatch):
     task.partition = 'heldout'
     with pytest.raises(ValueError, match='training task'):
         asyncio.run(provider.open_rollout('opaque','group',0,None))
+
+def test_probe_seed_reaches_customer_and_is_checkpoint_independent(monkeypatch):
+    from rift.verl.host_provider import NativeHostProvider
+    from rift.verl.usami_session import NativeUsamiSession
+    from rift.schemas import DataPurpose, Checkpoint
+    task = SimpleNamespace(partition='train')
+    world, profile = object(), object()
+    class Resolver:
+        def resolve(self, ref): return world, task, profile, ()
+        def purpose(self, ref): return DataPurpose.BANK_CANDIDATE
+    class Authorizer:
+        def verify_task(self, ref, w, t, p, *, purpose=None): return purpose is DataPurpose.BANK_CANDIDATE
+    class Customers:
+        def __init__(self): self.seeds = []
+        def create(self, ref, *, seed):
+            self.seeds.append(seed)
+            return SimpleNamespace(seed=seed)
+    class Store:
+        def verify(self, checkpoint): return True
+    class Source: pass
+    class Sink: pass
+    captures = []
+    def make_session(*args, **kwargs):
+        session = SimpleNamespace(**kwargs)
+        captures.append(session)
+        return session
+    monkeypatch.setattr(NativeUsamiSession, 'with_verl_parser', make_session)
+    customers = Customers()
+    provider = NativeHostProvider(Resolver(), Authorizer(), customers, Source(), Store(), Sink(),
+        budget=object(), parser_format='qwen')
+    before = Checkpoint('service','before','tok','weights-before')
+    after = Checkpoint('service','after','tok','weights-after')
+    first = asyncio.run(provider.open_probe('failure-F1', before, 41, 'eval-v1', None))[0]
+    second = asyncio.run(provider.open_probe('failure-F1', after, 41, 'eval-v1', None))[0]
+    assert customers.seeds == [41, 41]
+    assert first.rollout_id != second.rollout_id
+    assert first.sampling_seed == second.sampling_seed == 41
+    assert first.sampling_scope == second.sampling_scope
+
+def test_parser_runtime_failure_is_retained_as_unknown_native_episode(tmp_path):
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
+    from test_usami_v2_runtime import frozen, refund_task, refund_profile, ScriptedCustomer
+    from usami_v2.runtime.runner import EpisodeBudget
+    from rift.benchmark.usami import public_episode
+    from rift.verl.usami_session import NativeUsamiSession
+    from rift.verl.capture import ContinuousCapture
+    from rift.verl.capture_store import NativeCaptureStore
+    world, aliases = frozen()
+    class BrokenParser:
+        async def extract_tool_calls(self, token_ids, schemas):
+            raise RuntimeError('tokenizer parser runtime failed')
+    class Attestor:
+        def verify_capture(self, trace, request, response): return True
+    checkpoint = Checkpoint('service','v1','tok','weights')
+    store = NativeCaptureStore(tmp_path / 'captures', serialization='fake-template', attestor=Attestor())
+    async def run():
+        session = NativeUsamiSession(world, refund_task(world, aliases), refund_profile(aliases),
+            ScriptedCustomer(), BrokenParser(), budget=EpisodeBudget(max_model_calls=10))
+        try:
+            await session.start()
+            capture = ContinuousCapture([1], checkpoint)
+            capture.add_generation([1], [42], None, [1, 42], [True])
+            _, _, done = await session.advance([42], [1], {'temperature':1.0, 'seed':9},
+                generation_id='a' * 32, serving_fields={'global_steps':1,'min_global_steps':1,'max_global_steps':1})
+            assert done
+            episode = await session.finish()
+            await store.persist(episode, checkpoint, tuple(capture.decisions), capture.output())
+            return episode
+        finally:
+            await session.abort()
+    episode = asyncio.run(run())
+    assert episode.status == 'cancelled' and episode.replay_verified
+    assert len(episode.model_calls) == 1
+    assert episode.model_calls[0].response['generated_token_ids'] == [42]
+    assert public_episode(episode).outcome is Outcome.UNKNOWN
+    assert store.verify_trajectory(episode, checkpoint)
+
+def test_malformed_service_tool_is_a_native_business_failure_not_runtime_abort():
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
+    from test_usami_v2_runtime import frozen, refund_task, refund_profile, ScriptedCustomer
+    from usami_v2.runtime.runner import EpisodeBudget
+    from rift.benchmark.usami import public_episode
+    from rift.verl.usami_session import NativeUsamiSession
+    world, aliases = frozen()
+    class MalformedParser:
+        async def extract_tool_calls(self, token_ids, schemas):
+            return '', [SimpleNamespace(name='not_a_usami_tool', arguments='{}', tool_call_id='bad')]
+    async def run():
+        session = NativeUsamiSession(world, refund_task(world, aliases), refund_profile(aliases),
+            ScriptedCustomer(), MalformedParser(), budget=EpisodeBudget(max_model_calls=10))
+        try:
+            await session.start()
+            _, _, done = await session.advance([17], [1], {'temperature':1.0}, generation_id='b' * 32)
+            assert done
+            return await session.finish()
+        finally:
+            await session.abort()
+    episode = asyncio.run(run())
+    assert episode.status == 'service_protocol_error' and episode.replay_verified
+    assert len(episode.model_calls) == 1
+    assert public_episode(episode).outcome is Outcome.FAILURE
 
 def test_update_ledger_detects_checkpoint_and_receipt_tampering(tmp_path):
     """Dummy files and mocked metrics only test ledger integrity."""

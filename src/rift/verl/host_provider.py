@@ -49,9 +49,10 @@ class NativeHostProvider:
             raise ValueError('Probe task authorization failed')
         if self.checkpoint_store.verify(checkpoint) is not True:
             raise ValueError('selected Probe checkpoint failed verification')
-        customer = self.customer_factory.create(task_ref)
+        customer = self.customer_factory.create(task_ref, seed=seed)
         rollout_id = sha256(f"rift-probe:{task_ref}:{checkpoint.weights_digest}:{seed}:{protocol_ref}".encode()).hexdigest()[:32]
+        sampling_scope = sha256(f"rift-probe-sampling-v1:{task_ref}:{seed}:{protocol_ref}".encode()).hexdigest()
         session = NativeUsamiSession.with_verl_parser(world, task, profile, customer, tokenizer,
             self.parser_format, budget=self.budget, mode=self.mode, external_events=external_events,
-            rollout_id=rollout_id)
+            rollout_id=rollout_id, sampling_seed=seed, sampling_scope=sampling_scope)
         return session, checkpoint, self.checkpoint_store, self.capture_store

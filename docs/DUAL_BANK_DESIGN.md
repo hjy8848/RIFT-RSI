@@ -40,7 +40,7 @@ Ability Registry 不改变双池 Reward 公式，不添加能力数量、置信�
 3. Service 更新前冻结 `RECOVERY_FEEDBACK` 与 `RETENTION_FEEDBACK`：Recovery 先随机抽取目标能力关联的合格失败任务，再随机补齐其他合格失败任务；Retention 独立随机抽取。Designer 历史上见过的失败任务允许评分。每个候选必须先取得本轮 θ_before 与协议下的可信 baseline。快照保存 split policy 版本、seed、目标 ability、优先任务引用、当前基线、协议 digest、θ_before 和内容 digest。排除本轮训练包、实质重叠实例和 TEST。
 4. Probe 快照只使用 θ_before 下、同 TaskRef、同评测协议和固定 seeds 的已验证当前基线。历史 θ₀ 失败可以在后续 θ₂ 轮继续提供 Recovery 候选资格，但必须先读取或重新执行 θ₂ 的 baseline；不能把 θ₀ 的分数当作 θ₂ 基线，也不能缺失时默认成 0。
 5. Service 在新训练包上通过 verl 0.9.1、Usami 多轮 Agent Loop 和全参数 GRPO 更新 θ_before→θ_after。UNKNOWN 或验证失败的 GRPO 成员使整个组失效。
-6. 在相同冻结任务、seed 和协议下用 θ_after 独立重新执行 Probe，保留新的 Episode 和 replay 证据。任务先算自己的有效试次成功率，再对任务等权平均；UNKNOWN 不计成功也不计失败，但超出有效覆盖阈值则拒绝 Reward。
+6. 在相同冻结任务、seed 和协议下用 θ_after 独立重新执行 Probe。Probe seed 传入 CustomerFactory；Service 每轮生成使用由 TaskRef、seed、protocol 组成且不依赖 checkpoint 的随机种子范围，原始 sampling 参数写入生成证据。保留新的 Episode 和 replay 证据。任务先算自己的有效试次成功率，再对任务等权平均；UNKNOWN 不计成功也不计失败，但超出有效覆盖阈值则拒绝 Reward。
 7. `G = SR(θ_after, F) - SR(θ_before, F)`，`H = SR(θ_after, S) - SR(θ_before, S)`，`R = G - λ max(0, -H)`。独立保存 G、H、R、有效率、试次和 evidence refs。
 8. 把 `R` 绑定 Designer 原始 on-policy Token、结构化能力选择、包 ID、目标 ability、Service update、两个冻结 Probe、Checkpoint 和预算。对应 ability 追加真实更新与 Recovery/Retention 评测历史。默认采用 `sequential_curriculum`：每个包从当前 θ 更新，不伪造同起点 GRPO 组；Designer 使用带显式标量基线、不开 batch whitening 的 `reinforce_baseline`。若要用 GRPO，必须执行 matched-baseline 候选并共享 θ_before、冻结 Probe、协议和预算。
 9. 完成本轮证据持久化后，更新后续候选池；Recovery/Retention 具体题面仍不向 Designer 暴露。最终 TEST 永不产生 Designer Reward。
@@ -61,4 +61,4 @@ Ability Registry 不改变双池 Reward 公式，不添加能力数量、置信�
 
 Service 保留 VERL 0.9.1 FSDP2 全参数 GRPO 与 vLLM 权重同步。Designer 双池默认使用无分组 REINFORCE baseline：跨不同 Service 起点的序列奖励不能作为同一个 GRPO 对比组，也不能使用隐含 batch whitening。该实现提供算法与证据接口，但基线的真实方差、稳定性和学习效果须通过真实训练验证。旧 Replay LogP Designer 路径保持原有 matched-source 约束。
 
-Usami Benchmark 的认证、业务规则、Oracle 和 Reference 不改写。真实 Ray/FSDP2 Worker Launcher、持久化认证任务及 Episode Store、完整 Probe Runtime Factory、Ascend 兼容栈仍由目标运行环境提供；CPU/Scripted 测试只验证协议，不证明模型能力进步。本文不报告训练结果。
+Usami Benchmark 的认证、业务规则、Oracle 和 Reference 不改写。Grounding 按原生固定 seed 的候选顺序逐一尝试，次数由 native `GroundingBudget.max_matches` 限定。默认 Customer 工厂可以构造信息-only/mixed profile；但固定版本的原生 proof certifier 会将信息目标标为 UNKNOWN，直到接入交互式认证器，因此当前不能把这类任务当作已认证训练任务。真实 Ray/FSDP2 Worker Launcher、持久化认证任务及 Episode Store、完整 Probe Runtime Factory、Ascend 兼容栈仍由目标运行环境提供；CPU/Scripted 测试只验证协议，不证明模型能力进步。本文不报告训练结果。

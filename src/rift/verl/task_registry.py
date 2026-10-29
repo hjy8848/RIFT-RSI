@@ -74,6 +74,8 @@ class CertifiedTaskRegistry:
         if record is None or not self._check(record):
             raise ValueError('certified task evidence unavailable')
         return record
+    def purpose(self, task_ref):
+        return self.resolve_record(task_ref).identity.purpose
     def verify_task(self, task_ref, world, task, profile, *, purpose=None):
         record = self._records.get(task_ref)
         return bool(record is not None and record.world == world and record.task == task

@@ -8,14 +8,29 @@ import json
 from queue import Queue
 from uuid import uuid4
 
+
+class _ParserExecutionFailure(Exception):
+    def __init__(self, call, cause):
+        super().__init__(str(cause))
+        self.call = call
+        self.__cause__ = cause
+
+
 class NativeUsamiSession:
-    def __init__(self, world, task, profile, customer_agent, parser, *, budget, parser_schemas=None, mode='reference', external_events=(), rollout_id=None, group_id=None, group_size=None):
+    def __init__(self, world, task, profile, customer_agent, parser, *, budget, parser_schemas=None,
+                 mode='reference', external_events=(), rollout_id=None, group_id=None, group_size=None,
+                 sampling_seed=None, sampling_scope=None):
         self.world, self.task, self.profile, self.customer_agent = world, task, profile, customer_agent
         self.parser, self.budget, self.parser_schemas = parser, budget, parser_schemas
         self.mode, self.external_events = mode, external_events
         self.rollout_id = rollout_id or uuid4().hex
         self.group_id = group_id
         self.expected_group_size = group_size
+        if sampling_seed is not None and (type(sampling_seed) is not int or sampling_seed < 0
+                                          or not sampling_scope):
+            raise ValueError('probe sampling seed and stable scope must be supplied together')
+        self.sampling_seed, self.sampling_scope = sampling_seed, sampling_scope
+        self._parser_failure = None
         self._responses = Queue()
         self._finished = None
         self._started = False
@@ -47,12 +62,16 @@ class NativeUsamiSession:
             def decide(self, prompt):
                 asyncio.run_coroutine_threadsafe(owner._events.put(('prompt', prompt)), owner._loop).result()
                 result = owner._responses.get()
+                if isinstance(result, _ParserExecutionFailure):
+                    self.last_call = result.call
+                    raise result
                 if isinstance(result, BaseException): raise result
                 return result
         def run_native():
             try:
                 result = run_episode(self.world, self.task, self.profile, self.customer_agent, BlockingService(),
-                    budget=self.budget, mode=self.mode, external_events=self.external_events)
+                    budget=self.budget, mode=self.mode, external_events=self.external_events,
+                    cancel_check=lambda: owner._parser_failure is not None)
                 asyncio.run_coroutine_threadsafe(self._events.put(('finished', result)), self._loop).result()
             except BaseException as exc:
                 asyncio.run_coroutine_threadsafe(self._events.put(('error', exc)), self._loop).result()
@@ -75,33 +94,60 @@ class NativeUsamiSession:
     async def advance(self, token_ids, prompt_ids, sampling_params, token_logprobs=None, generation_id=None,
                       serving_fields=None):
         if not self._waiting: raise ValueError('no pending Service decision')
+        from usami.service.models import ServiceError
         from usami_v2.runtime.agents import AgentCall, ServiceAction
+        response = {'choices': [{'message': {'role': 'assistant', 'content': ''},
+                                 'finish_reason': 'stop'}],
+                    'generated_token_ids': list(token_ids),
+                    'generated_log_probs': None if token_logprobs is None else list(token_logprobs),
+                    'serving_fields': dict(serving_fields or {})}
+        call = AgentCall(role='service', request={'prompt_ids': list(prompt_ids),
+            'sampling_params': dict(sampling_params), 'rollout_id': self.rollout_id,
+            'group_id': self.group_id, 'group_size': self.expected_group_size,
+            'generation_id': generation_id}, response=response)
         try:
             content, calls = await self.parser.extract_tool_calls(list(token_ids), self.parser_schemas)
-            if len(calls) > 1: raise ValueError('native Service supports one tool call per decision')
+            if not isinstance(content, str) or not isinstance(calls, (list, tuple)):
+                raise TypeError('VERL parser returned an invalid result')
             message = {'role': 'assistant', 'content': content or ''}
             if calls:
-                call = calls[0]
-                call_id = call.tool_call_id or f'rift-call-{self._sequence}'
-                message['tool_calls'] = [{'id': call_id, 'type': 'function',
-                    'function': {'name': call.name, 'arguments': call.arguments}}]
-            response = {'choices': [{'message': message, 'finish_reason': 'tool_calls' if calls else 'stop'}],
-                        'generated_token_ids': list(token_ids),
-                        'generated_log_probs': None if token_logprobs is None else list(token_logprobs),
-                        'serving_fields': dict(serving_fields or {})}
-            call = AgentCall(role='service', request={'prompt_ids': list(prompt_ids),
-                'sampling_params': dict(sampling_params), 'rollout_id': self.rollout_id,
-                'group_id': self.group_id, 'group_size': self.expected_group_size,
-                'generation_id': generation_id}, response=response)
-            if calls:
-                parsed = ServiceAction.from_tool_message(response, self._prompt.customer_id, self._prompt.observed_subject_ids)
-                action = parsed.model_copy(update={'call': call})
+                message['tool_calls'] = [
+                    {'id': item.tool_call_id or f'rift-call-{self._sequence + index}',
+                     'type': 'function',
+                     'function': {'name': item.name, 'arguments': item.arguments}}
+                    for index, item in enumerate(calls)]
+            response['choices'][0]['message'] = message
+            response['choices'][0]['finish_reason'] = 'tool_calls' if calls else 'stop'
+            call = AgentCall(role='service', request=call.request, response=response)
+            if len(calls) > 1:
+                action = ServiceAction(kind='invalid', call=call)
+            elif calls:
+                try:
+                    parsed = ServiceAction.from_tool_message(
+                        response, self._prompt.customer_id, self._prompt.observed_subject_ids)
+                except ServiceError as exc:
+                    if getattr(exc, 'code', None) != 'MODEL_OUTPUT_INVALID':
+                        raise
+                    action = ServiceAction(kind='invalid', call=call)
+                else:
+                    action = parsed.model_copy(update={'call': call})
             else:
-                if not isinstance(content, str) or not content.strip(): raise ValueError('empty Service response')
-                action = ServiceAction(kind='reply', message=content, call=call)
-        except BaseException:
-            await self.abort()
-            raise
+                action = (ServiceAction(kind='reply', message=content, call=call)
+                          if content.strip() else ServiceAction(kind='invalid', call=call))
+        except Exception as exc:
+            # Parser/runtime failures are infrastructure uncertainty. Send the
+            # exact generated call through Usami's cancellation path so its
+            # native Episode and token evidence are retained with UNKNOWN reward.
+            self._parser_failure = exc
+            self._waiting = False
+            self._responses.put(_ParserExecutionFailure(call, exc))
+            kind, value = await self._events.get()
+            if kind == 'finished':
+                self._finished = value
+                await self._worker
+                return {'role': 'assistant', 'content': ''}, [], True
+            await self._worker
+            raise RuntimeError('native Usami failed while recording a parser execution error') from value
         self._sequence += 1
         before = [m.model_dump(mode='json', exclude_none=True) for m in self._prompt.conversation]
         self._waiting = False

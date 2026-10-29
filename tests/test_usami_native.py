@@ -153,7 +153,6 @@ def test_native_commerce_host_certification():
     import json
     from test_usami_v2_designer import distribution_and_slot, scenario_draft
     from usami_v2.scenarios.builder import build_world
-    from usami_v2.scenarios.task_certification import CustomerScenario
     from rift.tasks import Proposal
     from rift.benchmark.usami import CommerceHost
     distribution, _ = distribution_and_slot(13)
@@ -161,27 +160,17 @@ def test_native_commerce_host_certification():
     data = {'task_id':'grounded-task','customer_alias':'customer','hypothesis':'missing precondition',
         'remedy_goals':[{'goal_id':'g','line_alias':'item','quantity':1,'allowed_remedies':['refund']}],
         'line_selectors':[{'alias':'item','family':'device','issue':'damaged'}]}
-    def scenario(task, spec, build):
-        return CustomerScenario(customer_id=task.customer_id, delegated_line_ids=tuple(g.line_id for g in task.remedy_goals), maximum_extra_charge_cents=0)
     from rift.replay.splits import SplitRegistry
     from rift.schemas import Identity, Split
     registry = SplitRegistry()
     def identity(task, spec, build):
         return Identity(build.world_hash, task.record_hash, 'family', 'source', Split.TRAIN)
-    host = CommerceHost([('world', spec, build)], distribution, scenario, None, None, registry=registry, identity_factory=identity, proof_budget=ProofBudget(), episode_budget=EpisodeBudget())
+    host = CommerceHost([('world', spec, build)], distribution, None, None, None, registry=registry, identity_factory=identity, proof_budget=ProofBudget(), episode_budget=EpisodeBudget())
     cert, task = host.certify_proposal(Proposal('p','missing precondition','refund',json.dumps(data)))
     assert cert.status is CertificationStatus.CERTIFIED and cert.task_ref == task.record_hash
     assert registry.contains(identity(task, spec, build))
     assert 'rsi_core' not in sys.modules
-    from usami_v2.scenarios.task_certification import certify_task as native_certify
-    from rift.benchmark.usami import default_customer_scenario, default_customer_profile
-    from rift.verl.task_registry import CertifiedNativeTask, CertifiedTaskRegistry
-    private_scenario = default_customer_scenario(task, spec, build)
-    profile = default_customer_profile(task, spec, build)
-    native_certificate = native_certify(build.world, task, private_scenario, ProofBudget())
-    task_registry = CertifiedTaskRegistry(registry)
-    task_registry.register(CertifiedNativeTask(build.world, task, profile, private_scenario,
-        native_certificate, identity(task, spec, build)))
+    task_registry = host.task_registry
     w, t, p, _ = task_registry.resolve(task.record_hash)
     assert task_registry.verify_task(task.record_hash, w, t, p)
     import pytest
@@ -191,7 +180,7 @@ def test_native_commerce_host_certification():
         Identity('other-world', 'other-task', 'other-family', 'source', Split.VALIDATION),
     ):
         blocked_registry = SplitRegistry([conflicting])
-        blocked = CommerceHost([('world', spec, build)], distribution, scenario, None, None,
+        blocked = CommerceHost([('world', spec, build)], distribution, None, None, None,
             registry=blocked_registry, identity_factory=identity,
             proof_budget=ProofBudget(), episode_budget=EpisodeBudget())
         with pytest.raises(ValueError, match='cross-split'):
@@ -220,6 +209,108 @@ def test_default_host_ground_certify_and_scripted_rollout():
     assert cert.status is CertificationStatus.CERTIFIED
     record = host.rollout(task, ScriptedRefundService(build.world, dict(build.private_aliases)))
     assert public_episode(record).outcome is Outcome.SUCCESS
+
+def test_host_certifies_next_grounding_candidate_after_first_rejection(monkeypatch):
+    from types import SimpleNamespace
+    from test_usami_v2_designer import distribution_and_slot, scenario_draft
+    from usami_v2.scenarios.builder import build_world
+    from usami_v2.scenarios.designer import TaskDraft, compile_task
+    from rift import benchmark
+    from rift.benchmark.usami import CommerceHost
+    from rift.replay.splits import SplitRegistry
+    from rift.schemas import Identity, Split
+    from rift.tasks import Certification, CertificationStatus, Proposal
+    distribution, _ = distribution_and_slot(13)
+    spec = scenario_draft().compile(distribution)
+    build = build_world(spec, 13)
+    task_a = compile_task(TaskDraft(task_id='candidate-a', customer_alias='customer', remedy_goals=(
+        {'goal_id':'g','line_alias':'damaged','quantity':1,'allowed_remedies':['refund']},)),
+        spec, build, distribution)
+    task_b = compile_task(TaskDraft(task_id='candidate-b', customer_alias='customer', remedy_goals=(
+        {'goal_id':'g','line_alias':'damaged','quantity':1,'allowed_remedies':['refund']},)),
+        spec, build, distribution)
+    candidate_a = SimpleNamespace(key='a', world_ref='world', world_hash=build.world_hash)
+    candidate_b = SimpleNamespace(key='b', world_ref='world', world_hash=build.world_hash)
+    monkeypatch.setattr(benchmark.usami, 'ground', lambda *args: SimpleNamespace(candidates=(candidate_a, candidate_b)))
+    monkeypatch.setattr(benchmark.usami, 'compile_candidate',
+        lambda candidate, *args: task_a if candidate.key == 'a' else task_b)
+    native_certify = benchmark.usami.certify_native
+    attempted = []
+    def certify_candidate(proposal_id, world, task, scenario, budget):
+        attempted.append(task.task_id)
+        if task == task_a:
+            return Certification(proposal_id, CertificationStatus.REJECTED), None
+        return native_certify(proposal_id, world, task, scenario, budget)
+    monkeypatch.setattr(benchmark.usami, 'certify_native', certify_candidate)
+    host = CommerceHost([('world', spec, build)], distribution, None, None, ScriptedCustomer(),
+        registry=SplitRegistry(), identity_factory=lambda task, spec, build: Identity(
+            build.world_hash, task.record_hash, 'family', 'lineage', Split.TRAIN),
+        proof_budget=ProofBudget(), episode_budget=EpisodeBudget())
+    result, selected = host.certify_proposal(Proposal('p','preconditions','refund','{}'))
+    assert attempted == ['candidate-a', 'candidate-b']
+    assert result.status is CertificationStatus.CERTIFIED and selected == task_b
+    assert host.task_registry.resolve_record(task_b.record_hash).task == task_b
+
+def test_default_customer_runs_information_only_native_usami_task():
+    import json
+    from test_usami_v2_designer import distribution_and_slot, scenario_draft
+    from usami_v2.scenarios.builder import build_world
+    from usami_v2.scenarios.designer import TaskDraft, compile_task, task_design_capabilities
+    from usami_v2.runtime.agents import Operation, ServiceAction
+    from usami_v2.runtime.runner import EpisodeBudget
+    from usami_v2.scenarios.task_certification import ProofBudget, certify_task
+    from rift.benchmark.usami import default_customer_profile, default_customer_scenario
+    from rift.schemas import Outcome
+    from test_usami_v2_runtime import ScriptedCustomer
+    distribution, _ = distribution_and_slot(23)
+    spec = scenario_draft().compile(distribution)
+    build = build_world(spec, 23)
+    capabilities = task_design_capabilities(
+        spec, build, interaction_certifier_available=True, information_goals_certifiable=True)
+    task = compile_task(TaskDraft(task_id='information-only', customer_alias='customer', information_goals=(
+        {'goal_id':'refund-amount','subject_alias':'damaged','fact_kind':'refund_amount'},)),
+        spec, build, distribution, capabilities=capabilities)
+    scenario = default_customer_scenario(task, spec, build)
+    profile = default_customer_profile(task, spec, build)
+    assert scenario.accepted_remedies == profile.accepted_remedies == ()
+    assert scenario.delegated_line_ids == profile.delegated_line_ids == ()
+    mixed = compile_task(TaskDraft(task_id='mixed-remedy-information', customer_alias='customer',
+        remedy_goals=({'goal_id':'refund','line_alias':'damaged','quantity':1,
+                       'allowed_remedies':['refund']},),
+        information_goals=({'goal_id':'refund-amount','subject_alias':'damaged',
+                            'fact_kind':'refund_amount'},)),
+        spec, build, distribution, capabilities=capabilities)
+    mixed_scenario = default_customer_scenario(mixed, spec, build)
+    mixed_profile = default_customer_profile(mixed, spec, build)
+    assert mixed_scenario.accepted_remedies == mixed_profile.accepted_remedies == ('refund',)
+    assert mixed_scenario.delegated_line_ids == mixed_profile.delegated_line_ids == (
+        dict(build.private_aliases)['damaged'],)
+    # Runtime support does not claim that the pinned Reference certifier proves
+    # communication objectives; it explicitly reports that gap as UNKNOWN.
+    assert certify_task(build.world, task, scenario, ProofBudget()).status == 'UNKNOWN'
+
+    class InformationService:
+        uses_model = False
+        last_call = None
+        def __init__(self): self.queried = False
+        def decide(self, prompt):
+            line_id = dict(build.private_aliases)['damaged']
+            merchant = prompt.available_merchant_scope_ids[0]
+            if not self.queried:
+                self.queried = True
+                return ServiceAction(kind='operation', operation=Operation(
+                    name='get_refundable_balance', scope_id=merchant, resource_id=line_id, params={}))
+            result = json.loads(next(row.content for row in reversed(prompt.conversation)
+                                     if row.role == 'tool'))
+            amount = result['data']['remaining_original_credit_cents']
+            return ServiceAction(kind='reply', message=f'{line_id}: refund amount is CNY {amount / 100:.2f}.',
+                                 subject_ids=(line_id,))
+
+    episode = run_episode(build.world, task, profile, ScriptedCustomer(), InformationService(),
+        budget=EpisodeBudget(max_customer_turns=2, max_service_decisions=4,
+            max_service_tool_calls=2, max_model_calls=0))
+    assert episode.replay_verified and episode.status == 'customer_finished'
+    assert public_episode(episode).outcome is Outcome.SUCCESS
 
 def test_offline_round_reaches_ready_with_explicit_fake_recording():
     """Exercise wiring only; the recorded calls and token verifier are test doubles."""

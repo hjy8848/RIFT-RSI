@@ -15,6 +15,10 @@ This document records which pieces of the dual-bank RIFT protocol have code and 
 - Dual-bank task-success reward with evidence coverage threshold, before/after checkpoint checks, same training/split isolation checks, and a verifier that reloads and recomputes its evidence.
 - Legacy Replay LogP remains a separate tagged reward and state protocol; legacy untagged LoopState loads as Replay LogP.
 - Full-parameter VERL role adapters remain in place. Service uses GRPO complete groups. Sequential delayed Designer feedback uses ungrouped REINFORCE with explicit scalar baseline and no batch whitening.
+- CommerceHost tries native Grounding candidates in its deterministic, budget-capped order until one certifies. One shared CertifiedTaskRegistry is the task resolver/authorizer for execution; SplitRegistry retains only split-overlap state.
+- Default Usami Customer bounds now accept information-only and mixed TaskSpecV3 tasks. The pinned native proof certifier still returns UNKNOWN for information goals until an interaction certifier is supplied; the adapter does not bypass that boundary.
+- Malformed Service tool output is recorded by the native Runner as a Service protocol failure. Tool-parser execution exceptions produce a replay-verified cancelled Episode with UNKNOWN business reward and retained token evidence.
+- Probe seed is passed to CustomerFactory and seeds each Service generation from a scope stable across before/after checkpoints. Per-generation sampling settings remain in generation evidence.
 - Pending Designer generation action is retained and verified through Service training so delayed reward is credited to its exact on-policy rollout.
 - Recovery snapshots exclude the current training package, substantive overlap under the selected split policy, and TEST, but allow previously Designer-visible task references.
 - Dual-bank stages are persisted in LoopState. `EvolutionScheduler` and the `rift-evolve` application-factory entry coordinate round execution and checkpoint handoff without embedding fake models or checkpoints.
@@ -22,14 +26,15 @@ This document records which pieces of the dual-bank RIFT protocol have code and 
 
 ## Offline verification
 
-CPU tests exercise unlabelled bootstrap, UNKNOWN exclusion, public failure projection, split policies, explicit `NEW` and existing-ID choices, captured proposal/context binding, cross-round failure reuse, training-overlap exclusion, current-checkpoint baselines, reproducible random fill, TEST rejection, Registry persistence, Probe evidence storage, scripted-evidence rejection from real reward, reward arithmetic, ungrouped Designer credit, and dual-bank LoopState save/restore. These tests use fixture records and mocked verifiers/workers; they do not demonstrate model learning.
+CPU tests exercise unlabelled bootstrap, UNKNOWN exclusion, public failure projection, split policies, explicit `NEW` and existing-ID choices, captured proposal/context binding, cross-round failure reuse, training-overlap exclusion, current-checkpoint baselines, reproducible random fill, TEST rejection, Registry persistence, Probe evidence storage, scripted-evidence rejection from real reward, reward arithmetic, ungrouped Designer credit, dual-bank LoopState save/restore, native information-only Customer execution, multi-candidate certification fallback, seeded probe construction, and native parse-failure outcomes. Model generation and runtime attestation remain test doubles; these tests do not demonstrate model learning.
 
 ## Still required from a deployment runtime
 
 - A production `EvolutionRunRuntime` factory with persistent Usami task/certificate/Episode stores, authoritative identity construction, native multi-turn evaluator, real VERL FSDP2 worker groups, checkpoint store, and production update/reward/action/trial verifiers.
+- A production CustomerFactory that applies the supplied probe seed to its stochastic behavior, and an evaluator that uses the same recorded Service sampling protocol before and after updates.
 - A bank updater that persists real Bootstrap and subsequent task/probe observations with trusted evidence, and a plan factory that restores the exact pending Designer action on interrupted rounds and supplies current-Checkpoint baseline records for historical Recovery and Retention candidates.
 - A tested exclusive lifecycle for two full-parameter policies sharing the eight NPU devices, including optimizer/RNG restore, serving weight synchronization, and safe resource release between Designer and Service phases.
-- Integration validation of UNKNOWN and failed-tool behavior against actual Usami episodes and actual Agent Loop token capture.
+- Integration validation with the configured VERL parser, real inference server, production CustomerFactory, persistent task/Episode stores, and Agent Loop token capture.
 - Resolution and validation of the requested software image. The pinned VERL v0.9.1 source requires `numpy>=2.0.0`, which conflicts with requested NumPy 1.26.4; no dependency override is claimed safe.
 
 No real training, model inference, checkpoint update, replay measurement, capability acquisition, forgetting measurement, or Ascend job has been run. A real experiment remains unverified until performed in the target environment using `configs/dual_bank.yaml` and independently frozen TEST tasks.

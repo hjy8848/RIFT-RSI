@@ -51,8 +51,12 @@ def __getattr__(name):
                         raise ValueError('rollout serving weights changed')
                     turn_sampling_params = dict(sampling_params)
                     from rift.verl.sampling import rollout_seed
-                    turn_sampling_params['seed'] = rollout_seed(turn_sampling_params.get('seed', 0),
-                        session.rollout_id, len(capture.decisions))
+                    base_seed = getattr(session, 'sampling_seed', None)
+                    seed_scope = getattr(session, 'sampling_scope', None)
+                    turn_sampling_params['seed'] = rollout_seed(
+                        turn_sampling_params.get('seed', 0) if base_seed is None else base_seed,
+                        session.rollout_id if seed_scope is None else seed_scope,
+                        len(capture.decisions))
                     output = await self.server_manager.generate(request_id=request_id, prompt_ids=prefix,
                                                                 sampling_params=turn_sampling_params)
                     token_ids = list(output.token_ids)
