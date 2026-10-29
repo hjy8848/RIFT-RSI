@@ -1,0 +1,13 @@
+include README.md VERIFICATION.md constraints-tested.txt
+recursive-include configs *.json
+recursive-include examples *.py *.json
+recursive-include tests *.py
+recursive-include usami/service *.md
+recursive-include usami/customer *.md
+recursive-include usami/interaction *.md
+include web/README.md web/VERIFICATION.md web/run.py
+recursive-include web/frontend *.json *.html *.ts *.tsx *.css
+prune web/frontend/node_modules
+prune web/frontend/dist
+prune web/frontend/test-results
+prune web/frontend/playwright-report

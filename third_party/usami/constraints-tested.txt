@@ -1,0 +1,3 @@
+# Direct dependency versions used for the v0.1 acceptance run.
+pydantic==2.13.5
+pytest==8.4.2

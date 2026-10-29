@@ -1,0 +1,24 @@
+.sidebar-bottom > a.human-mode-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-start;
+  margin: 0 0 13px;
+  padding: 10px 11px;
+  color: #5b73a3;
+  font-size: 11px;
+  font-weight: 600;
+  background: #f5f7fc;
+  border: 1px solid #e5eaf4;
+  border-radius: 7px;
+}
+
+.sidebar-bottom > a.human-mode-link:hover {
+  color: #3867c9;
+  background: #edf2ff;
+  border-color: #d5e0fa;
+}
+
+.human-mode-link svg:last-child {
+  margin-left: auto;
+}

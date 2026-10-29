@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vast-coevo"
+version = "1.0.4"
+description = "Independent verification-guided Customer-Service skill co-evolution Core"
+requires-python = ">=3.9"
+dependencies = ["pydantic>=2.12,<3"]
+
+[project.scripts]
+vast-coevo = "vast_coevo.cli:main"
+
+[tool.setuptools]
+packages = ["vast_coevo", "vast_coevo.skills", "vast_coevo.agents", "vast_coevo.reflection", "vast_coevo.evolution", "vast_coevo.evidence", "vast_coevo.evaluation", "vast_coevo.storage", "vast_coevo.designer"]
+package-dir = {vast_coevo = "."}
