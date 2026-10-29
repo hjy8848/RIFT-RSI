@@ -25,19 +25,30 @@ class ProbeSelector:
                diagnosis_identities, train_package_identities, split_registry,
                before_checkpoint, recovery_tasks, retention_tasks, seed,
                protocol_ref, protocol_digest, frozen_at_ns=0,
-               target_ability_id=None, ability_task_refs=()):
+               target_ability_id=None, ability_task_refs=(),
+               current_baseline_candidates=()):
         if type(seed) is not int or seed < 0:
             raise ValueError("non-negative integer sampling seed required")
         if type(recovery_tasks) is not int or recovery_tasks < 1 or type(retention_tasks) is not int or retention_tasks < 1:
             raise ValueError("positive recovery and retention task counts required")
         if not protocol_ref or not protocol_digest or not split_registry.policy_version:
             raise ValueError("protocol and versioned SplitRegistry required")
+        current_baselines = {}
+        for row in current_baseline_candidates:
+            if not isinstance(row, TaskEvidenceRecord):
+                continue
+            if row.task_ref in current_baselines:
+                raise ValueError("multiple current baseline records for one task")
+            current_baselines[row.task_ref] = row
         recovery, recovery_reasons = self._eligible(recovery_candidates,
             DataPurpose.RECOVERY_FEEDBACK, before_checkpoint, protocol_digest,
-            split_registry, train_package_identities, diagnosis_identities)
+            split_registry, train_package_identities, diagnosis_identities,
+            current_baselines)
         retention, retention_reasons = self._eligible(retention_candidates,
             DataPurpose.RETENTION_FEEDBACK, before_checkpoint, protocol_digest,
-            split_registry, train_package_identities, tuple(diagnosis_identities) + tuple(r.identity for r in recovery))
+            split_registry, train_package_identities,
+            tuple(diagnosis_identities) + tuple(r.identity for r in recovery),
+            current_baselines)
         if target_ability_id is not None and not target_ability_id:
             raise ValueError("non-empty target ability ID required")
         ability_task_refs = frozenset(ability_task_refs)
@@ -82,38 +93,60 @@ class ProbeSelector:
         return recovery_snapshot, retention_snapshot
 
     def _eligible(self, candidates, purpose, checkpoint, protocol_digest,
-                  registry, training, diagnosis):
-        rows, rejected = [], {}
+                  registry, training, diagnosis, current_baselines):
+        rows, rejected, history_by_task = [], {}, {}
         def reject(reason): rejected[reason] = rejected.get(reason, 0) + 1
-        for row in candidates:
-            if not isinstance(row, TaskEvidenceRecord):
+        for history in candidates:
+            if not isinstance(history, TaskEvidenceRecord):
                 reject("not_task_evidence"); continue
-            if row.purpose is not purpose or row.identity.purpose is not purpose:
+            if history.purpose is not purpose or history.identity.purpose is not purpose:
                 reject("wrong_purpose"); continue
-            state = row.state(success_threshold=self.success_threshold,
+            state = history.state(success_threshold=self.success_threshold,
                               failure_threshold=self.failure_threshold)
             target = CapabilityState.ACTIVE_WEAKNESS if purpose is DataPurpose.RECOVERY_FEEDBACK else CapabilityState.MASTERED_CANDIDATE
             if state is not target:
                 reject("outside_capability_threshold"); continue
-            if row.checkpoint != checkpoint:
-                reject("baseline_checkpoint_mismatch"); continue
-            if row.protocol_digest != protocol_digest:
-                reject("evaluation_protocol_mismatch"); continue
-            if not registry.contains(row.identity):
+            if not registry.contains(history.identity):
                 reject("identity_not_registered"); continue
-            if self.record_verifier.verify_record(row) is not True:
-                reject("baseline_evidence_unverified"); continue
+            if self.record_verifier.verify_record(history) is not True:
+                reject("historical_evidence_unverified"); continue
             if any(trial.valid and trial.evidence_level is not EvidenceLevel.REAL_SERVICE
-                   for trial in row.trials):
+                   for trial in history.trials):
                 if not self.allow_nonreal:
-                    reject("baseline_not_real_or_complete"); continue
-            total = len(row.trials)
-            if total == 0 or row.valid_trials / total < self.min_valid_fraction:
-                reject("baseline_valid_fraction"); continue
-            if any(row.identity.overlaps_under(other, registry.policy_version)
+                    reject("historical_evidence_not_real"); continue
+            total = len(history.trials)
+            if total == 0 or history.valid_trials / total < self.min_valid_fraction:
+                reject("historical_valid_fraction"); continue
+            if any(history.identity.overlaps_under(other, registry.policy_version)
                    for other in tuple(training) + tuple(diagnosis)):
                 reject("training_or_diagnosis_overlap"); continue
-            rows.append(row)
+
+            baseline = current_baselines.get(history.task_ref)
+            if baseline is None and history.checkpoint == checkpoint and history.protocol_digest == protocol_digest:
+                baseline = history
+            if baseline is None:
+                reject("current_checkpoint_baseline_missing"); continue
+            if (baseline.task_ref != history.task_ref or baseline.identity != history.identity
+                    or baseline.purpose is not purpose or baseline.identity.purpose is not purpose):
+                reject("current_baseline_task_identity_mismatch"); continue
+            if baseline.checkpoint != checkpoint:
+                reject("current_baseline_checkpoint_mismatch"); continue
+            if baseline.protocol_digest != protocol_digest:
+                reject("evaluation_protocol_mismatch"); continue
+            if self.record_verifier.verify_record(baseline) is not True:
+                reject("current_baseline_evidence_unverified"); continue
+            if any(trial.valid and trial.evidence_level is not EvidenceLevel.REAL_SERVICE
+                   for trial in baseline.trials):
+                if not self.allow_nonreal:
+                    reject("current_baseline_not_real"); continue
+            baseline_total = len(baseline.trials)
+            if baseline_total == 0 or baseline.valid_trials / baseline_total < self.min_valid_fraction:
+                reject("current_baseline_valid_fraction"); continue
+            previous = history_by_task.get(history.task_ref)
+            if previous is None or history.observed_at > previous[0]:
+                history_by_task[history.task_ref] = (history.observed_at, baseline)
+
+        rows.extend(baseline for _, baseline in history_by_task.values())
         return rows, rejected
 
     @staticmethod

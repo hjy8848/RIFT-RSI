@@ -1,9 +1,11 @@
-"""Offline contracts for durable Ability Registry attribution and Probe selection."""
+"""Offline contracts for provisional abilities and checkpoint-relative probes."""
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from rift.abilities import AbilityAttributor, AbilityRegistry, AbilityStatus
+from rift.abilities import AbilityRegistry, AbilityStatus
+from rift.abilities.records import AbilityEvidenceLink
 from rift.banks.records import EvidenceLevel, ObservedTrial, TaskEvidenceRecord
 from rift.benchmark.public_feedback import PublicEvent, PublicSummary
 from rift.loop import Stage
@@ -23,12 +25,14 @@ def task_record(task_ref, purpose, split, text, outcome=Outcome.FAILURE,
                 checkpoint=BEFORE, evidence_level=EvidenceLevel.REAL_SERVICE):
     identity = Identity("world-" + task_ref, "task-" + task_ref, "accounts",
         "lineage-" + task_ref, split, purpose)
+    outcomes = outcome if isinstance(outcome, tuple) else (outcome,) * 4
     trials = tuple(ObservedTrial(task_ref, f"{task_ref}-trial-{index}", checkpoint,
-        index, outcome, PROTOCOL,
-        None if outcome is Outcome.UNKNOWN else f"private-evidence-{task_ref}-{index}",
-        outcome is not Outcome.UNKNOWN, evidence_level,
-        None if outcome is Outcome.UNKNOWN else PublicSummary(
-            (PublicEvent("user", text),), outcome)) for index in range(4))
+        index, trial_outcome, PROTOCOL,
+        None if trial_outcome is Outcome.UNKNOWN else f"private-evidence-{task_ref}-{index}",
+        trial_outcome is not Outcome.UNKNOWN, evidence_level,
+        None if trial_outcome is Outcome.UNKNOWN else PublicSummary(
+            (PublicEvent("user", text),), trial_outcome))
+        for index, trial_outcome in enumerate(outcomes))
     return TaskEvidenceRecord(task_ref, identity, purpose, checkpoint, PROTOCOL,
                               trials, "offline-test-fixture")
 
@@ -39,88 +43,74 @@ class AcceptRecordEvidence:
             trial.valid for trial in record.trials)
 
 
-def test_attribution_matches_existing_hypothesis_and_persists_verified_links(tmp_path):
+def test_hypotheses_remain_provisional_without_failure_attribution(tmp_path):
     diagnosis = task_record("diagnosis-secret", DataPurpose.DIAGNOSIS,
-        Split.TRAIN, "refund status lookup failed")
-    recovery = task_record("recovery-secret", DataPurpose.RECOVERY_FEEDBACK,
-        Split.VALIDATION, "refund status lookup still failed")
+        Split.TRAIN, "tool returned EVIDENCE_REQUIRED")
     registry = AbilityRegistry()
-    ability = registry.create("refund status lookup", round_index=0)
+    registry.mark_diagnosis_seen(diagnosis.task_ref, diagnosis.identity)
 
-    resolution = AbilityAttributor(record_verifier=AcceptRecordEvidence()).resolve(
-        "refund status lookup", (diagnosis,), registry, round_index=1,
-        failure_candidates=(recovery,))
+    first = registry.create("missing prerequisite checks", round_index=0)
+    same_words_next_round = registry.create("missing prerequisite checks", round_index=1)
 
-    assert resolution.decision == "matched"
-    assert resolution.ability_id == ability.ability_id
-    assert set(registry.get(ability.ability_id).failure_task_refs) == {
-        diagnosis.task_ref, recovery.task_ref}
-    assert registry.failure_task_refs(ability.ability_id) == {
-        diagnosis.task_ref, recovery.task_ref}
-    assert set(resolution.evidence_refs) == {
-        trial.evidence_ref for row in (diagnosis, recovery) for trial in row.trials}
+    assert first.ability_id != same_words_next_round.ability_id
+    assert first.status is AbilityStatus.PROVISIONAL
+    assert first.failure_task_refs == ()
+    assert registry.failure_task_refs(first.ability_id) == frozenset()
+    assert registry.seen_diagnosis_identities == (diagnosis.identity,)
 
     path = tmp_path / "registry.json"
     registry.save(path)
-    restored = AbilityRegistry.load(path)
-    assert restored.records == registry.records
-    assert restored.attributions == registry.attributions
-    assert restored.seen_diagnosis_identities == (diagnosis.identity,)
+    assert AbilityRegistry.load(path).records == registry.records
     path.write_text(path.read_text(encoding="utf-8").replace(
-        "refund status lookup", "tampered ability"), encoding="utf-8")
+        "missing prerequisite checks", "tampered ability"), encoding="utf-8")
     with pytest.raises(ValueError, match="digest"):
         AbilityRegistry.load(path)
 
 
-def test_uncertain_or_ambiguous_hypotheses_create_provisional_ids():
-    diagnosis = task_record("diagnosis-provisional", DataPurpose.DIAGNOSIS,
-        Split.TRAIN, "transfer cancellation failed")
+def test_explicit_evidence_link_accepts_uncertain_failure_history():
+    uncertain = task_record("uncertain-recovery", DataPurpose.RECOVERY_FEEDBACK,
+        Split.VALIDATION, "consent check was missing",
+        (Outcome.FAILURE, Outcome.FAILURE, Outcome.SUCCESS, Outcome.SUCCESS))
+    assert uncertain.state().value == "UNCERTAIN"
     registry = AbilityRegistry()
-    attributor = AbilityAttributor(record_verifier=AcceptRecordEvidence())
-    provisional = attributor.resolve("transfer cancellation", (diagnosis,),
-        registry, round_index=0)
-    assert provisional.decision == "provisional"
-    assert registry.get(provisional.ability_id).status is AbilityStatus.PROVISIONAL
-    assert registry.get(provisional.ability_id).failure_task_refs == (diagnosis.task_ref,)
+    ability = registry.create("check authorization before action", round_index=0)
+    failure_refs = tuple(trial.evidence_ref for trial in uncertain.trials
+                         if trial.outcome is Outcome.FAILURE)
 
-    duplicate = registry.create("transfer cancellation", round_index=0)
-    ambiguous = attributor.resolve("transfer cancellation", (diagnosis,),
-        registry, round_index=1)
-    assert ambiguous.decision == "provisional"
-    assert ambiguous.ability_id not in {provisional.ability_id, duplicate.ability_id}
+    registry.link_failure_task(ability.ability_id, uncertain, failure_refs,
+        evidence_verifier=AcceptRecordEvidence(), round_index=1)
 
-
-def test_attributor_only_passes_public_summaries_and_registered_descriptions():
-    diagnosis = task_record("diagnosis-private", DataPurpose.DIAGNOSIS,
-        Split.TRAIN, "transfer cancellation failed")
-
-    class InspectingMatcher:
-        def match(self, hypothesis, public_summaries, candidates, public_failure_summaries):
-            self.inputs = repr((hypothesis, public_summaries, candidates,
-                                public_failure_summaries))
-            return ()
-
-        def associate_failures(self, ability, public_failure_summaries):
-            return ()
-
-    matcher = InspectingMatcher()
-    AbilityAttributor(matcher, record_verifier=AcceptRecordEvidence()).resolve(
-        "transfer cancellation", (diagnosis,), AbilityRegistry(), round_index=0)
-    assert "diagnosis-private" not in matcher.inputs
-    assert "private-evidence" not in matcher.inputs
-    assert "lineage-diagnosis-private" not in matcher.inputs
-    assert "transfer cancellation failed" in matcher.inputs
+    assert registry.failure_task_refs(ability.ability_id) == {uncertain.task_ref}
+    link = registry.get(ability.ability_id).failure_links[0]
+    assert link.evidence_refs == failure_refs
+    assert link.confidence is None
 
 
-def test_nonreal_failure_evidence_cannot_enter_ability_registry():
-    scripted = task_record("scripted-diagnosis", DataPurpose.DIAGNOSIS,
-        Split.TRAIN, "refund issue", evidence_level=EvidenceLevel.SCRIPTED_USAMI)
-    with pytest.raises(ValueError, match="active Diagnosis"):
-        AbilityAttributor(record_verifier=AcceptRecordEvidence()).resolve(
-            "refund issue", (scripted,), AbilityRegistry(), round_index=0)
+def test_legacy_confidence_link_is_not_used_for_ability_priority():
+    registry = AbilityRegistry()
+    ability = registry.create("check authorization", round_index=0)
+    legacy = replace(ability, failure_task_refs=("legacy-task",),
+        failure_links=(AbilityEvidenceLink("legacy-task", ("legacy-evidence",),
+            1.0, 0, "old string match"),))
+    registry = AbilityRegistry((legacy,))
+
+    assert registry.get(ability.ability_id).failure_task_refs == ("legacy-task",)
+    assert registry.failure_task_refs(ability.ability_id) == frozenset()
 
 
-def test_recovery_prioritizes_linked_tasks_then_random_fallback_and_keeps_retention_random(tmp_path):
+def test_scripted_failure_cannot_be_linked_to_an_ability():
+    scripted = task_record("scripted-recovery", DataPurpose.RECOVERY_FEEDBACK,
+        Split.VALIDATION, "refund issue", evidence_level=EvidenceLevel.SCRIPTED_USAMI)
+    registry = AbilityRegistry()
+    ability = registry.create("refund handling", round_index=0)
+    refs = tuple(trial.evidence_ref for trial in scripted.trials)
+
+    with pytest.raises(ValueError, match="real Service failure"):
+        registry.link_failure_task(ability.ability_id, scripted, refs,
+            evidence_verifier=AcceptRecordEvidence(), round_index=1)
+
+
+def test_recovery_prioritizes_explicit_links_then_random_fallback(tmp_path):
     diagnosis = task_record("seen-diagnosis", DataPurpose.DIAGNOSIS,
         Split.TRAIN, "refund handling failed")
     linked = task_record("linked-recovery", DataPurpose.RECOVERY_FEEDBACK,
@@ -141,8 +131,7 @@ def test_recovery_prioritizes_linked_tasks_then_random_fallback_and_keeps_retent
     ability = registry.create("refund handling", round_index=0)
     registry.link_failure_task(ability.ability_id, linked,
         tuple(trial.evidence_ref for trial in linked.trials),
-        evidence_verifier=AcceptRecordEvidence(), confidence=0.95,
-        round_index=0, rationale="verified public failure evidence")
+        evidence_verifier=AcceptRecordEvidence(), round_index=0)
 
     selector = ProbeSelector(record_verifier=AcceptRecordEvidence())
     common = dict(recovery_candidates=(linked, fallback),
@@ -168,6 +157,49 @@ def test_recovery_prioritizes_linked_tasks_then_random_fallback_and_keeps_retent
     evidence = JsonProbeEvidenceStore(tmp_path / "probe-evidence")
     evidence.save_snapshot(recovery)
     assert evidence.load_snapshot(recovery.content_digest) == recovery
+
+
+def test_historical_failure_uses_new_checkpoint_baseline_for_recovery_and_retention():
+    old_failure = task_record("old-failure", DataPurpose.RECOVERY_FEEDBACK,
+        Split.VALIDATION, "authorization not checked", checkpoint=BEFORE)
+    current_recovery = task_record("old-failure", DataPurpose.RECOVERY_FEEDBACK,
+        Split.VALIDATION, "authorization now checked", Outcome.SUCCESS,
+        checkpoint=AFTER)
+    old_mastery = task_record("old-mastery", DataPurpose.RETENTION_FEEDBACK,
+        Split.VALIDATION, "invoice reconciled", Outcome.SUCCESS, checkpoint=BEFORE)
+    current_retention = task_record("old-mastery", DataPurpose.RETENTION_FEEDBACK,
+        Split.VALIDATION, "invoice still reconciled", Outcome.SUCCESS,
+        checkpoint=AFTER)
+    split_registry = SplitRegistry(
+        [old_failure.identity, old_mastery.identity],
+        policy_version=INSTANCE_DISJOINT_WITHIN_FAMILY_V1)
+    ability_registry = AbilityRegistry()
+    ability = ability_registry.create("check authorization", round_index=0)
+    ability_registry.link_failure_task(ability.ability_id, old_failure,
+        tuple(trial.evidence_ref for trial in old_failure.trials),
+        evidence_verifier=AcceptRecordEvidence(), round_index=0)
+    selector = ProbeSelector(record_verifier=AcceptRecordEvidence())
+    args = dict(recovery_candidates=(old_failure,), retention_candidates=(old_mastery,),
+        diagnosis_identities=(), train_package_identities=(), split_registry=split_registry,
+        before_checkpoint=AFTER, recovery_tasks=1, retention_tasks=1, seed=13,
+        protocol_ref="protocol-v2", protocol_digest=PROTOCOL,
+        target_ability_id=ability.ability_id,
+        ability_task_refs=ability_registry.failure_task_refs(ability.ability_id),
+        current_baseline_candidates=(current_recovery, current_retention))
+
+    recovery, retention = selector.freeze(**args)
+
+    assert recovery.baseline_checkpoint == retention.baseline_checkpoint == AFTER
+    assert recovery.priority_task_refs == (old_failure.task_ref,)
+    assert recovery.probes[0].task_ref == old_failure.task_ref
+    assert all(trial.outcome is Outcome.SUCCESS
+               for trial in recovery.probes[0].baseline_trials)
+    assert retention.probes[0].task_ref == old_mastery.task_ref
+    assert all(trial.checkpoint == AFTER for probe in recovery.probes + retention.probes
+               for trial in probe.baseline_trials)
+
+    with pytest.raises(ValueError, match="insufficient eligible"):
+        selector.freeze(**{**args, "current_baseline_candidates": ()})
 
 
 def test_ability_training_and_evaluation_history_is_idempotent_and_restorable(tmp_path):

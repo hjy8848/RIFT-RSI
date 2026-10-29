@@ -1,16 +1,14 @@
-"""Durable Ability Registry with append-only attribution and learning history."""
+"""Durable Ability Registry with explicit failure links and learning history."""
 from dataclasses import asdict, replace
 from enum import Enum
 from hashlib import sha256
 import json
-from math import isfinite
 from pathlib import Path
 
-from rift.abilities.records import (AbilityAttributionRecord, AbilityCandidate,
-    AbilityEvaluationEvent, AbilityEvidenceLink, AbilityRecord, AbilityRevision,
-    AbilityStatus, AbilityTrainingEvent)
+from rift.abilities.records import (AbilityEvaluationEvent, AbilityEvidenceLink,
+    AbilityRecord, AbilityRevision, AbilityStatus, AbilityTrainingEvent)
 from rift.schemas import Checkpoint, Identity, Split, DataPurpose
-from rift.banks.records import CapabilityState, EvidenceLevel, TaskEvidenceRecord
+from rift.banks.records import EvidenceLevel, TaskEvidenceRecord
 from rift.schemas import Outcome
 
 
@@ -31,25 +29,16 @@ def _canonical(value):
 
 class AbilityRegistry:
     """Host-owned hypotheses; identity and evidence never enter Designer inputs."""
-    def __init__(self, records=(), *, attributions=(), diagnosis_seen=()):
+    def __init__(self, records=(), *, diagnosis_seen=()):
         self._records = {}
-        self._attributions = list(attributions)
         self._diagnosis_seen = {}
         for record in records:
             self.add(record)
         for task_ref, identity in diagnosis_seen:
             self.mark_diagnosis_seen(task_ref, identity)
-        if any(not isinstance(row, AbilityAttributionRecord)
-               or row.ability_id not in self._records for row in self._attributions):
-            raise ValueError("attribution history must refer to a registered ability")
-
     @property
     def records(self):
         return tuple(self._records[key] for key in sorted(self._records))
-
-    @property
-    def attributions(self):
-        return tuple(self._attributions)
 
     @property
     def seen_diagnosis_identities(self):
@@ -58,7 +47,6 @@ class AbilityRegistry:
     def fingerprint(self):
         payload = {"schema_version": 1,
             "records": [_jsonable(asdict(row)) for row in self.records],
-            "attributions": [_jsonable(asdict(row)) for row in self._attributions],
             "diagnosis_seen": [{"task_ref": key, "identity": _jsonable(asdict(value))}
                                for key, value in sorted(self._diagnosis_seen.items())]}
         return sha256(_canonical(payload).encode("utf-8")).hexdigest()
@@ -76,11 +64,6 @@ class AbilityRegistry:
             return self._records[ability_id]
         except KeyError as exc:
             raise KeyError("unknown ability ID") from exc
-
-    def candidates(self):
-        return tuple(AbilityCandidate(row.ability_id, row.description,
-            tuple(dict.fromkeys(row.aliases + row.previous_descriptions)))
-            for row in self.records)
 
     def create(self, description, *, round_index, status=AbilityStatus.PROVISIONAL):
         if not description or type(round_index) is not int or round_index < 0:
@@ -102,23 +85,19 @@ class AbilityRegistry:
             raise ValueError("diagnosis TaskRef identity changed across rounds")
         self._diagnosis_seen[task_ref] = identity
 
-    def failure_task_refs(self, ability_id, *, min_confidence=0.8):
-        if not isfinite(min_confidence) or not 0 <= min_confidence <= 1:
-            raise ValueError("failure-link confidence floor must be in [0, 1]")
-        record = self.get(ability_id)
-        return frozenset(link.task_ref for link in record.failure_links
-                         if link.confidence >= min_confidence)
+    def failure_task_refs(self, ability_id):
+        """Return links explicitly confirmed after the current evidence check."""
+        return frozenset(self.get(ability_id).explicit_failure_task_refs)
 
     def link_failure_task(self, ability_id, failure_record, evidence_refs, *,
-                          evidence_verifier, confidence, round_index, rationale):
+                          evidence_verifier, round_index, confidence=None, rationale=""):
         record = self.get(ability_id)
         if (not isinstance(failure_record, TaskEvidenceRecord)
                 or failure_record.purpose not in (DataPurpose.DIAGNOSIS, DataPurpose.RECOVERY_FEEDBACK)
-                or failure_record.state() is not CapabilityState.ACTIVE_WEAKNESS
                 or any(trial.valid and trial.evidence_level is not EvidenceLevel.REAL_SERVICE
                        for trial in failure_record.trials)
                 or evidence_verifier.verify_record(failure_record) is not True):
-            raise ValueError("ability links require verified historical failure evidence")
+            raise ValueError("ability links require verified real Service failure evidence")
         valid_failure_refs = {trial.evidence_ref for trial in failure_record.trials
             if trial.valid and trial.outcome is Outcome.FAILURE
             and trial.evidence_level is EvidenceLevel.REAL_SERVICE}
@@ -134,45 +113,16 @@ class AbilityRegistry:
                           and row.evidence_refs == link.evidence_refs), None)
         if duplicate is None:
             links.append(link)
-        elif link.confidence > links[duplicate].confidence:
+        elif (link.confidence is not None and
+              (links[duplicate].confidence is None
+               or link.confidence > links[duplicate].confidence)):
             links[duplicate] = link
         task_refs = tuple(dict.fromkeys(record.failure_task_refs + (task_ref,)))
+        explicit_refs = tuple(dict.fromkeys(record.explicit_failure_task_refs + (task_ref,)))
         self._records[ability_id] = replace(record, failure_task_refs=task_refs,
                                             failure_links=tuple(links),
+                                            explicit_failure_task_refs=explicit_refs,
                                             last_observed_round=max(record.last_observed_round, round_index))
-
-    def revise(self, ability_id, description, *, round_index, rationale, evidence_refs=()):
-        record = self.get(ability_id)
-        if not description or description == record.description:
-            raise ValueError("a distinct revised ability hypothesis is required")
-        revision = AbilityRevision(round_index, record.description, description,
-                                   rationale, tuple(evidence_refs))
-        self._records[ability_id] = replace(record, description=description,
-            previous_descriptions=record.previous_descriptions + (record.description,),
-            revisions=record.revisions + (revision,),
-            last_observed_round=max(record.last_observed_round, round_index))
-
-    def record_attribution(self, attribution):
-        if not isinstance(attribution, AbilityAttributionRecord):
-            raise TypeError("AbilityAttributionRecord required")
-        self.get(attribution.ability_id)
-        key = (attribution.round_index, attribution.hypothesis,
-               attribution.input_evidence_refs)
-        existing = next((row for row in self._attributions
-                         if (row.round_index, row.hypothesis,
-                             row.input_evidence_refs) == key), None)
-        if existing is not None:
-            if existing != attribution:
-                raise ValueError("ability attribution changed while resuming the same round")
-            return existing
-        self._attributions.append(attribution)
-        return attribution
-
-    def prior_attribution(self, hypothesis, round_index, evidence_refs):
-        key = (round_index, hypothesis, tuple(evidence_refs))
-        return next((row for row in self._attributions
-                     if (row.round_index, row.hypothesis,
-                         row.input_evidence_refs) == key), None)
 
     def record_round(self, state, *, update_verifier, reward_verifier,
                      mastery_threshold=0.75):
@@ -248,7 +198,6 @@ class AbilityRegistry:
         path = Path(path)
         payload = {"schema_version": 1,
             "records": [_jsonable(asdict(row)) for row in self.records],
-            "attributions": [_jsonable(asdict(row)) for row in self._attributions],
             "diagnosis_seen": [{"task_ref": key, "identity": _jsonable(asdict(value))}
                                for key, value in sorted(self._diagnosis_seen.items())]}
         envelope = {"payload": payload, "sha256": self.fingerprint()}
@@ -291,15 +240,13 @@ class AbilityRegistry:
                 tuple(AbilityRevision(value["round_index"], value["previous_description"],
                     value["revised_description"], value["rationale"], tuple(value["evidence_refs"]))
                     for value in row.get("revisions", ()))))
-        attributions = tuple(AbilityAttributionRecord(row["hypothesis"], row["ability_id"],
-            row["round_index"], row["confidence"], row["decision"], row["method"],
-            row["rationale"], tuple(row["evidence_refs"]),
-            tuple(row.get("input_evidence_refs", ())))
-            for row in payload.get("attributions", ()))
+            records[-1] = replace(records[-1],
+                                  explicit_failure_task_refs=tuple(
+                                      row.get("explicit_failure_task_refs", ())))
         seen = []
         for row in payload.get("diagnosis_seen", ()):
             identity = row["identity"]
             seen.append((row["task_ref"], Identity(identity["world"], identity["task"],
                 identity["family"], identity["lineage"], Split(identity["split"]),
                 None if identity.get("purpose") is None else DataPurpose(identity["purpose"]))))
-        return cls(records, attributions=attributions, diagnosis_seen=seen)
+        return cls(records, diagnosis_seen=seen)

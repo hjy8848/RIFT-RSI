@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 from typing import Callable, Protocol
 
-from rift.abilities.records import AbilityAttributionRecord
 from rift.abilities.registry import AbilityRegistry
 from rift.banks.bootstrap import BootstrapResult, BootstrapRunner, BootstrapTask
 from rift.banks.core import BankManager, JsonTaskEvidenceStore, public_projection
@@ -40,7 +39,7 @@ class EvolutionRoundPlan:
     action_verifier: object
     designer_checkpoint: Checkpoint
     target_ability_id: str
-    ability_attribution: AbilityAttributionRecord
+    target_ability_hypothesis: str
     feedback_provider: Callable
     training_identity_resolver: Callable
     designer_batch_id: str
@@ -57,9 +56,7 @@ class EvolutionRoundPlan:
                 or self.state.package_id != self.service_request.package_id
                 or not self.target_ability_id
                 or self.state.target_ability_id != self.target_ability_id
-                or not isinstance(self.ability_attribution, AbilityAttributionRecord)
-                or self.ability_attribution.ability_id != self.target_ability_id
-                or self.ability_attribution.round_index != self.state.round_index
+                or not self.target_ability_hypothesis.strip()
                 or (self.state.designer_action.target_ability_id is not None
                     and self.state.designer_action.target_ability_id != self.target_ability_id)
                 or self.recovery_snapshot.target_ability_id != self.target_ability_id
@@ -152,8 +149,8 @@ class EvolutionScheduler:
                                     'verify_designer_hypothesis', None)
         if (not callable(verify_hypothesis)
                 or verify_hypothesis(state.designer_action.rollout_id,
-                                     plan.ability_attribution.hypothesis) is not True):
-            raise ValueError('Ability Registry hypothesis is not bound to captured Designer output')
+                                     plan.target_ability_hypothesis) is not True):
+            raise ValueError('target ability hypothesis is not bound to captured Designer output')
 
         def target_bound_feedback(current_state):
             rows = tuple(plan.feedback_provider(current_state))
@@ -227,13 +224,11 @@ class EvolutionScheduler:
                 raise ValueError('round plan index does not match scheduler history')
             if plan.target_ability_id not in {row.ability_id for row in ability_registry.records}:
                 raise ValueError('round target ability was not persisted in the registry')
-            if plan.ability_attribution not in ability_registry.attributions:
-                raise ValueError('round target lacks a persisted Designer hypothesis attribution')
-            if plan.ability_attribution.round_index != index:
-                raise ValueError('Designer hypothesis attribution belongs to another round')
+            if ability_registry.get(plan.target_ability_id).description != plan.target_ability_hypothesis:
+                raise ValueError('round target hypothesis differs from its provisional Ability record')
             priority_refs = ability_registry.failure_task_refs(plan.target_ability_id)
             if not set(plan.recovery_snapshot.priority_task_refs).issubset(priority_refs):
-                raise ValueError('Recovery priority tasks lack a confident target-ability link')
+                raise ValueError('Recovery priority tasks lack an explicit target-ability link')
             seen_diagnosis = ability_registry.seen_diagnosis_identities
             for snapshot in (plan.recovery_snapshot, plan.retention_snapshot):
                 if any(probe.identity.overlaps_under(identity, snapshot.split_policy_version)

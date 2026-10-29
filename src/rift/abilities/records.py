@@ -15,25 +15,18 @@ class AbilityStatus(str, Enum):
 
 
 @dataclass(frozen=True)
-class AbilityCandidate:
-    """Only the non-sensitive description is passed to an attribution judge."""
-    ability_id: str
-    description: str
-    aliases: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
 class AbilityEvidenceLink:
     task_ref: str
     evidence_refs: tuple[str, ...]
-    confidence: float
+    confidence: float | None
     round_index: int
-    rationale: str
+    rationale: str = ""
 
     def __post_init__(self):
         if (not self.task_ref or not self.evidence_refs or len(set(self.evidence_refs)) != len(self.evidence_refs)
-                or not isfinite(self.confidence) or not 0 <= self.confidence <= 1
-                or type(self.round_index) is not int or self.round_index < 0 or not self.rationale):
+                or (self.confidence is not None and
+                    (not isfinite(self.confidence) or not 0 <= self.confidence <= 1))
+                or type(self.round_index) is not int or self.round_index < 0):
             raise ValueError("invalid ability-to-failure evidence link")
 
 
@@ -50,29 +43,6 @@ class AbilityRevision:
                 or not self.previous_description or not self.revised_description
                 or self.previous_description == self.revised_description or not self.rationale):
             raise ValueError("invalid ability hypothesis revision")
-
-
-@dataclass(frozen=True)
-class AbilityAttributionRecord:
-    hypothesis: str
-    ability_id: str
-    round_index: int
-    confidence: float
-    decision: str
-    method: str
-    rationale: str
-    evidence_refs: tuple[str, ...]
-    input_evidence_refs: tuple[str, ...] = ()
-
-    def __post_init__(self):
-        if (not self.hypothesis or not self.ability_id or type(self.round_index) is not int
-                or self.round_index < 0 or not isfinite(self.confidence)
-                or not 0 <= self.confidence <= 1
-                or self.decision not in ("matched", "provisional")
-                or not self.method or not self.rationale
-                or len(set(self.evidence_refs)) != len(self.evidence_refs)
-                or len(set(self.input_evidence_refs)) != len(self.input_evidence_refs)):
-            raise ValueError("invalid ability attribution record")
 
 
 @dataclass(frozen=True)
@@ -140,6 +110,7 @@ class AbilityRecord:
     training_history: tuple[AbilityTrainingEvent, ...] = ()
     evaluation_history: tuple[AbilityEvaluationEvent, ...] = ()
     revisions: tuple[AbilityRevision, ...] = ()
+    explicit_failure_task_refs: tuple[str, ...] = ()
 
     def __post_init__(self):
         if (not self.ability_id or not self.description or not isinstance(self.status, AbilityStatus)
@@ -147,6 +118,8 @@ class AbilityRecord:
                 or type(self.last_observed_round) is not int
                 or self.last_observed_round < self.created_round
                 or len(set(self.failure_task_refs)) != len(self.failure_task_refs)
+                or len(set(self.explicit_failure_task_refs)) != len(self.explicit_failure_task_refs)
+                or not set(self.explicit_failure_task_refs).issubset(self.failure_task_refs)
                 or any(not ref for ref in self.aliases + self.previous_descriptions)):
             raise ValueError("invalid persistent Ability Registry record")
         linked = {row.task_ref for row in self.failure_links}
