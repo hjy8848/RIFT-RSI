@@ -3,7 +3,6 @@ from typing import Protocol, Sequence
 from rift.benchmark.public_feedback import PublicEpisode
 from rift.schemas import Identity, Split
 from rift.tasks import Proposal
-from rift.banks.records import DiagnosisExperience
 
 @dataclass(frozen=True)
 class TrainingExperience:
@@ -35,19 +34,6 @@ def propose(designer: Designer, experiences, registry):
     if not proposals or any(not isinstance(p, Proposal) for p in proposals):
         raise ValueError('structured proposals required')
     if len({p.proposal_id for p in proposals}) != len(proposals): raise ValueError('proposal IDs must be distinct')
-    return proposals
-
-def propose_from_diagnosis(designer: Designer, experiences):
-    """Feed a FailureBank diagnosis projection, never its Host-private record."""
-    rows = tuple(experiences)
-    if not rows or any(not isinstance(row, DiagnosisExperience) for row in rows):
-        raise ValueError("public DiagnosisExperience records required")
-    summaries = tuple(row.summary for row in rows)
-    proposals = tuple(designer.propose(summaries))
-    if not proposals or any(not isinstance(p, Proposal) for p in proposals):
-        raise ValueError("structured proposals required")
-    if len({p.proposal_id for p in proposals}) != len(proposals):
-        raise ValueError("proposal IDs must be distinct")
     return proposals
 
 class Service(Protocol):

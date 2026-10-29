@@ -1,10 +1,8 @@
 """Host-private, provenance-preserving records for evolving capability banks."""
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
-
 from rift.benchmark.public_feedback import PublicSummary
-from rift.schemas import Checkpoint, DataPurpose, Identity, Outcome
+from rift.schemas import Checkpoint, Identity, Outcome
 
 
 class EvidenceLevel(str, Enum):
@@ -56,7 +54,6 @@ class TaskEvidenceRecord:
     """Private task replay binding and its checkpoint-relative capability estimate."""
     task_ref: str
     identity: Identity
-    purpose: DataPurpose
     checkpoint: Checkpoint
     protocol_digest: str
     trials: tuple[ObservedTrial, ...]
@@ -64,21 +61,24 @@ class TaskEvidenceRecord:
 
     def __post_init__(self):
         if (not self.task_ref or not isinstance(self.identity, Identity)
-                or not isinstance(self.purpose, DataPurpose) or not self.checkpoint
+                or not self.checkpoint
                 or not self.protocol_digest or not self.trials or not self.observed_at):
             raise ValueError("complete host task evidence required")
-        if self.identity.purpose is not None and self.identity.purpose is not self.purpose:
-            raise ValueError("task identity purpose mismatch")
+        if self.identity.purpose is None:
+            raise ValueError("task evidence identity requires one purpose")
         if any(t.task_ref != self.task_ref or t.checkpoint != self.checkpoint
                or t.protocol_digest != self.protocol_digest for t in self.trials):
             raise ValueError("task trials do not share the bound task, checkpoint and protocol")
-        # PublicSummary is still Host-private in this record. Only
-        # public_projection(DIAGNOSIS) can create a Designer input; Probe
-        # snapshots strip summaries before persistence or evaluation.
+        # PublicSummary stays Host-side here. FailureObservation is the only
+        # projection that exposes an opaque task reference and public summary.
         if len({t.trial_id for t in self.trials}) != len(self.trials):
             raise ValueError("duplicate task trial")
         if len({t.seed for t in self.trials}) != len(self.trials):
             raise ValueError("duplicate evaluation seed")
+
+    @property
+    def purpose(self):
+        return self.identity.purpose
 
     @property
     def successes(self):
@@ -118,13 +118,14 @@ class TaskEvidenceRecord:
 
 
 @dataclass(frozen=True)
-class DiagnosisExperience:
-    """Explicit public allowlist: no TaskRef, identity, checkpoint hash or private evidence."""
+class FailureObservation:
+    """Designer-visible failure and opaque reference, without task identity or evidence."""
+    task_ref: str
     summary: PublicSummary
 
     def __post_init__(self):
-        if not isinstance(self.summary, PublicSummary):
-            raise TypeError("PublicSummary required")
+        if not self.task_ref or not isinstance(self.summary, PublicSummary):
+            raise ValueError("opaque failure reference and PublicSummary required")
 
 
 @dataclass(frozen=True)
@@ -138,7 +139,7 @@ class BankMembershipEvent:
     reason: str
 
     def __post_init__(self):
-        if (not self.event_id or not self.task_ref or self.bank not in ("success", "failure")
+        if (not self.event_id or not self.task_ref or self.bank not in ("success", "failure", "unresolved")
                 or not isinstance(self.state, CapabilityState) or type(self.sequence) is not int
                 or self.sequence < 0 or not self.reason):
             raise ValueError("invalid bank membership event")

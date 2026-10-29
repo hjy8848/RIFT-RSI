@@ -7,28 +7,27 @@ This document records which pieces of the dual-bank RIFT protocol have code and 
 
 ## Implemented
 
-- Checkpoint-relative SuccessBank and FailureBank records, explicit UNKNOWN trials, Host-private evidence storage, diagnosis allowlisting, and append-only membership events.
-- Persistent Ability Registry with provisional hypothesis records, explicit evidence-verified task links, all-round diagnosis-seen memory, and per-ability training/evaluation history. Automatic semantic attribution is intentionally absent pending a research method.
-- Captured Designer hypotheses are checked against the original on-policy generation record; stable IDs stay Host-side while an optional directed prompt includes only the public ability description.
+- One `BANK_CANDIDATE` task purpose feeds FailureBank and SuccessBank. Bootstrap failures need no ability label; unresolved failures remain recorded. Failure and Recovery no longer form disjoint task partitions.
+- AbilityRegistry stores ID, description, explicit failure TaskRefs, training/evaluation history, and explicit link revisions. Designer selects an existing ID or `NEW`; Host validates captured generation, visible IDs and TaskRefs, verifies real Failure Bank evidence, and assigns stable IDs. No semantic matcher or old unused Registry migration branch remains.
+- Designer receives opaque `FailureObservation` references with public summaries and available ability choices. Previously shown failures may enter Recovery; task selection must still exclude current Service training overlap and TEST.
 - Versioned split registry with unchanged legacy `strict_family_disjoint_v1` behavior and explicit `instance_disjoint_within_family_v1` support.
-- Seeded Recovery selection that samples explicitly linked historical failures first and randomly fills from other eligible failures, plus independent random Retention sampling. Each historical candidate must pair with a verified baseline at the current Service Checkpoint and protocol. Frozen snapshots persist priority task refs, pre-update baseline evidence, and same-task/same-seed after-evaluation contracts.
+- Seeded Recovery selection that samples linked failures first and randomly fills from other eligible Failure Bank records, plus independent random Retention sampling. Historical failures must pair with a verified baseline at the current Service checkpoint and protocol. Frozen snapshots persist priority refs, seed, current baseline and same-task/same-seed after-evaluation contracts.
 - Dual-bank task-success reward with evidence coverage threshold, before/after checkpoint checks, same training/split isolation checks, and a verifier that reloads and recomputes its evidence.
 - Legacy Replay LogP remains a separate tagged reward and state protocol; legacy untagged LoopState loads as Replay LogP.
 - Full-parameter VERL role adapters remain in place. Service uses GRPO complete groups. Sequential delayed Designer feedback uses ungrouped REINFORCE with explicit scalar baseline and no batch whitening.
 - Pending Designer generation action is retained and verified through Service training so delayed reward is credited to its exact on-policy rollout.
-- Ability hypotheses remain provisional and unmerged; Recovery snapshots exclude every diagnosis identity persisted as Designer-visible across prior rounds.
+- Recovery snapshots exclude the current training package, substantive overlap under the selected split policy, and TEST, but allow previously Designer-visible task references.
 - Dual-bank stages are persisted in LoopState. `EvolutionScheduler` and the `rift-evolve` application-factory entry coordinate round execution and checkpoint handoff without embedding fake models or checkpoints.
 - `IndependentTestRunner` enforces the TEST purpose boundary; its result is isolated from learning reward and bank updates by the scheduler contract.
 
 ## Offline verification
 
-The added tests exercise capability classification and UNKNOWN exclusion, diagnosis privacy projection, both split policies, reproducible Probe freezing, explicit ability links, historical-failure/current-baseline pairing across Checkpoints, random fallback and independent Retention sampling, Registry persistence/tamper detection/history recovery, target-bound Designer capture, same-seed Probe evidence storage, scripted-evidence rejection from real reward, reward arithmetic, ungrouped Designer credit, and dual-bank LoopState save/restore. These tests use fixture records and mocked verifiers/workers; they do not demonstrate model learning.
+CPU tests exercise unlabelled bootstrap, UNKNOWN exclusion, public failure projection, split policies, explicit `NEW` and existing-ID choices, captured proposal/context binding, cross-round failure reuse, training-overlap exclusion, current-checkpoint baselines, reproducible random fill, TEST rejection, Registry persistence, Probe evidence storage, scripted-evidence rejection from real reward, reward arithmetic, ungrouped Designer credit, and dual-bank LoopState save/restore. These tests use fixture records and mocked verifiers/workers; they do not demonstrate model learning.
 
 ## Still required from a deployment runtime
 
 - A production `EvolutionRunRuntime` factory with persistent Usami task/certificate/Episode stores, authoritative identity construction, native multi-turn evaluator, real VERL FSDP2 worker groups, checkpoint store, and production update/reward/action/trial verifiers.
 - A bank updater that persists real Bootstrap and subsequent task/probe observations with trusted evidence, and a plan factory that restores the exact pending Designer action on interrupted rounds and supplies current-Checkpoint baseline records for historical Recovery and Retention candidates.
-- A research method for linking natural-language Designer hypotheses to historical failure tasks. Until selected and validated, hypotheses remain provisional and Recovery uses random fallback for unlinked failures.
 - A tested exclusive lifecycle for two full-parameter policies sharing the eight NPU devices, including optimizer/RNG restore, serving weight synchronization, and safe resource release between Designer and Service phases.
 - Integration validation of UNKNOWN and failed-tool behavior against actual Usami episodes and actual Agent Loop token capture.
 - Resolution and validation of the requested software image. The pinned VERL v0.9.1 source requires `numpy>=2.0.0`, which conflicts with requested NumPy 1.26.4; no dependency override is claimed safe.

@@ -4,8 +4,8 @@ from hashlib import sha256
 import json
 from math import isfinite
 
-from rift.banks.records import EvidenceLevel, ObservedTrial
-from rift.schemas import Checkpoint, DataPurpose, Identity, Outcome
+from rift.banks.records import ObservedTrial
+from rift.schemas import Checkpoint, DataPurpose, Identity, Outcome, Split
 
 
 def _canonical(value):
@@ -24,10 +24,11 @@ class TaskProbe:
     weight: float = 1.0
 
     def __post_init__(self):
-        expected = (DataPurpose.RECOVERY_FEEDBACK if self.purpose is DataPurpose.RECOVERY_FEEDBACK
-                    else DataPurpose.RETENTION_FEEDBACK)
-        if self.purpose is not expected or self.identity.purpose is not self.purpose:
-            raise ValueError("probe purpose and explicit task identity required")
+        if (self.purpose not in (DataPurpose.RECOVERY_FEEDBACK,
+                                 DataPurpose.RETENTION_FEEDBACK)
+                or self.identity.purpose is not DataPurpose.BANK_CANDIDATE
+                or self.identity.split is Split.TEST):
+            raise ValueError("probe role must use a non-TEST Failure Bank task")
         if (not self.task_ref or not self.protocol_ref or not self.protocol_digest
                 or not self.baseline_trials or not isfinite(self.weight) or self.weight <= 0):
             raise ValueError("complete probe baseline required")

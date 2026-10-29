@@ -6,16 +6,18 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from rift.abilities.registry import AbilityRegistry
-from rift.banks.bootstrap import BootstrapResult, BootstrapRunner, BootstrapTask
+from rift.abilities.records import AbilityPrompt
+from rift.banks.bootstrap import BootstrapResult, BootstrapRunner
 from rift.banks.core import BankManager, JsonTaskEvidenceStore, public_projection
-from rift.banks.records import DiagnosisExperience, TaskEvidenceRecord
+from rift.banks.records import FailureObservation, TaskEvidenceRecord
 from rift.banks.records import CapabilityState
-from rift.loop import LoopState, PendingDesignerAction, Stage
+from rift.loop import LoopState, Stage
 from rift.probes.records import ProbeSnapshot
 from rift.rewards.learning_value import RewardMode
 from rift.schemas import Checkpoint
 from rift.training.contracts import UpdateRequest
 from rift.training.records import DesignerFeedback
+from rift.tasks import Proposal
 from rift.verl.coordinator import prepare_dual_bank_round, run_round
 
 
@@ -39,7 +41,7 @@ class EvolutionRoundPlan:
     action_verifier: object
     designer_checkpoint: Checkpoint
     target_ability_id: str
-    target_ability_hypothesis: str
+    designer_selection: Proposal
     feedback_provider: Callable
     training_identity_resolver: Callable
     designer_batch_id: str
@@ -56,9 +58,8 @@ class EvolutionRoundPlan:
                 or self.state.package_id != self.service_request.package_id
                 or not self.target_ability_id
                 or self.state.target_ability_id != self.target_ability_id
-                or not self.target_ability_hypothesis.strip()
-                or (self.state.designer_action.target_ability_id is not None
-                    and self.state.designer_action.target_ability_id != self.target_ability_id)
+                or not isinstance(self.designer_selection, Proposal)
+                or self.state.proposal_ids != (self.designer_selection.proposal_id,)
                 or self.recovery_snapshot.target_ability_id != self.target_ability_id
                 or self.retention_snapshot.target_ability_id is not None
                 or self.service_request.policy_before != self.recovery_snapshot.baseline_checkpoint
@@ -74,8 +75,9 @@ class EvolutionPlanFactory(Protocol):
     def build(self, round_index: int, service_checkpoint: Checkpoint,
               designer_checkpoint: Checkpoint, banks: BankManager,
               ability_registry: AbilityRegistry,
-              diagnosis: tuple[DiagnosisExperience, ...],
-              diagnosis_records: tuple[TaskEvidenceRecord, ...],
+              failures: tuple[FailureObservation, ...],
+              failure_records: tuple[TaskEvidenceRecord, ...],
+              ability_options: tuple[AbilityPrompt, ...],
               previous_state: LoopState | None
               ) -> EvolutionRoundPlan: ...
 
@@ -89,14 +91,14 @@ class EvolutionScheduler:
     def __init__(self, *, bootstrap_runner: BootstrapRunner,
                  task_evidence_store: JsonTaskEvidenceStore, state_root,
                  success_threshold=0.75, failure_threshold=0.25,
-                 diagnosis_limit=8, seed=0):
+                 failure_context_limit=8, seed=0):
         self.bootstrap_runner = bootstrap_runner
         self.task_evidence_store = task_evidence_store
         self.state_root = Path(state_root)
         self.success_threshold, self.failure_threshold = success_threshold, failure_threshold
-        self.diagnosis_limit, self.seed = diagnosis_limit, seed
-        if type(diagnosis_limit) is not int or diagnosis_limit < 1 or type(seed) is not int or seed < 0:
-            raise ValueError('positive diagnosis limit and non-negative scheduler seed required')
+        self.failure_context_limit, self.seed = failure_context_limit, seed
+        if type(failure_context_limit) is not int or failure_context_limit < 1 or type(seed) is not int or seed < 0:
+            raise ValueError('positive failure context limit and non-negative scheduler seed required')
 
     def bootstrap(self, task_manifest, checkpoint, *, protocol, trials_per_task=3,
                   seed=None, banks_path=None):
@@ -138,30 +140,21 @@ class EvolutionScheduler:
             action_args = (plan.state.designer_action.tokens, plan.designer_checkpoint,
                 plan.state.package_id, plan.state.designer_action.rollout_id,
                 plan.state.designer_action.group_id)
-            verified_action = (plan.action_verifier.verify_designer_action(*action_args)
-                if plan.state.designer_action.target_ability_id is None else
-                plan.action_verifier.verify_designer_action(*action_args,
-                    target_ability_id=plan.state.designer_action.target_ability_id))
-            if verified_action is not True:
+            if plan.action_verifier.verify_designer_action(*action_args) is not True:
                 raise ValueError('round plan Designer action evidence failed verification')
             state.save(path)
-        verify_hypothesis = getattr(plan.action_verifier,
-                                    'verify_designer_hypothesis', None)
-        if (not callable(verify_hypothesis)
-                or verify_hypothesis(state.designer_action.rollout_id,
-                                     plan.target_ability_hypothesis) is not True):
-            raise ValueError('target ability hypothesis is not bound to captured Designer output')
+        verify_proposal = getattr(plan.action_verifier, 'verify_designer_proposal', None)
+        if (not callable(verify_proposal)
+                or verify_proposal(state.designer_action.rollout_id, plan.designer_selection) is not True):
+            raise ValueError('selected ability choice is not bound to captured Designer output')
 
         def target_bound_feedback(current_state):
             rows = tuple(plan.feedback_provider(current_state))
-            captured_prompt_target = current_state.designer_action.target_ability_id
             if any(not isinstance(row, DesignerFeedback)
                    or row.target_ability_id not in (None, plan.target_ability_id)
-                   or row.prompt_ability_id not in (None, captured_prompt_target)
                    for row in rows):
                 raise ValueError('Designer feedback target differs from verified round attribution')
-            return tuple(replace(row, target_ability_id=plan.target_ability_id,
-                prompt_ability_id=captured_prompt_target) for row in rows)
+            return tuple(replace(row, target_ability_id=plan.target_ability_id) for row in rows)
 
         if state.stage in (Stage.CERTIFIED, Stage.PROBES_FROZEN, Stage.BASELINE_READY, Stage.READY_FOR_TRAINING):
             state = prepare_dual_bank_round(state,
@@ -208,37 +201,41 @@ class EvolutionScheduler:
         service_checkpoint, designer_checkpoint, previous = initial_service, initial_designer, None
         completed = []
         for index in range(rounds):
-            diagnosis_records = banks.failure_bank.diagnosis_records(
-                limit=self.diagnosis_limit, seed=self.seed + index)
-            diagnosis = tuple(public_projection(row) for row in diagnosis_records)
-            for row in diagnosis_records:
-                ability_registry.mark_diagnosis_seen(row.task_ref, row.identity)
-            # Persist exposure intent before the runtime can start Designer generation.
+            failure_records = banks.failure_bank.sample_records(
+                limit=self.failure_context_limit, seed=self.seed + index)
+            failures = tuple(public_projection(row) for row in failure_records)
+            ability_options = ability_registry.prompts()
             ability_registry.save(registry_path)
             plan = plan_factory.build(index, service_checkpoint, designer_checkpoint,
-                                      banks, ability_registry, diagnosis,
-                                      diagnosis_records, previous)
+                                      banks, ability_registry, failures,
+                                      failure_records, ability_options, previous)
             if not isinstance(plan, EvolutionRoundPlan):
                 raise TypeError('plan factory must return EvolutionRoundPlan')
             if plan.state.round_index != index:
                 raise ValueError('round plan index does not match scheduler history')
-            if plan.target_ability_id not in {row.ability_id for row in ability_registry.records}:
-                raise ValueError('round target ability was not persisted in the registry')
-            if ability_registry.get(plan.target_ability_id).description != plan.target_ability_hypothesis:
-                raise ValueError('round target hypothesis differs from its provisional Ability record')
+            verify_proposal = getattr(plan.action_verifier, 'verify_designer_proposal', None)
+            if (not callable(verify_proposal)
+                    or verify_proposal(plan.state.designer_action.rollout_id,
+                        plan.designer_selection, visible_failure_refs=tuple(row.task_ref for row in failures),
+                        ability_options=ability_options) is not True):
+                raise ValueError('Designer choice is not bound to captured failure and ability context')
+            selected = ability_registry.apply_designer_choice(
+                ability_id=plan.designer_selection.ability_id,
+                hypothesis=plan.designer_selection.hypothesis,
+                add_failure_task_refs=plan.designer_selection.diagnosis_task_refs,
+                remove_failure_task_refs=plan.designer_selection.remove_failure_task_refs,
+                visible_failures=failure_records, evidence_verifier=banks,
+                round_index=index,
+                designer_rollout_id=plan.state.designer_action.rollout_id)
+            if selected.ability_id != plan.target_ability_id:
+                raise ValueError('resolved Designer ability ID differs from prepared round')
             priority_refs = ability_registry.failure_task_refs(plan.target_ability_id)
             if not set(plan.recovery_snapshot.priority_task_refs).issubset(priority_refs):
                 raise ValueError('Recovery priority tasks lack an explicit target-ability link')
-            seen_diagnosis = ability_registry.seen_diagnosis_identities
-            for snapshot in (plan.recovery_snapshot, plan.retention_snapshot):
-                if any(probe.identity.overlaps_under(identity, snapshot.split_policy_version)
-                       for probe in snapshot.probes for identity in seen_diagnosis):
-                    raise ValueError('Probe snapshot overlaps a diagnosis task already shown to Designer')
             if plan.state.expected_service != (None if previous is None else service_checkpoint):
                 raise ValueError('round plan does not continue the latest Service checkpoint')
             if plan.state.expected_designer != (None if previous is None else designer_checkpoint):
                 raise ValueError('round plan does not continue the latest Designer checkpoint')
-            ability_registry.save(registry_path)
             state_path = self.state_root / f'round-{index:06d}.json'
             result = self.execute_round(plan, state_path)
             if result.stage is not Stage.DESIGNER_TRAINING_COMPLETED:

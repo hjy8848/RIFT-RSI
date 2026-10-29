@@ -139,7 +139,7 @@ def test_grpo_request_requires_real_attested_source_and_comparable_designer_rewa
 
 def test_replay_reward_verifier_recomputes_saved_scores():
     from rift.verl.replay_evidence import RecomputedReplayRewardVerifier
-    from test_core import BEFORE, TRAIN, REPLAY, Scorer, Store, Verifier, completed, demo
+    from test_core import TRAIN, REPLAY, Scorer, Store, Verifier, completed, demo
     from rift.replay.bank import ReplayBank
     from rift.replay.splits import SplitRegistry
     from rift.replay.reward import score_update
@@ -423,6 +423,7 @@ def test_designer_on_policy_capture_precedes_delayed_reward(tmp_path):
     """Simulated server and attestor validate wiring, not real policy provenance."""
     import json
     from rift.benchmark.public_feedback import PublicSummary, PublicEvent
+    from rift.banks.records import FailureObservation
     from rift.tasks import Proposal
     from rift.verl.designer import DesignerCaptureStore, DesignerSampler
     class FakeServer:
@@ -436,39 +437,46 @@ def test_designer_on_policy_capture_precedes_delayed_reward(tmp_path):
         def verify_serving(self, checkpoint): return True
         def verify_generation(self, checkpoint, fields): return fields == {'global_steps':1,'min_global_steps':1,'max_global_steps':1}
         def record_generation(self, *args): pass
-    async def encode(summaries):
-        assert isinstance(summaries[0], PublicSummary)
+    async def encode(failures, ability_options):
+        assert failures[0].task_ref == 'F001'
+        assert isinstance(failures[0].summary, PublicSummary)
+        assert ability_options == ()
         return [1, 2]
-    async def parse(tokens): return [Proposal('p', 'hypothesis', 'request', '{}')]
+    async def parse(tokens): return [Proposal('p', 'hypothesis', 'request', '{}',
+        'NEW', ('F001',))]
     from rift.verl.generation_ledger import GenerationLedger
     verifier = FakeVerifier(); ledger = GenerationLedger(tmp_path / 'generation-ledger', verifier)
     store = DesignerCaptureStore(tmp_path, attestor=ledger)
     sampler = DesignerSampler(FakeServer(), encode, parse, verifier, store, serialization='fixture')
     cp = Checkpoint('designer', 'v1', 'tok', 'weights')
-    pending = asyncio.run(sampler.sample([PublicSummary((PublicEvent('user','request'),), Outcome.FAILURE)], cp,
+    failure = FailureObservation('F001', PublicSummary((PublicEvent('user','request'),), Outcome.FAILURE))
+    pending = asyncio.run(sampler.sample([failure], (), cp,
         'package', {'temperature':1.0}, group_id='group'))
     assert pending.trace.tokens.prompt == (1, 2) and pending.trace.tokens.response == (3, 4)
     assert store.verify_designer_action(pending.trace.tokens, cp, 'package', pending.rollout_id, 'group')
     assert not store.verify_designer_action(pending.trace.tokens, cp, 'package', pending.rollout_id, 'forged-group')
     assert not store.verify_designer_action(pending.trace.tokens, cp, 'other', pending.rollout_id, 'group')
+    assert store.verify_designer_proposal(pending.rollout_id, pending.proposals[0],
+        visible_failure_refs=('F001',), ability_options=())
+    from dataclasses import replace
+    assert not store.verify_designer_proposal(pending.rollout_id,
+        replace(pending.proposals[0], diagnosis_task_refs=('F002',)))
     from rift.abilities.records import AbilityPrompt
-    async def encode_target(summaries, *, target_ability_description):
-        assert target_ability_description == 'refund status lookup'
+    async def encode_target(failures, ability_options):
+        assert ability_options[0].description == 'refund status lookup'
         return [1, 2]
+    async def parse_target(tokens): return [Proposal('p2', 'refund status lookup',
+        'request', '{}', 'A000001', (), ('F001',))]
     targeted_sampler = DesignerSampler(FakeServer(), encode_target, parse, verifier,
         store, serialization='fixture')
-    targeted = asyncio.run(targeted_sampler.sample(
-        [PublicSummary((PublicEvent('user','request'),), Outcome.FAILURE)], cp,
-        'package-targeted', {'temperature':1.0},
-        target_ability=AbilityPrompt('A000001', 'refund status lookup')))
-    assert targeted.target_ability_id == 'A000001'
+    targeted_sampler.proposal_parser = parse_target
+    option = AbilityPrompt('A000001', 'refund status lookup', ('F001',))
+    targeted = asyncio.run(targeted_sampler.sample([failure], (option,), cp,
+        'package-targeted', {'temperature':1.0}))
+    assert targeted.proposals[0].ability_id == 'A000001'
     assert store.load_pending(targeted.rollout_id) == targeted
-    assert store.verify_designer_action(targeted.trace.tokens, cp,
-        'package-targeted', targeted.rollout_id, None, 'A000001')
-    assert not store.verify_designer_action(targeted.trace.tokens, cp,
-        'package-targeted', targeted.rollout_id, None, 'A000002')
-    assert store.verify_designer_hypothesis(targeted.rollout_id, 'hypothesis')
-    assert not store.verify_designer_hypothesis(targeted.rollout_id, 'forged hypothesis')
+    assert store.verify_designer_proposal(targeted.rollout_id, targeted.proposals[0],
+        visible_failure_refs=('F001',), ability_options=(option,))
     from test_core import TRAIN, REPLAY, Scorer, Store, Verifier, completed, demo
     from rift.replay.bank import ReplayBank
     from rift.replay.splits import SplitRegistry

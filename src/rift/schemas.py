@@ -15,7 +15,7 @@ class Split(str, Enum):
 class DataPurpose(str, Enum):
     """Logical use of a task without changing the legacy coarse Split enum."""
     TRAIN = "train"
-    DIAGNOSIS = "diagnosis"
+    BANK_CANDIDATE = "bank_candidate"
     RECOVERY_FEEDBACK = "recovery_feedback"
     RETENTION_FEEDBACK = "retention_feedback"
     REPLAY_LOGP_FEEDBACK = "replay_logp_feedback"

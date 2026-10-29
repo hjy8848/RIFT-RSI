@@ -15,41 +15,41 @@ RIFT 要训练 Designer 找到能帮助 Service 获得新能力、同时保留�
 
 | 记录 | 内容 | 用途 | 可见性 |
 |---|---|---|---|
-| `DiagnosisExperience` | 失败/薄弱 Episode 的 `PublicSummary` 与公开结果 | Designer 形成可检验 hypothesis 并提出新任务 | 仅显式公开投影 |
-| `TaskEvidenceRecord` | Host 的 opaque TaskRef、来源身份、用途分区、Checkpoint、试次结果和可信证据引用 | 持久化双池、重放任务、选择 Probe | Host 私有 |
+| `FailureObservation` | 失败任务 opaque `TaskRef` 与 `PublicSummary` | Designer 显式选择 ability ID/`NEW`，关联失败任务并提出新任务 | 仅显式公开投影 |
+| `TaskEvidenceRecord` | Host 的 TaskRef、来源身份、统一 `BANK_CANDIDATE` 用途、Checkpoint、试次结果和可信证据引用 | Failure/Success Bank 与 Recovery/Retention Probe | Host 私有 |
 | `Demonstration` | 成功 Episode 的精确上下文、Action Token 与 mask | 旧 Replay LogP 对照 | Host Scorer 使用 |
 
-`FailureBank` 保存特定 Service Checkpoint 下的薄弱候选，不能把失败 Token 当作正向动作标签。它区分可见 `DIAGNOSIS` 与保密 `RECOVERY_FEEDBACK`；两个分区不能包含相同任务、World 或 source lineage。`SuccessBank` 保存能力估计较高的任务候选；其任务可独立抽入 `RETENTION_FEEDBACK`。同一用途内的多个试次估计成功率，UNKNOWN 单独记录，不能作为失败样本。
+`FailureBank` 保存各 Service Checkpoint 下的真实薄弱候选，未归因任务可长期保留。Bootstrap 不要求 ability 标签；Designer 后续可显式追加 `ability_id → failure_task_refs`。Recovery 与 Failure Bank 共用任务来源，不再按 Diagnosis/Recovery 划分任务；`RECOVERY_FEEDBACK` 和 `RETENTION_FEEDBACK` 只标识冻结快照的评分角色。UNKNOWN 单独记录，不能作为失败样本。
 
 Failure/Success 是随 Checkpoint 和协议变化的历史状态。后续任务结果可以新增 `RECOVERED` 或候选状态事件，不覆盖旧记录。任务引用、World、来源 lineage、证据引用及 Probe 具体成员都留在 Host。Designer 输入通过 allowlist 只包含公开事件和允许公开的最终业务结果；不序列化私有记录。
 
 ## Ability Registry 与 Failure Bank 的关联
 
-`AbilityRegistry` 长期保存能力缺口 hypothesis、失败任务引用，以及对应的 Service 更新、双池奖励和评测历史。每个新生成的 hypothesis 都先作为 provisional 条目记录。当前实现不执行字符串匹配或自动语义归因，也不把匹配分数称为置信度。只有 Host 显式调用链接操作并验证真实 Service 的失败证据后，任务才会进入该能力的优先候选集合。Ability 状态只参考 Recovery 快照中的目标关联任务；快照没有目标任务时，状态保持 `UNCERTAIN`。Registry 保存研究假设，不代表 Usami Oracle 标签或已知的真实能力本体。
+`AbilityRegistry` 保存能力 ID、描述、显式失败任务引用，以及对应的 Service 更新和评测历史。Designer 每次从 Host 展示的已有 ID 中选择一个，或输出 `NEW`，并提交 hypothesis、诊断任务引用和训练任务提案。Host 校验 ID、引用是否出现在本次公开上下文、选择是否绑定原始生成记录，以及新增引用是否对应 Failure Bank 中真实 Service 失败证据；`NEW` 的稳定 ID 由 Host 分配。Host 不根据文本相似度推断归属。选中既有能力时，Designer 可明确增删关联失败任务或修订描述。Ability 状态只参考 Recovery 快照中的目标关联任务；Registry 不代表 Usami Oracle 标签或已知的真实能力本体。
 
-Designer 的 hypothesis 必须能追溯到捕获的 on-policy 输出。TaskRef、Identity、EvidenceRef 和 Oracle 信息留在 Host。关联方法尚未确定前，能力条目不自动合并，未关联的失败任务仍可通过随机补齐进入 Recovery。`AbilityRecord` 的主流程字段是 ID、描述、失败任务引用、训练历史和评测历史；状态、别名和修订信息只作可选记录，不参与自动匹配。旧 Registry 中由旧匹配器写入的 TaskRef 会保留作历史记录，但不会因为旧置信度值而进入优先集合；需通过新的显式链接操作重新确认。
+Designer 的完整结构化选择必须能追溯到捕获的 on-policy 输出。Identity、EvidenceRef 和 Oracle 信息留在 Host；公开 FailureObservation 只包含 opaque TaskRef 与已允许公开的摘要。`AbilityRecord` 保留 ID、描述、失败任务引用、训练历史和评测历史，显式关联修订也记入记录。当前没有旧 Registry 迁移分支：仓库没有实际使用的旧 Registry 数据需要兼容。
 
-每轮展示给 Designer 的诊断 TaskRef/Identity 会写入 Ability Registry 并跨轮保留。Recovery 先从显式关联的历史失败任务中按固定 seed 随机抽取，再从其他合格失败任务随机补足，且任务不重复。历史失败记录只证明该任务曾在其原始 Checkpoint 下失败，不作为本轮评分基线。每个入选 TaskRef 都必须配有本轮 Service Checkpoint 与评测协议下可信的当前基线记录；缺少基线时该任务不能进入冻结快照。快照保存目标 ability ID、优先任务引用、当前基线和内容 digest。历史上任何已展示给 Designer 的诊断身份、当前训练包、TEST 及 split-policy 冲突样本均不能进入 Probe。Retention 同样以历史 mastered 记录确定候选资格，并使用当前 Checkpoint 基线独立随机抽样。
+Recovery 先从目标 ability 关联且当前符合资格的历史失败任务中按冻结 seed 随机抽取，不足时从其他合格失败任务随机补足，任务不重复。Designer 曾见过任务不构成排除条件。当前 Service 训练包及按 split policy 判定的实质重叠实例必须排除；最终 TEST 永不进入训练或奖励。历史失败只证明任务曾在旧 Checkpoint 下失败，不作为本轮评分基线。每个入选 TaskRef 都必须配有本轮 Service Checkpoint 与评测协议下可信的当前基线记录；缺少基线时不能进入冻结快照。快照保存目标 ability ID、优先任务引用、当前基线和内容 digest。Retention 从历史 mastered 任务中独立随机抽样，并同样使用当前 Checkpoint 基线。
 
 Ability Registry 不改变双池 Reward 公式，不添加能力数量、置信度或难度奖励，也不增设第三类 Probe。旧 Replay LogP 继续作为单独标记的实验对照。Registry 默认持久化在 scheduler 的 state root 下 `ability-registry.json`，JSON 内容有 checksum；可通过运行时指定独立路径。配置见 [`configs/dual_bank.yaml`](../configs/dual_bank.yaml)，实现见 `src/rift/abilities/`。
 
 ## 每轮协议
 
 1. Bootstrap 用 θ₀ 对可信任务按固定协议重复 Rollout，保存每次 `SUCCESS` / `FAILURE` / `UNKNOWN`、Checkpoint 和证据。默认只建池和基线，不训练 Service，也不生成 Designer 奖励。
-2. Designer 从随机选择的公开诊断轨迹提出 hypothesis 与结构化 Usami Proposal。Grounding、Certification 和 TaskRegistry 在 Host 完成；失败提案不获得虚构的能力收益。
-3. Designer 的真实生成 hypothesis 作为新的 provisional Ability Registry 条目保存，不做自动语义归并。Service 更新前冻结 `RECOVERY_FEEDBACK` 与 `RETENTION_FEEDBACK`：候选资格来自历史记录，优先级只来自显式 Host 关联，未关联 Recovery 候选随机补足，Retention 独立随机抽取。每个候选必须先取得本轮 θ_before 与协议下的可信 baseline。快照保存 split policy 版本、seed、目标 ability、优先任务引用、当前基线任务引用、协议 digest、θ_before 和内容 digest。训练包、所有历史已展示诊断实例、两个 Probe 池与 TEST 必须满足所选 split-policy。
+2. Designer 从统一 Failure Bank 的公开失败轨迹中，选择已有 ability ID 或 `NEW`，给出 hypothesis、诊断任务引用和结构化 Usami 训练任务提案。Host 校验 ID、公开引用和原始生成记录；`NEW` 由 Host 分配稳定 ID。Grounding、Certification 和 TaskRegistry 在 Host 完成。
+3. Service 更新前冻结 `RECOVERY_FEEDBACK` 与 `RETENTION_FEEDBACK`：Recovery 先随机抽取目标能力关联的合格失败任务，再随机补齐其他合格失败任务；Retention 独立随机抽取。Designer 历史上见过的失败任务允许评分。每个候选必须先取得本轮 θ_before 与协议下的可信 baseline。快照保存 split policy 版本、seed、目标 ability、优先任务引用、当前基线、协议 digest、θ_before 和内容 digest。排除本轮训练包、实质重叠实例和 TEST。
 4. Probe 快照只使用 θ_before 下、同 TaskRef、同评测协议和固定 seeds 的已验证当前基线。历史 θ₀ 失败可以在后续 θ₂ 轮继续提供 Recovery 候选资格，但必须先读取或重新执行 θ₂ 的 baseline；不能把 θ₀ 的分数当作 θ₂ 基线，也不能缺失时默认成 0。
 5. Service 在新训练包上通过 verl 0.9.1、Usami 多轮 Agent Loop 和全参数 GRPO 更新 θ_before→θ_after。UNKNOWN 或验证失败的 GRPO 成员使整个组失效。
 6. 在相同冻结任务、seed 和协议下用 θ_after 独立重新执行 Probe，保留新的 Episode 和 replay 证据。任务先算自己的有效试次成功率，再对任务等权平均；UNKNOWN 不计成功也不计失败，但超出有效覆盖阈值则拒绝 Reward。
 7. `G = SR(θ_after, F) - SR(θ_before, F)`，`H = SR(θ_after, S) - SR(θ_before, S)`，`R = G - λ max(0, -H)`。独立保存 G、H、R、有效率、试次和 evidence refs。
-8. 把 `R` 绑定 Designer 的原始 on-policy Token、捕获输出中的 hypothesis、包 ID、目标 ability、Service update、两个冻结 Probe、Checkpoint 和预算。对应 ability 追加真实更新与 Recovery/Retention 评测历史。默认采用 `sequential_curriculum`：每个包从当前 θ 更新，不伪造同起点 GRPO 组；Designer 使用带显式标量基线、不开 batch whitening 的 `reinforce_baseline`。若要用 GRPO，必须执行 matched-baseline 候选并共享 θ_before、冻结 Probe、协议和预算。
+8. 把 `R` 绑定 Designer 原始 on-policy Token、结构化能力选择、包 ID、目标 ability、Service update、两个冻结 Probe、Checkpoint 和预算。对应 ability 追加真实更新与 Recovery/Retention 评测历史。默认采用 `sequential_curriculum`：每个包从当前 θ 更新，不伪造同起点 GRPO 组；Designer 使用带显式标量基线、不开 batch whitening 的 `reinforce_baseline`。若要用 GRPO，必须执行 matched-baseline 候选并共享 θ_before、冻结 Probe、协议和预算。
 9. 完成本轮证据持久化后，更新后续候选池；Recovery/Retention 具体题面仍不向 Designer 暴露。最终 TEST 永不产生 Designer Reward。
 
 ## 数据分区与策略版本
 
-逻辑用途为 `TRAIN`、`DIAGNOSIS`、`RECOVERY_FEEDBACK`、`RETENTION_FEEDBACK`、`REPLAY_LOGP_FEEDBACK`、`VALIDATION`、`TEST`。现有 `Split` 语义保持兼容，新增 `Identity.purpose` 明确细分用途。旧默认 `strict_family_disjoint_v1` 保持原行为：World、Task、Family 或 Lineage 任一相同即跨分区冲突。`instance_disjoint_within_family_v1` 明确允许不同任务实例共享宽泛 family，但仍禁止 World、Task 或具体 source lineage 跨分区重叠。不同 family 本身不能替代 source lineage 的可信粒度。
+任务用途为 `TRAIN`、`BANK_CANDIDATE`、`REPLAY_LOGP_FEEDBACK`、`VALIDATION`、`TEST`；Recovery 和 Retention 是 Probe 快照角色，不再分割来源任务。现有 `Split` 语义保持不变，`Identity.purpose` 用于任务来源。`strict_family_disjoint_v1` 按 World、Task、Family 或 Lineage 判定跨 split 冲突；`instance_disjoint_within_family_v1` 允许不同任务实例共享宽泛 family，但仍隔离 World、Task 和 source lineage。
 
-旧 SplitRegistry JSON 数组按 `strict_family_disjoint_v1` 加载；新 envelope 记录 policy 版本。任何变更 policy 的实验需显式新建 Registry，不能在读取旧档时自动放宽隔离。Probe、奖励和实验 manifest 都记录该版本。Diagnosis 与 Recovery 既不能共享任务/World/lineage，也不能只凭不同 `task_ref` 被视为独立。
+旧 SplitRegistry JSON 数组按 `strict_family_disjoint_v1` 加载；新 envelope 记录 policy 版本。任何变更 policy 的实验需显式新建 Registry，不能在读取旧档时自动放宽隔离。Probe、奖励和实验 manifest 都记录该版本；同一 Failure Bank 任务可以在不同轮次作为训练候选或 Probe，但不能同时进入本轮 Service 训练包和评分快照。
 
 ## Reward、Verifier 与恢复
 

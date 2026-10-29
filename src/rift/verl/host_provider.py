@@ -42,8 +42,8 @@ class NativeHostProvider:
         if not callable(purpose_resolver):
             raise ValueError('task resolver must expose Host-private logical task purpose')
         purpose = purpose_resolver(task_ref)
-        if purpose not in (DataPurpose.RECOVERY_FEEDBACK, DataPurpose.RETENTION_FEEDBACK):
-            raise ValueError('only frozen Recovery or Retention tasks may enter the Probe runner')
+        if purpose is not DataPurpose.BANK_CANDIDATE:
+            raise ValueError('only frozen bank candidates may enter the Probe runner')
         world, task, profile, external_events = self.task_resolver.resolve(task_ref)
         if self.task_authorizer.verify_task(task_ref, world, task, profile, purpose=purpose) is not True:
             raise ValueError('Probe task authorization failed')

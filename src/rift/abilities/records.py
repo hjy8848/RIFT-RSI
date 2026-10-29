@@ -1,9 +1,9 @@
-"""Versioned host-side records for uncertain, revisable ability hypotheses."""
+"""Small persistent records for explicit Designer ability choices."""
 from dataclasses import dataclass
 from enum import Enum
 from math import isfinite
 
-from rift.schemas import Checkpoint, Identity
+from rift.schemas import Checkpoint
 
 
 class AbilityStatus(str, Enum):
@@ -15,34 +15,21 @@ class AbilityStatus(str, Enum):
 
 
 @dataclass(frozen=True)
-class AbilityEvidenceLink:
-    task_ref: str
-    evidence_refs: tuple[str, ...]
-    confidence: float | None
-    round_index: int
-    rationale: str = ""
-
-    def __post_init__(self):
-        if (not self.task_ref or not self.evidence_refs or len(set(self.evidence_refs)) != len(self.evidence_refs)
-                or (self.confidence is not None and
-                    (not isfinite(self.confidence) or not 0 <= self.confidence <= 1))
-                or type(self.round_index) is not int or self.round_index < 0):
-            raise ValueError("invalid ability-to-failure evidence link")
-
-
-@dataclass(frozen=True)
 class AbilityRevision:
     round_index: int
     previous_description: str
     revised_description: str
-    rationale: str
-    evidence_refs: tuple[str, ...]
+    added_failure_task_refs: tuple[str, ...] = ()
+    removed_failure_task_refs: tuple[str, ...] = ()
 
     def __post_init__(self):
         if (type(self.round_index) is not int or self.round_index < 0
                 or not self.previous_description or not self.revised_description
-                or self.previous_description == self.revised_description or not self.rationale):
-            raise ValueError("invalid ability hypothesis revision")
+                or (self.previous_description == self.revised_description
+                    and not self.added_failure_task_refs and not self.removed_failure_task_refs)
+                or len(set(self.added_failure_task_refs)) != len(self.added_failure_task_refs)
+                or len(set(self.removed_failure_task_refs)) != len(self.removed_failure_task_refs)):
+            raise ValueError("invalid explicit ability revision")
 
 
 @dataclass(frozen=True)
@@ -103,36 +90,31 @@ class AbilityRecord:
     status: AbilityStatus
     created_round: int
     last_observed_round: int
-    aliases: tuple[str, ...] = ()
-    previous_descriptions: tuple[str, ...] = ()
     failure_task_refs: tuple[str, ...] = ()
-    failure_links: tuple[AbilityEvidenceLink, ...] = ()
+    creator_rollout_id: str | None = None
     training_history: tuple[AbilityTrainingEvent, ...] = ()
     evaluation_history: tuple[AbilityEvaluationEvent, ...] = ()
     revisions: tuple[AbilityRevision, ...] = ()
-    explicit_failure_task_refs: tuple[str, ...] = ()
 
     def __post_init__(self):
         if (not self.ability_id or not self.description or not isinstance(self.status, AbilityStatus)
                 or type(self.created_round) is not int or self.created_round < 0
                 or type(self.last_observed_round) is not int
                 or self.last_observed_round < self.created_round
+                or (self.creator_rollout_id is not None and not self.creator_rollout_id)
                 or len(set(self.failure_task_refs)) != len(self.failure_task_refs)
-                or len(set(self.explicit_failure_task_refs)) != len(self.explicit_failure_task_refs)
-                or not set(self.explicit_failure_task_refs).issubset(self.failure_task_refs)
-                or any(not ref for ref in self.aliases + self.previous_descriptions)):
-            raise ValueError("invalid persistent Ability Registry record")
-        linked = {row.task_ref for row in self.failure_links}
-        if not linked.issubset(set(self.failure_task_refs)):
-            raise ValueError("failure links must be indexed in failure_task_refs")
+                or any(not ref for ref in self.failure_task_refs)):
+            raise ValueError("invalid Ability record")
 
 
 @dataclass(frozen=True)
 class AbilityPrompt:
-    """Public target context supplied to the Designer's prompt encoder."""
+    """Allowlisted existing ability and its explicitly linked failures."""
     ability_id: str
     description: str
+    failure_task_refs: tuple[str, ...] = ()
 
     def __post_init__(self):
-        if not self.ability_id or not self.description:
-            raise ValueError("Designer target ability context required")
+        if (not self.ability_id or not self.description
+                or len(set(self.failure_task_refs)) != len(self.failure_task_refs)):
+            raise ValueError("valid ability option required")

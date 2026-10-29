@@ -15,7 +15,6 @@ class Rollout:
     response_id: str | None = None
     reward_ref: str | None = None
     target_ability_id: str | None = None
-    prompt_ability_id: str | None = None
     def __post_init__(self):
         if not all((self.task_id, self.episode_id, self.reward_source)) or not isfinite(self.reward):
             raise ValueError("rollout provenance and finite reward required")
@@ -23,8 +22,7 @@ class Rollout:
             raise ValueError("empty group ID")
         if self.response_id == '' or self.reward_ref == '':
             raise ValueError("empty provenance reference")
-        if ((self.target_ability_id is not None and not self.target_ability_id)
-                or (self.prompt_ability_id is not None and not self.prompt_ability_id)):
+        if self.target_ability_id is not None and not self.target_ability_id:
             raise ValueError("empty ability attribution reference")
 
 @dataclass(frozen=True)
@@ -93,6 +91,5 @@ class UpdateVerifier(Protocol):
 class DesignerActionVerifier(Protocol):
     """Verify the package action tokens and generating policy against its rollout."""
     def verify_designer_action(self, tokens: Tokens, checkpoint: Checkpoint,
-                               package_id: str, rollout_id: str, group_id: str | None,
-                               target_ability_id: str | None = None) -> bool: ...
-    def verify_designer_hypothesis(self, rollout_id: str, hypothesis: str) -> bool: ...
+                               package_id: str, rollout_id: str, group_id: str | None) -> bool: ...
+    def verify_designer_proposal(self, rollout_id: str, proposal) -> bool: ...

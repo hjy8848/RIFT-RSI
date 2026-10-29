@@ -4,7 +4,7 @@ import random
 from dataclasses import replace
 
 from rift.banks.records import CapabilityState, EvidenceLevel, TaskEvidenceRecord
-from rift.schemas import DataPurpose
+from rift.schemas import DataPurpose, Split
 from rift.probes.records import ProbeSnapshot, TaskProbe
 
 
@@ -22,7 +22,7 @@ class ProbeSelector:
             raise TypeError("trusted baseline record verifier required")
 
     def freeze(self, *, recovery_candidates, retention_candidates,
-               diagnosis_identities, train_package_identities, split_registry,
+               train_package_identities, split_registry,
                before_checkpoint, recovery_tasks, retention_tasks, seed,
                protocol_ref, protocol_digest, frozen_at_ns=0,
                target_ability_id=None, ability_task_refs=(),
@@ -42,12 +42,12 @@ class ProbeSelector:
             current_baselines[row.task_ref] = row
         recovery, recovery_reasons = self._eligible(recovery_candidates,
             DataPurpose.RECOVERY_FEEDBACK, before_checkpoint, protocol_digest,
-            split_registry, train_package_identities, diagnosis_identities,
+            split_registry, train_package_identities,
             current_baselines)
         retention, retention_reasons = self._eligible(retention_candidates,
             DataPurpose.RETENTION_FEEDBACK, before_checkpoint, protocol_digest,
-            split_registry, train_package_identities,
-            tuple(diagnosis_identities) + tuple(r.identity for r in recovery),
+            split_registry, tuple(train_package_identities)
+                + tuple(r.identity for r in recovery),
             current_baselines)
         if target_ability_id is not None and not target_ability_id:
             raise ValueError("non-empty target ability ID required")
@@ -71,8 +71,10 @@ class ProbeSelector:
                                                 min(retention_tasks, len(retention)))
         if len(recovery_chosen) != recovery_tasks or len(retention_chosen) != retention_tasks:
             raise ValueError("insufficient eligible independent candidates for frozen Probe snapshots")
-        recovery_probes = tuple(self._as_probe(row, protocol_ref, protocol_digest) for row in recovery_chosen)
-        retention_probes = tuple(self._as_probe(row, protocol_ref, protocol_digest) for row in retention_chosen)
+        recovery_probes = tuple(self._as_probe(row, DataPurpose.RECOVERY_FEEDBACK,
+            protocol_ref, protocol_digest) for row in recovery_chosen)
+        retention_probes = tuple(self._as_probe(row, DataPurpose.RETENTION_FEEDBACK,
+            protocol_ref, protocol_digest) for row in retention_chosen)
         priority_refs = tuple(row.task_ref for row in chosen_priority)
         recovery_id = self._snapshot_id("recovery", seed, recovery_probes, protocol_digest,
                                         split_registry.policy_version, target_ability_id, priority_refs)
@@ -92,18 +94,22 @@ class ProbeSelector:
         self._validate_pair(recovery_snapshot, retention_snapshot, split_registry.policy_version)
         return recovery_snapshot, retention_snapshot
 
-    def _eligible(self, candidates, purpose, checkpoint, protocol_digest,
-                  registry, training, diagnosis, current_baselines):
+    def _eligible(self, candidates, probe_purpose, checkpoint, protocol_digest,
+                  registry, excluded_identities, current_baselines):
         rows, rejected, history_by_task = [], {}, {}
         def reject(reason): rejected[reason] = rejected.get(reason, 0) + 1
         for history in candidates:
             if not isinstance(history, TaskEvidenceRecord):
                 reject("not_task_evidence"); continue
-            if history.purpose is not purpose or history.identity.purpose is not purpose:
+            if history.purpose is not DataPurpose.BANK_CANDIDATE:
                 reject("wrong_purpose"); continue
+            if history.identity.split is Split.TEST:
+                reject("final_test_candidate"); continue
             state = history.state(success_threshold=self.success_threshold,
                               failure_threshold=self.failure_threshold)
-            target = CapabilityState.ACTIVE_WEAKNESS if purpose is DataPurpose.RECOVERY_FEEDBACK else CapabilityState.MASTERED_CANDIDATE
+            target = (CapabilityState.ACTIVE_WEAKNESS
+                      if probe_purpose is DataPurpose.RECOVERY_FEEDBACK
+                      else CapabilityState.MASTERED_CANDIDATE)
             if state is not target:
                 reject("outside_capability_threshold"); continue
             if not registry.contains(history.identity):
@@ -118,8 +124,8 @@ class ProbeSelector:
             if total == 0 or history.valid_trials / total < self.min_valid_fraction:
                 reject("historical_valid_fraction"); continue
             if any(history.identity.overlaps_under(other, registry.policy_version)
-                   for other in tuple(training) + tuple(diagnosis)):
-                reject("training_or_diagnosis_overlap"); continue
+                   for other in excluded_identities):
+                reject("training_overlap"); continue
 
             baseline = current_baselines.get(history.task_ref)
             if baseline is None and history.checkpoint == checkpoint and history.protocol_digest == protocol_digest:
@@ -127,8 +133,10 @@ class ProbeSelector:
             if baseline is None:
                 reject("current_checkpoint_baseline_missing"); continue
             if (baseline.task_ref != history.task_ref or baseline.identity != history.identity
-                    or baseline.purpose is not purpose or baseline.identity.purpose is not purpose):
+                    or baseline.purpose is not DataPurpose.BANK_CANDIDATE):
                 reject("current_baseline_task_identity_mismatch"); continue
+            if baseline.identity.split is Split.TEST:
+                reject("final_test_baseline"); continue
             if baseline.checkpoint != checkpoint:
                 reject("current_baseline_checkpoint_mismatch"); continue
             if baseline.protocol_digest != protocol_digest:
@@ -150,12 +158,10 @@ class ProbeSelector:
         return rows, rejected
 
     @staticmethod
-    def _as_probe(record, protocol_ref, protocol_digest):
-        # Hidden Recovery/Retention observations may be retained Host-side to
-        # support ability attribution. Frozen evaluation snapshots contain no
-        # Designer-visible summaries.
+    def _as_probe(record, purpose, protocol_ref, protocol_digest):
+        # Frozen evaluation snapshots retain no Designer-visible summaries.
         trials = tuple(replace(trial, public_summary=None) for trial in record.trials)
-        return TaskProbe(record.task_ref, record.identity, record.purpose,
+        return TaskProbe(record.task_ref, record.identity, purpose,
             record.checkpoint, trials, protocol_ref, protocol_digest)
 
     @staticmethod

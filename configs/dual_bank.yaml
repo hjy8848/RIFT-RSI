@@ -13,16 +13,15 @@ banks:
   bootstrap_trials_per_task: 5
   success_threshold: 0.75
   failure_threshold: 0.25
-  diagnosis_limit: 8
+  failure_context_limit: 8
   split_policy_version: instance_disjoint_within_family_v1
 ability_registry:
   enabled: true
   persistence_file: ability-registry.json
-  hypothesis_role: revisable_non_oracle_gap
-  hypothesis_policy: create_provisional_without_automatic_matching
-  failure_attribution: pending_research_method
+  hypothesis_role: designer_selected_non_oracle_gap
+  hypothesis_policy: explicit_existing_id_or_NEW
+  failure_links: explicit_designer_task_refs
   recovery_selection: explicitly_linked_history_then_random_fallback
-  exclude_all_designer_seen_diagnoses: true
 probes:
   recovery_selection: explicitly_linked_history_then_seeded_random_fallback
   retention_selection: seeded_random

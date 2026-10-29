@@ -12,9 +12,16 @@ class Proposal:
     hypothesis: str
     public_request: str
     abstract_spec: str
+    ability_id: str = "NEW"
+    diagnosis_task_refs: tuple[str, ...] = ()
+    remove_failure_task_refs: tuple[str, ...] = ()
     def __post_init__(self):
         if not all((self.proposal_id, self.hypothesis, self.public_request, self.abstract_spec)):
             raise ValueError("proposal fields required")
+        if (not self.ability_id or len(set(self.diagnosis_task_refs)) != len(self.diagnosis_task_refs)
+                or len(set(self.remove_failure_task_refs)) != len(self.remove_failure_task_refs)
+                or any(not ref for ref in self.diagnosis_task_refs + self.remove_failure_task_refs)):
+            raise ValueError("explicit ability choice and distinct task references required")
 
 @dataclass(frozen=True)
 class Certification:

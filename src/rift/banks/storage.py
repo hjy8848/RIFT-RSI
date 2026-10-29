@@ -27,7 +27,7 @@ def record_from_payload(value):
             row["protocol_digest"], row.get("evidence_ref"), row["replay_verified"],
             EvidenceLevel(row["evidence_level"]), public))
     return TaskEvidenceRecord(value["task_ref"], _identity(value["identity"]),
-        DataPurpose(value["purpose"]), Checkpoint(**value["checkpoint"]),
+        Checkpoint(**value["checkpoint"]),
         value["protocol_digest"], tuple(trials), value["observed_at"])
 
 
@@ -37,7 +37,7 @@ def canonical_record(record):
 
 
 def encode_manager(manager):
-    payload = {"schema_version": 1,
+    payload = {"schema_version": 2,
         "success_threshold": manager.success_bank.success_threshold,
         "failure_threshold": manager.failure_bank.failure_threshold,
         "records": [json.loads(canonical_record(row)) for row in manager.records],
@@ -50,7 +50,7 @@ def encode_manager(manager):
 def decode_manager(raw):
     from rift.banks.core import BankManager
     value = json.loads(raw)
-    if value.get("schema_version") != 1:
+    if value.get("schema_version") != 2:
         raise ValueError("unsupported bank manifest schema")
     digest = value.pop("manifest_digest", None)
     encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
@@ -63,9 +63,9 @@ def decode_manager(raw):
         if (event["task_ref"] != item.task_ref or event["checkpoint"] != asdict(item.checkpoint)
                 or event["sequence"] != index):
             raise ValueError("bank membership event binding mismatch")
-        if item.purpose in (DataPurpose.RETENTION_FEEDBACK, DataPurpose.REPLAY_LOGP_FEEDBACK) and item.state(success_threshold=manager.success_bank.success_threshold) is CapabilityState.MASTERED_CANDIDATE:
+        if item.purpose in (DataPurpose.BANK_CANDIDATE, DataPurpose.REPLAY_LOGP_FEEDBACK) and item.state(success_threshold=manager.success_bank.success_threshold) is CapabilityState.MASTERED_CANDIDATE:
             manager.success_bank.add(item)
-        if item.purpose in (DataPurpose.DIAGNOSIS, DataPurpose.RECOVERY_FEEDBACK) and item.state(failure_threshold=manager.failure_bank.failure_threshold) is CapabilityState.ACTIVE_WEAKNESS:
+        if item.purpose is DataPurpose.BANK_CANDIDATE and item.state(failure_threshold=manager.failure_bank.failure_threshold) is CapabilityState.ACTIVE_WEAKNESS:
             manager.failure_bank.add(item)
         manager.records.append(item)
     manager.events = [BankMembershipEvent(e["event_id"], e["task_ref"], e["bank"],

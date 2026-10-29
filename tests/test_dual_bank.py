@@ -1,5 +1,4 @@
 """Offline dual-bank protocol tests; scripted and fake records are not model evidence."""
-from dataclasses import replace
 import json
 
 import pytest
@@ -10,7 +9,6 @@ from rift.banks.records import (CapabilityState, EvidenceLevel, ObservedTrial,
     TaskEvidenceRecord)
 from rift.benchmark.public_feedback import PublicEvent, PublicSummary
 from rift.loop import LoopState, PendingDesignerAction, Stage
-from rift.probes.records import ProbeSnapshot
 from rift.probes.runner import ProbeRunner
 from rift.probes.selection import ProbeSelector
 from rift.probes.storage import JsonProbeEvidenceStore
@@ -21,8 +19,7 @@ from rift.schemas import (Checkpoint, DataPurpose, Identity, Outcome, Split,
 from rift.replay.splits import SplitRegistry
 from rift.tasks import Certification, CertificationStatus
 from rift.training.contracts import CompletedUpdate, UpdateRequest
-from rift.training.records import (DesignerFeedback, comparable_designer_rollouts,
-    prepare_designer_update, service_rollout)
+from rift.training.records import prepare_designer_update, service_rollout
 from rift.verl.coordinator import prepare_dual_bank_round
 
 
@@ -49,7 +46,7 @@ class ScriptedBootstrapEvaluator:
         self.counts[task_ref] = index + 1
         outcome = self.outcomes[task_ref][index]
         summary = None
-        if self.purpose_by_task[task_ref] is DataPurpose.DIAGNOSIS:
+        if self.purpose_by_task[task_ref] is DataPurpose.BANK_CANDIDATE:
             summary = PublicSummary((PublicEvent('user', '公开退款申请'),), outcome)
         return ObservedTrial(task_ref, f'{task_ref}-trial-{index}', checkpoint, seed,
             outcome, protocol_digest, None if outcome is Outcome.UNKNOWN else f'scripted:{task_ref}:{index}',
@@ -63,19 +60,19 @@ class AcceptBootstrapEvidence:
 
 def make_bootstrap(tmp_path):
     refs = {
-        'diag': (DataPurpose.DIAGNOSIS, Split.TRAIN, [Outcome.FAILURE] * 4),
-        'recovery-a': (DataPurpose.RECOVERY_FEEDBACK, Split.VALIDATION,
+        'diag': (DataPurpose.BANK_CANDIDATE, Split.TRAIN, [Outcome.FAILURE] * 4),
+        'recovery-a': (DataPurpose.BANK_CANDIDATE, Split.VALIDATION,
                        [Outcome.SUCCESS, Outcome.FAILURE, Outcome.FAILURE, Outcome.FAILURE]),
-        'recovery-b': (DataPurpose.RECOVERY_FEEDBACK, Split.VALIDATION, [Outcome.FAILURE] * 4),
-        'recovery-c': (DataPurpose.RECOVERY_FEEDBACK, Split.VALIDATION,
+        'recovery-b': (DataPurpose.BANK_CANDIDATE, Split.VALIDATION, [Outcome.FAILURE] * 4),
+        'recovery-c': (DataPurpose.BANK_CANDIDATE, Split.VALIDATION,
                        [Outcome.SUCCESS, Outcome.FAILURE, Outcome.FAILURE, Outcome.FAILURE]),
-        'retention-a': (DataPurpose.RETENTION_FEEDBACK, Split.VALIDATION,
+        'retention-a': (DataPurpose.BANK_CANDIDATE, Split.VALIDATION,
                         [Outcome.SUCCESS] * 3 + [Outcome.FAILURE]),
-        'retention-b': (DataPurpose.RETENTION_FEEDBACK, Split.VALIDATION, [Outcome.SUCCESS] * 4),
-        'retention-c': (DataPurpose.RETENTION_FEEDBACK, Split.VALIDATION, [Outcome.SUCCESS] * 4),
-        'unknown': (DataPurpose.DIAGNOSIS, Split.TRAIN, [Outcome.UNKNOWN] * 4),
+        'retention-b': (DataPurpose.BANK_CANDIDATE, Split.VALIDATION, [Outcome.SUCCESS] * 4),
+        'retention-c': (DataPurpose.BANK_CANDIDATE, Split.VALIDATION, [Outcome.SUCCESS] * 4),
+        'unknown': (DataPurpose.BANK_CANDIDATE, Split.TRAIN, [Outcome.UNKNOWN] * 4),
     }
-    manifest = tuple(BootstrapTask(key, identity(key, purpose, split), purpose)
+    manifest = tuple(BootstrapTask(key, identity(key, purpose, split))
                      for key, (purpose, split, _) in refs.items())
     evaluator = ScriptedBootstrapEvaluator({key: outcomes for key, (_, _, outcomes) in refs.items()},
         {key: purpose for key, (purpose, _, _) in refs.items()})
@@ -114,7 +111,7 @@ class ScriptedAfterEvaluator:
             EvidenceLevel.SCRIPTED_USAMI)
 
 
-def test_bootstrap_keeps_unknown_separate_and_diagnosis_is_allowlisted(tmp_path):
+def test_bootstrap_uses_unlabelled_bank_candidates_and_keeps_unknown_unresolved(tmp_path):
     result = make_bootstrap(tmp_path)
     by_ref = {row.task_ref: row for row in result.records}
     assert by_ref['diag'].state() is CapabilityState.ACTIVE_WEAKNESS
@@ -122,10 +119,12 @@ def test_bootstrap_keeps_unknown_separate_and_diagnosis_is_allowlisted(tmp_path)
     assert by_ref['unknown'].state() is CapabilityState.UNRESOLVED
     assert by_ref['unknown'].success_rate is None
     assert by_ref['unknown'] not in result.bank_manager.failure_bank.records
-    diagnosis = public_projection(by_ref['diag'])
-    assert 'diag' not in repr(diagnosis) and 'source-diag' not in repr(diagnosis)
-    assert 'evidence_ref' not in repr(diagnosis) and 'strict_task_success' not in repr(diagnosis)
-    assert diagnosis.summary.outcome is Outcome.FAILURE
+    failure = public_projection(by_ref['diag'])
+    assert failure.task_ref == 'diag'
+    assert 'source-diag' not in repr(failure)
+    assert 'evidence_ref' not in repr(failure) and 'strict_task_success' not in repr(failure)
+    assert failure.summary.outcome is Outcome.FAILURE
+    assert all(row.purpose is DataPurpose.BANK_CANDIDATE for row in result.records)
     assert all(row.evidence_levels == {EvidenceLevel.SCRIPTED_USAMI} for row in result.records)
     path = tmp_path / 'banks.json'
     result.bank_manager.save(path)
@@ -139,14 +138,14 @@ def test_bootstrap_keeps_unknown_separate_and_diagnosis_is_allowlisted(tmp_path)
 
 def test_versioned_split_policy_preserves_legacy_and_allows_same_family_instances(tmp_path):
     training = identity('train', DataPurpose.TRAIN, Split.TRAIN)
-    feedback = identity('feedback', DataPurpose.RECOVERY_FEEDBACK, Split.VALIDATION)
+    feedback = identity('feedback', DataPurpose.BANK_CANDIDATE, Split.VALIDATION)
     with pytest.raises(ValueError, match='overlap'):
         SplitRegistry((training, feedback), policy_version=STRICT_FAMILY_DISJOINT_V1)
     registry = SplitRegistry((training, feedback),
         policy_version=INSTANCE_DISJOINT_WITHIN_FAMILY_V1)
     assert training.family == feedback.family and training.task != feedback.task
     same_instance_other_purpose = Identity(training.world, training.task, training.family,
-        training.lineage, Split.VALIDATION, DataPurpose.RECOVERY_FEEDBACK)
+        training.lineage, Split.VALIDATION, DataPurpose.BANK_CANDIDATE)
     with pytest.raises(ValueError, match='overlap'):
         SplitRegistry((training, same_instance_other_purpose),
             policy_version=INSTANCE_DISJOINT_WITHIN_FAMILY_V1)
@@ -168,7 +167,7 @@ def test_random_probe_freeze_is_reproducible_private_and_instance_disjoint(tmp_p
     selector = ProbeSelector(record_verifier=AcceptRecordEvidence(), allow_nonreal=True)
     args = dict(recovery_candidates=[rows['recovery-a'], rows['recovery-b'], rows['recovery-c']],
         retention_candidates=[rows['retention-a'], rows['retention-b'], rows['retention-c']],
-        diagnosis_identities=(rows['diag'].identity,), train_package_identities=(training,),
+        train_package_identities=(training,),
         split_registry=registry, before_checkpoint=BEFORE, recovery_tasks=1,
         retention_tasks=1, seed=0, protocol_ref='protocol-v1', protocol_digest=bootstrap.protocol_digest)
     recovery1, retention1 = selector.freeze(**args, frozen_at_ns=1)
@@ -179,9 +178,8 @@ def test_random_probe_freeze_is_reproducible_private_and_instance_disjoint(tmp_p
     assert recovery1.probes[0].identity.family == training.family
     assert recovery1.probes[0].task_ref not in repr(public_projection(rows['diag']))
     with pytest.raises(ValueError, match='insufficient'):
-        selector.freeze(**{**args, 'diagnosis_identities':
-            (rows['diag'].identity, rows['recovery-a'].identity,
-             rows['recovery-b'].identity, rows['recovery-c'].identity)})
+        selector.freeze(**{**args, 'train_package_identities':
+            tuple(rows[key].identity for key in ('recovery-a', 'recovery-b', 'recovery-c'))})
     assert all(row.purpose is DataPurpose.RECOVERY_FEEDBACK for row in recovery1.probes)
     store = JsonProbeEvidenceStore(tmp_path / 'probe-store')
     store.save_snapshot(recovery1); store.save_snapshot(retention1)
@@ -198,7 +196,7 @@ def test_scripted_probe_runner_persists_trials_but_cannot_claim_learning_reward(
     recovery, retention = ProbeSelector(record_verifier=AcceptRecordEvidence(),
         allow_nonreal=True).freeze(recovery_candidates=[records['recovery-a'], records['recovery-b']],
         retention_candidates=[records['retention-a'], records['retention-b']],
-        diagnosis_identities=(records['diag'].identity,), train_package_identities=(training,),
+        train_package_identities=(training,),
         split_registry=registry, before_checkpoint=BEFORE, recovery_tasks=1,
         retention_tasks=1, seed=3, protocol_ref='protocol-v1', protocol_digest=bootstrap.protocol_digest)
     runner = ProbeRunner(ScriptedAfterEvaluator(), AcceptProbeEvidence())
@@ -286,7 +284,7 @@ def test_dual_bank_loop_freeze_baseline_and_restore(tmp_path):
     recovery, retention = ProbeSelector(record_verifier=AcceptRecordEvidence(),
         allow_nonreal=True).freeze(recovery_candidates=[rows['recovery-a'], rows['recovery-b']],
         retention_candidates=[rows['retention-a'], rows['retention-b']],
-        diagnosis_identities=(rows['diag'].identity,), train_package_identities=(training,),
+        train_package_identities=(training,),
         split_registry=registry, before_checkpoint=BEFORE, recovery_tasks=1,
         retention_tasks=1, seed=4, protocol_ref='protocol-v1', protocol_digest=bootstrap.protocol_digest)
     runner = ProbeRunner(ScriptedAfterEvaluator(), AcceptProbeEvidence())
@@ -331,7 +329,6 @@ def test_mock_coordinator_persists_frozen_probes_and_resumes_before_training(tmp
         allow_nonreal=True).freeze(
             recovery_candidates=[rows['recovery-a'], rows['recovery-b']],
             retention_candidates=[rows['retention-a'], rows['retention-b']],
-            diagnosis_identities=(rows['diag'].identity,),
             train_package_identities=(training,), split_registry=registry,
             before_checkpoint=BEFORE, recovery_tasks=1, retention_tasks=1,
             seed=31, protocol_ref='protocol-v1',

@@ -6,23 +6,20 @@ import json
 from typing import Protocol, Sequence
 
 from rift.banks.core import BankManager
-from rift.banks.records import EvidenceLevel, ObservedTrial, TaskEvidenceRecord
-from rift.schemas import Checkpoint, DataPurpose, Identity
+from rift.banks.records import ObservedTrial, TaskEvidenceRecord
+from rift.schemas import Checkpoint, DataPurpose, Identity, Split
 
 
 @dataclass(frozen=True)
 class BootstrapTask:
     task_ref: str
     identity: Identity
-    purpose: DataPurpose
 
     def __post_init__(self):
-        if not self.task_ref or not isinstance(self.identity, Identity) or not isinstance(self.purpose, DataPurpose):
-            raise ValueError("bootstrap task requires opaque reference, identity and purpose")
-        if self.identity.purpose is not self.purpose:
-            raise ValueError("bootstrap task requires an identity with the same explicit purpose")
-        if self.purpose in (DataPurpose.TRAIN, DataPurpose.TEST, DataPurpose.VALIDATION):
-            raise ValueError("bootstrap bank construction cannot consume train, validation or final-test tasks")
+        if (not self.task_ref or not isinstance(self.identity, Identity)
+                or self.identity.purpose is not DataPurpose.BANK_CANDIDATE
+                or self.identity.split is Split.TEST):
+            raise ValueError("bootstrap tasks must be unlabelled non-TEST bank candidates")
 
 
 class BootstrapEvaluator(Protocol):
@@ -94,7 +91,7 @@ class BootstrapRunner:
                 if self.evidence_verifier.verify_trial(result, task) is not True:
                     raise ValueError("bootstrap trial evidence was not verified")
                 trials.append(result)
-            record = TaskEvidenceRecord(task.task_ref, task.identity, task.purpose,
+            record = TaskEvidenceRecord(task.task_ref, task.identity,
                 checkpoint, protocol_hash, tuple(trials), observed_at)
             manager.observe(record, event_id=f"bootstrap-{len(records):06d}-{task.task_ref}")
             records.append(record)

@@ -86,8 +86,7 @@ class RecordedDesignerActionVerifier:
         self.call_resolver = call_resolver
         self.attestor = attestor
 
-    def verify_designer_action(self, tokens, checkpoint, package_id, rollout_id, group_id=None,
-                               target_ability_id=None):
+    def verify_designer_action(self, tokens, checkpoint, package_id, rollout_id, group_id=None):
         matches = [t for t in self.traces if t.role == 'designer' and t.rollout_id == rollout_id
                    and t.package_id == package_id and t.policy == checkpoint and t.tokens == tokens]
         if len(matches) != 1:
@@ -98,11 +97,11 @@ class RecordedDesignerActionVerifier:
             return False
         request, response = call
         return (request.get('group_id') == group_id
-                and request.get('target_ability_id') == target_ability_id
                 and trace.request_digest == digest(request) and trace.response_digest == digest(response)
                 and self.attestor.verify_capture(trace, request, response) is True)
 
-    def verify_designer_hypothesis(self, rollout_id, hypothesis):
+    def verify_designer_proposal(self, rollout_id, proposal, *,
+                                 visible_failure_refs=None, ability_options=None):
         matches = [trace for trace in self.traces if trace.role == 'designer'
                    and trace.rollout_id == rollout_id]
         if len(matches) != 1:
@@ -112,8 +111,24 @@ class RecordedDesignerActionVerifier:
         if call is None:
             return False
         request, response = call
+        from dataclasses import asdict
+        selected = asdict(proposal)
+        selected['diagnosis_task_refs'] = list(selected['diagnosis_task_refs'])
+        selected['remove_failure_task_refs'] = list(selected['remove_failure_task_refs'])
+        recorded_options = request.get('ability_options', ())
+        recorded_failures = request.get('visible_failure_refs', ())
+        expected_options = None if ability_options is None else [
+            {'ability_id': row.ability_id, 'description': row.description,
+             'failure_task_refs': list(row.failure_task_refs)} for row in ability_options]
+        available = {row['ability_id']: set(row['failure_task_refs']) for row in recorded_options}
+        visible = set(recorded_failures)
         return (trace.request_digest == digest(request)
                 and trace.response_digest == digest(response)
                 and self.attestor.verify_capture(trace, request, response) is True
-                and any(row.get('hypothesis') == hypothesis
-                        for row in response.get('parsed_proposals', ())))
+                and selected in response.get('parsed_proposals', ())
+                and (visible_failure_refs is None or tuple(recorded_failures) == tuple(visible_failure_refs))
+                and (expected_options is None or list(recorded_options) == expected_options)
+                and (proposal.ability_id == 'NEW' or proposal.ability_id in available)
+                and set(proposal.diagnosis_task_refs).issubset(visible)
+                and set(proposal.remove_failure_task_refs).issubset(
+                    available.get(proposal.ability_id, set())))

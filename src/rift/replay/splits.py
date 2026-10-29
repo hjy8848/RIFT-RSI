@@ -19,9 +19,6 @@ class SplitRegistry:
                 continue
             if identity.split != row.split:
                 raise ValueError("cross-split identity overlap under " + self.policy_version)
-            if (identity.purpose is not None and row.purpose is not None
-                    and identity.purpose != row.purpose):
-                raise ValueError("cross-purpose identity overlap under " + self.policy_version)
         if identity not in self._identities: self._identities.append(identity)
     def contains(self, identity):
         return identity in self._identities

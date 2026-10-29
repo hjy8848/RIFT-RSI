@@ -30,10 +30,8 @@ class CertifiedTaskRegistry:
         if not isinstance(identity, Identity): return False
         expected = {
             DataPurpose.TRAIN: (Split.TRAIN, ("train",)),
-            DataPurpose.DIAGNOSIS: (Split.TRAIN, ("train",)),
-            DataPurpose.RECOVERY_FEEDBACK: (Split.VALIDATION, ("validation", "heldout")),
-            DataPurpose.RETENTION_FEEDBACK: (Split.VALIDATION, ("validation", "heldout")),
-            DataPurpose.REPLAY_LOGP_FEEDBACK: (Split.REPLAY, ("train", "validation", "heldout")),
+            DataPurpose.BANK_CANDIDATE: (None, ("train", "validation")),
+            DataPurpose.REPLAY_LOGP_FEEDBACK: (Split.REPLAY, ("train", "validation")),
             DataPurpose.VALIDATION: (Split.VALIDATION, ("validation",)),
             DataPurpose.TEST: (Split.TEST, ("heldout",)),
         }
@@ -43,6 +41,10 @@ class CertifiedTaskRegistry:
             expected_split, partitions = Split.TRAIN, ("train",)
         else:
             expected_split, partitions = expected[purpose]
+            if purpose is DataPurpose.BANK_CANDIDATE:
+                expected_split = (Split.TRAIN if task.partition == "train"
+                                  else Split.VALIDATION if task.partition == "validation"
+                                  else None)
         if (identity.split is not expected_split
                 or not self.split_registry.contains(identity) or identity.task != task.record_hash
                 or identity.world != world.state_hash or task.partition not in partitions
