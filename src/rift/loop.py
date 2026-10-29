@@ -260,12 +260,14 @@ class LoopState:
                 or self.reward_mode not in (RewardMode.REPLAY_LOGP_V1.value,
                                              RewardMode.DUAL_BANK_OUTCOME_V1.value)
                 or package.stats is not None
-                or len(rows) != len(package.designer_task_refs)
+                or len(rows) < len(package.designer_task_refs)
+                or len({row.task_ref for row in rows if isinstance(row, Certification)}) != len(rows)
                 or any(not isinstance(row, Certification)
                        or row.proposal_id != package.proposal_id
                        or row.status is not CertificationStatus.CERTIFIED
                        for row in rows)
-                or tuple(row.task_ref for row in rows) != package.designer_task_refs):
+                or tuple(row.task_ref for row in rows[:len(package.designer_task_refs)])
+                    != package.designer_task_refs):
             raise ValueError('Designer certifications do not bind the one frozen task package')
         return self._next(Stage.CERTIFIED, task_refs=package.task_refs,
             protocol_version=3, reward_mode=RewardMode.DUAL_BANK_OUTCOME_V1.value,

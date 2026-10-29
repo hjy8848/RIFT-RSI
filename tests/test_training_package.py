@@ -53,11 +53,11 @@ def _native_fixture():
     plan = Proposal('decision-1', 'evidence before action', ability_id='NEW',
         diagnosis_task_refs=('failure-1', 'failure-2'),
         world_draft=scenario_draft('designer-world').model_dump(mode='json', exclude={'record_hash'}),
-        challenges=(_challenge('focused-a'), _challenge('focused-b')))
+        challenges=tuple(_challenge(f'focused-{index}') for index in range(8)))
     designer_world = designer_host.certify_training_plan(plan, world_seed=73)
     assert designer_world.build.status == 'SAT'
     assert designer_world.build_verification['verified'] is True
-    assert len(designer_world.tasks) == len(designer_world.certifications) == 2
+    assert len(designer_world.tasks) == len(designer_world.certifications) == 8
     assert designer_world.tasks[0].world_hash == designer_world.tasks[1].world_hash
 
     task_registry = designer_host.task_registry
@@ -66,7 +66,8 @@ def _native_fixture():
     benchmark_host = _host(distribution, split_registry, task_registry,
         worlds=(('benchmark-world', benchmark_spec, benchmark_build),))
     benchmark_refs = []
-    for task_id in ('general-a', 'general-b', 'general-c', 'general-d'):
+    for index in range(8):
+        task_id = f'general-{index}'
         challenge = _challenge(task_id)
         proposal = Proposal(task_id, challenge['hypothesis'], 'Please refund',
             json.dumps(_challenge(task_id)))
@@ -100,7 +101,7 @@ def test_native_one_world_multi_challenge_mixed_package_and_state_restore(tmp_pa
     fixture = native_fixture
     plan, host, result, task_registry, pool, split_registry, config, checkpoint = fixture
     package = _package(fixture)
-    assert len(result.tasks) == 2
+    assert len(result.tasks) == 8
     assert len(package.designer_task_refs) == len(package.benchmark_task_refs) == 2
     assert set(package.designer_task_refs).isdisjoint(package.benchmark_task_refs)
     assert set(package.task_refs) == set(package.designer_task_refs) | set(package.benchmark_task_refs)
@@ -109,6 +110,18 @@ def test_native_one_world_multi_challenge_mixed_package_and_state_restore(tmp_pa
     assert all(task_registry.resolve_record(ref).task.partition == 'train'
                for ref in package.task_refs)
     assert host.task_registry is task_registry
+
+    full_config = TrainingPackageConfig(tasks_per_round=16, designer_fraction=.5,
+        benchmark_fraction=.5, sampling_seed=211, group_size=4)
+    full_package = assemble_training_package(package_id='package-default-8-plus-8',
+        proposal=plan, designer_action_ref='d' * 32, target_ability_id='A000001',
+        designer_result=result, benchmark_pool=pool, task_registry=task_registry,
+        service_checkpoint_before=package.service_checkpoint_before,
+        config=full_config, round_index=0)
+    assert len(full_package.designer_task_refs) == len(full_package.benchmark_task_refs) == 8
+    assert len(full_package.task_refs) == 16
+    assert all(task_registry.resolve_record(ref).certificate.status == 'CERTIFIED'
+               for ref in full_package.task_refs)
 
     # Both episodes start from the same frozen World record. Native Usami clones
     # its initial state for each run, so the stored World remains unchanged.
