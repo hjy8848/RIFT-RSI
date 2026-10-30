@@ -1,7 +1,5 @@
-"""Optional Service LLM integration; benchmark core stays independent."""
-from usami.service.client import CompletionClient, OpenAICompatibleClient
-from usami.service.models import CustomerInput, Experiment, ModelSettings, ServiceTurn
-from usami.service.runner import ServiceExecution, ServiceSession, replay_execution
+"""Service protocol modules retained by the embedded Usami v2 runtime.
 
-__all__ = ["CustomerInput", "Experiment", "ModelSettings", "CompletionClient", "OpenAICompatibleClient",
-           "ServiceSession", "ServiceTurn", "ServiceExecution", "replay_execution"]
+Import concrete types from ``usami.service.models`` or ``usami.service.client``.
+The historical v0.1 session runner is not part of RIFT's embedded dependency set.
+"""

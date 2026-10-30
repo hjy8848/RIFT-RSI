@@ -1,13 +1,12 @@
-include README.md VERIFICATION.md constraints-tested.txt
-recursive-include configs *.json
-recursive-include examples *.py *.json
-recursive-include tests *.py
-recursive-include usami/service *.md
-recursive-include usami/customer *.md
-recursive-include usami/interaction *.md
-include web/README.md web/VERIFICATION.md web/run.py
-recursive-include web/frontend *.json *.html *.ts *.tsx *.css
-prune web/frontend/node_modules
-prune web/frontend/dist
-prune web/frontend/test-results
-prune web/frontend/playwright-report
+include README.md constraints-tested.txt
+recursive-include docs/benchmark-vnext *.md
+include tests/test_usami_v2_builder.py
+include tests/test_usami_v2_commerce.py
+include tests/test_usami_v2_contracts.py
+include tests/test_usami_v2_designer.py
+include tests/test_usami_v2_properties.py
+include tests/test_usami_v2_runtime.py
+include tests/test_usami_v2_task_certification.py
+include tests/test_usami_v2_tasks.py
+include tests/test_vast_skills.py
+global-exclude __pycache__ *.py[cod]

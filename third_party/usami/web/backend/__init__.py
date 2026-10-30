@@ -1,1 +1,0 @@
-"""World Explorer HTTP adapter."""

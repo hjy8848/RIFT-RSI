@@ -1,25 +1,18 @@
-"""P5 focused tests: two-stage proposal, provenance, proof and diagnostics."""
-import json
-from datetime import timedelta
-
+"""CPU contract tests for RIFT-facing Usami World and task compilation."""
 import pytest
 
 from vast_coevo.schema import digest
-from usami_v2.runtime.agents import AgentCall
-from usami.service.models import ModelSettings, ServiceError
 from usami_v2.scenarios.distribution import (
     BusinessSource, BusinessStratum, DistributionSpec, sample_schedule,
 )
 from usami_v2.scenarios.designer import (
-    DesignerTrainingEvidence, InformationDraft, OpenAIDesignerProvider, RemedyDraft, ScenarioDraft, TaskDraft,
-    _chat, compile_task, design_and_certify,
+    InformationDraft, RemedyDraft, ScenarioDraft, TaskDraft, compile_task,
+    task_design_capabilities,
 )
-from usami_v2.scenarios.task_certification import CustomerScenario, ProofBudget
+from usami_v2.scenarios.task_certification import CustomerScenario
 from usami_v2.scenarios.builder import build_world
 from usami_v2.scenarios.schema import SKUVariable
 from test_usami_v2_builder import scene
-
-
 def distribution_and_slot(seed):
     source = BusinessSource(source_id="unit-test-source", kind="synthetic_assumption",
                             reference="synthetic test fixture", version="1",
@@ -78,221 +71,9 @@ def replace_sealed(row, **updates):
     return type(row).model_validate(data)
 
 
-class RecordedDesigner:
-    def __init__(self, world, task):
-        self.world, self.task = world, task
-        self.contexts = []
-
-    def submit(self, phase, messages, model):
-        self.contexts.append((phase, messages))
-        output = self.world if phase == "world" else self.task
-        request = {"phase": phase, "messages": messages}
-        response = {"choices": [{"message": {"role": "assistant", "content": "offline fixture"}}]}
-        return output, AgentCall(role="designer", request=request, response=response)
-
-
-class CorrectingDesigner:
-    def __init__(self, world, invalid_task, valid_task):
-        self.world, self.tasks, self.contexts = world, [invalid_task, valid_task], []
-
-    def submit(self, phase, messages, model):
-        self.contexts.append((phase, messages))
-        output = self.world if phase == "world" else self.tasks.pop(0)
-        raw = {"phase": phase, "attempt": len(self.contexts)}
-        return output, AgentCall(role="designer", request=raw,
-            response={"choices": [{"message": {"role": "assistant", "content": "offline correction fixture"}}]})
-
-
-class TimeoutDesigner:
-    def __init__(self):
-        self.calls = 0
-        self.last_call = None
-
-    def submit(self, phase, messages, model):
-        self.calls += 1
-        request = {"phase": phase, "messages": messages}
-        self.last_call = AgentCall(role="designer", request=request,
-            response={"error": {"code": "PROVIDER_TIMEOUT",
-                                "provider_response": {"timeout_phase": "ReadTimeout"}}})
-        raise ServiceError("PROVIDER_TIMEOUT", "LLM request timed out; no retry performed",
-                           {"timeout_phase": "ReadTimeout"})
-
-
-class FixedCompletionClient:
-    def __init__(self, arguments):
-        self.settings = ModelSettings(model="offline-test", base_url="http://localhost/v1")
-        self.response = {"choices": [{"message": {"role": "assistant", "tool_calls": [{
-            "id": "call-1", "type": "function", "function": {
-                "name": "submit_customer_task", "arguments": arguments,
-            },
-        }]}, "finish_reason": "tool_calls"}]}
-
-    def complete(self, request):
-        return self.response
-
-
-def proof_customer(world, task):
-    return CustomerScenario(customer_id=task.customer_id,
-                           delegated_line_ids=tuple(row.line_id for row in task.remedy_goals),
-                           maximum_extra_charge_cents=2000,
-                           latest_arrival=world.clock + timedelta(days=3))
-
-
-def run_designer(seed, evidence):
-    distribution, slot = distribution_and_slot(seed)
-    training_hash = evidence.source_record_hash
-    provider = RecordedDesigner(scenario_draft(), task_draft((training_hash,)))
-    run = design_and_certify(provider, distribution, slot,
-        proof_budget=ProofBudget(max_plan_candidates=128, max_operation_steps=24, max_witnesses=2),
-        allowed_training_hashes=(training_hash,), training_evidence=(evidence,),
-        customer_scenario_factory=proof_customer, max_attempts=2)
-    return run, provider
-
-
-def test_two_stage_designer_builds_frozen_world_and_certified_task_with_provenance():
-    evidence = DesignerTrainingEvidence(
-        source_record_hash="a" * 64, partition="train",
-        summary="Service asked for confirmation before committing the quoted remedy.",
-        observed_events=({"kind": "service_reply", "text": "Please confirm the quote."},))
-    run, provider = run_designer(21, evidence)
-    assert run.status == "CERTIFIED"
-    assert len(run.calls) == 2 and [call.phase for call in run.calls] == ["world", "task"]
-    assert all(len(call.prompt_hash) == 64 for call in run.calls)
-    assert len(run.world_attempts) == len(run.build_attempts) == 1
-    assert run.world_attempts[0].status == "SAT"
-    assert run.task.partition == "train"
-    assert run.task.protocol == "commerce-task-v3"
-    assert "replacement" in run.task.customer_request
-    assert run.task.request_bundle.request_hash == digest(run.task.customer_request)
-    assert run.task.source_distribution_hash == run.distribution.record_hash
-    assert run.task.parent_training_evidence_hashes == (evidence.source_record_hash,)
-    assert run.certification.business_reachability_certified
-    assert run.pre_run_quality.business_valid and run.pre_run_quality.diagnosability
-    assert run.pre_run_quality.decision_power == "diagnostic_only"
-    task_context = json.loads(provider.contexts[1][1][1]["content"])
-    rendered = json.dumps(task_context, sort_keys=True)
-    assert evidence.source_record_hash in rendered
-    capabilities = task_context["available_context"]["task_certification_capabilities"]
-    assert capabilities["scenario_hash"] == run.scenario_spec.record_hash
-    assert capabilities["world_hash"] == run.build_result.world_hash
-    assert run.calls[1].capability_manifest_hash == digest(capabilities)
-    assert capabilities["information_goals_certifiable"] is False
-    assert capabilities["interaction_certifier_available"] is False
-    assert capabilities["delivery_confirmation_available"] is False
-    assert capabilities["supported_target_stages"] == ["settled"]
-    assert capabilities["return_receipt_event_configured"] is False
-    assert capabilities["policy_review_event_configured"] is False
-    sku_context = next(row for row in task_context["available_context"]["skus"] if row["alias"] == "original")
-    line_context = next(line for order in task_context["available_context"]["orders"]
-                        for line in order["lines"] if line["alias"] == "damaged")
-    assert sku_context["price_cents"] > 0 and sku_context["return_days"] == 30
-    assert line_context["line_paid_cents"] == 20000 and "delivered_days_ago" in task_context["available_context"]["orders"][0]
-    assert task_context["available_context"]["merchant_policy"]["refund_approval_limit_cents"] == 50000
-    def has_internal_id_key(value):
-        if isinstance(value, dict):
-            return any(key == "id" or has_internal_id_key(item) for key, item in value.items())
-        if isinstance(value, list):
-            return any(has_internal_id_key(item) for item in value)
-        return False
-    assert not has_internal_id_key(task_context["available_context"])
-    assert task_context["active_stratum"]["stratum_id"] == "single-order"
-    assert task_context["active_stratum"]["design_focus"] == ["damaged-item-remedy"]
-    assert "candidate_hash" not in rendered and "witness_hashes" not in rendered
-    assert run.pre_run_quality.novelty_status == "NOT_EVALUATED"
-    assert run.pre_run_quality.novel_against_history is None
-    assert run.pre_run_quality.candidate_consequence_diagnostics
-    assert run.pre_run_quality.quality_status == "business_certified_interaction_pending"
-
-
-def test_id_and_seed_renaming_do_not_create_new_decision_structure():
-    evidence = DesignerTrainingEvidence(source_record_hash="b" * 64, partition="train",
-                                        summary="A training-only interaction observation.")
-    left, _ = run_designer(31, evidence)
-    right, _ = run_designer(32, evidence)
-    assert left.build_result.world_hash != right.build_result.world_hash
-    assert set(dict(left.build_result.private_aliases).values()) != set(dict(right.build_result.private_aliases).values())
-    assert left.pre_run_quality.structural_signature == right.pre_run_quality.structural_signature
-    assert left.pre_run_quality.world_hash != right.pre_run_quality.world_hash
-
-
-def test_task_compiler_feedback_is_bounded_and_does_not_rebuild_frozen_world():
-    evidence = DesignerTrainingEvidence(source_record_hash="e" * 64, partition="train",
-                                        summary="A Service decision from a training episode.")
-    valid_template = task_draft((evidence.source_record_hash,))
-    goal_data = valid_template.remedy_goals[0].model_dump(mode="json", exclude={"record_hash"})
-    goal_data["line_alias"] = "unknown-line"
-    invalid = TaskDraft(task_id=valid_template.task_id, customer_alias=valid_template.customer_alias,
-        remedy_goals=(RemedyDraft.model_validate(goal_data),),
-        parent_training_evidence_hashes=valid_template.parent_training_evidence_hashes)
-    provider = CorrectingDesigner(scenario_draft(), invalid,
-                                  task_draft((evidence.source_record_hash,)))
-    distribution, slot = distribution_and_slot(63)
-    run = design_and_certify(provider, distribution, slot,
-        proof_budget=ProofBudget(max_plan_candidates=128, max_operation_steps=24, max_witnesses=2),
-        allowed_training_hashes=(evidence.source_record_hash,), training_evidence=(evidence,),
-        customer_scenario_factory=proof_customer, max_attempts=2)
-    assert run.status == "CERTIFIED"
-    assert len(run.calls) == 3 and [row.phase for row in run.calls] == ["world", "task", "task"]
-    assert len(run.build_attempts) == len(run.world_attempts) == 1
-    assert [row.status for row in run.task_attempts] == ["REJECTED", "CERTIFIED"]
-    correction = json.loads(provider.contexts[2][1][1]["content"])
-    assert any("unknown order-line alias" in row for row in correction["validator_feedback"])
-
-
-def test_provider_timeout_blocks_without_spending_proposal_correction_attempts():
-    provider = TimeoutDesigner()
-    distribution, slot = distribution_and_slot(64)
-    run = design_and_certify(provider, distribution, slot,
-        customer_scenario_factory=proof_customer, max_attempts=3)
-
-    assert run.status == "BLOCKED"
-    assert provider.calls == 1
-    assert len(run.calls) == len(run.world_attempts) == 1
-    assert run.world_attempts[0].status == "ERROR"
-    assert "world provider failed: PROVIDER_TIMEOUT" in run.validation_errors[0]
-    assert "proposal rejected" not in run.validation_errors[0]
-    assert run.calls[0].validation_feedback == ""
-
-
-@pytest.mark.parametrize("arguments,code,feedback", [
-    ("{}", "EMPTY_TOOL_ARGUMENTS", "empty object"),
-    ('{"task_id":"only"}', "DESIGNER_SCHEMA_INVALID", "customer_alias"),
-])
-def test_empty_and_incomplete_task_tool_calls_are_classified_and_preserved(arguments, code, feedback):
-    client = FixedCompletionClient(arguments)
-    provider = OpenAIDesignerProvider(client)
-    with pytest.raises(ServiceError) as error:
-        provider.submit("task", [{"role": "user", "content": "test"}], TaskDraft)
-    assert error.value.code == code
-    assert feedback in str(error.value)
-    assert provider.last_call is not None
-    assert provider.last_call.response == client.response
-    from usami_v2.scenarios.designer import _call_provenance
-    provenance = _call_provenance("task", provider.last_call)
-    assert len(provenance["prompt_hash"]) == 64
-    assert len(provenance["submission_schema_hash"]) == 64
-
-
-def test_post_run_quality_is_separate_diagnostic_not_a_selection_rule():
-    from usami_v2.scenarios.designer import post_run_quality
-    evidence = DesignerTrainingEvidence(source_record_hash="c" * 64, partition="train",
-                                        summary="Training sample")
-    run, _ = run_designer(41, evidence)
-    fake_episode = type("Episode", (), {
-        "record_hash": "d" * 64,
-        "replay_verified": True,
-        "outcome": type("Result", (), {"strict_task_success": False, "final_goal_reached": False})(),
-        "tool_executions": (), "status": "agent_error", "model_calls": (), "total_tokens": 0,
-    })()
-    vector = post_run_quality(run.pre_run_quality, fake_episode)
-    assert vector.decision_power == "diagnostic_only"
-    assert vector.strict_task_success is False and vector.model_calls == 0
-
-
 def test_task_intent_is_structured_and_the_host_renders_the_public_request():
-    evidence = DesignerTrainingEvidence(source_record_hash="f" * 64, partition="train",
-                                        summary="Training evidence.")
-    draft = task_draft((evidence.source_record_hash,))
+    evidence_hash = "f" * 64
+    draft = task_draft((evidence_hash,))
     schema = TaskDraft.model_json_schema()
     assert "customer_request" not in schema["properties"]
     remedy_schema = schema["$defs"]["RemedyDraft"]["properties"]
@@ -303,7 +84,7 @@ def test_task_intent_is_structured_and_the_host_renders_the_public_request():
     scenario = scenario_draft("structured-intent").compile(distribution)
     built = build_world(scenario, slot.seed)
     task = compile_task(draft, scenario, built, distribution,
-                        allowed_training_hashes=(evidence.source_record_hash,))
+                        allowed_training_hashes=(evidence_hash,))
     assert task.protocol == "commerce-task-v3"
     assert "replacement" in task.customer_request
     assert task.request_bundle.intent_hash
@@ -325,24 +106,15 @@ def test_structured_information_objective_does_not_need_a_quoted_question():
     assert "refund status" in task.customer_request
 
 
-def test_task_schema_and_prompt_do_not_ask_for_natural_language_matching():
-    schema = TaskDraft.model_json_schema()["$defs"]["RemedyDraft"]["properties"]
-    assert "public_request_span" not in schema
-    assert "subject_mention" not in schema
-    assert "structured" in schema["allowed_remedies"]["description"]
-    assert "actual receipt" in schema["target_stage"]["description"]
-
-    from usami_v2.scenarios.designer import _tool_schema
-    task_schema = _tool_schema("submit_customer_task", TaskDraft)["function"]["parameters"]
-    assert "record_hash" not in json.dumps(task_schema)
+def test_task_schema_is_structured_and_has_no_internal_record_fields():
+    schema = TaskDraft.model_json_schema()
+    remedy_schema = schema["$defs"]["RemedyDraft"]["properties"]
+    assert "customer_request" not in schema["properties"]
+    assert "public_request_span" not in remedy_schema
+    assert "subject_mention" not in remedy_schema
+    assert "structured" in remedy_schema["allowed_remedies"]["description"]
+    assert "actual receipt" in remedy_schema["target_stage"]["description"]
     assert "replacement-compatibility group" in SKUVariable.model_json_schema()["properties"]["family"]["description"]
-
-    distribution, slot = distribution_and_slot(65)
-    messages = _chat("task", {"world_hash": "a" * 64}, distribution, slot,
-                     errors=("unknown order-line alias",))
-    instruction = messages[0]["content"]
-    assert "do not write customer_request" in instruction
-    assert "without matching keywords or substrings" in instruction
 
 
 def test_natural_product_names_and_replacement_intent_compile_against_frozen_world():
@@ -362,15 +134,6 @@ def test_natural_product_names_and_replacement_intent_compile_against_frozen_wor
     assert task.remedy_goals[0].line_id == dict(built.private_aliases)["damaged"]
     assert task.remedy_goals[0].target_stage == "settled"
     assert task.remedy_goals[0].allowed_remedies == ("exchange", "reship")
-
-    provider = RecordedDesigner(scenario_draft("natural-product", natural_product_names=True), draft)
-    run = design_and_certify(provider, distribution, slot,
-        proof_budget=ProofBudget(max_plan_candidates=128, max_operation_steps=24, max_witnesses=2),
-        customer_scenario_factory=proof_customer, max_attempts=1)
-    assert run.status == "CERTIFIED"
-    context = json.loads(provider.contexts[1][1][1]["content"])["available_context"]
-    assert context["task_certification_capabilities"]["delivery_confirmation_available"] is False
-    assert context["task_certification_capabilities"]["information_goals_certifiable"] is False
 
 
 def test_broad_electronics_category_does_not_make_laptop_and_mouse_compatible():

@@ -1,14 +1,12 @@
 """Offline native-Usami coverage for the single-World mixed training package."""
 import json
-import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
-from test_usami_v2_designer import distribution_and_slot, scenario_draft
+from rift_usami_fixtures import distribution_and_slot, scenario_draft
 from usami_v2.scenarios.builder import build_world
 from usami_v2.scenarios.task_certification import ProofBudget
 
@@ -126,7 +124,7 @@ def test_native_one_world_multi_challenge_mixed_package_and_state_restore(tmp_pa
 
     # Both episodes start from the same frozen World record. Native Usami clones
     # its initial state for each run, so the stored World remains unchanged.
-    from test_usami_v2_runtime import ScriptedCustomer, ScriptedRefundService
+    from rift_usami_fixtures import ScriptedCustomer, ScriptedRefundService
     from rift.benchmark.usami import public_episode
     host.customer_agent = ScriptedCustomer()
     record_a = task_registry.resolve_record(package.designer_task_refs[0])

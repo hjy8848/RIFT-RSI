@@ -7,9 +7,6 @@ from vast_coevo.schema import atomic_json, digest
 from usami_v2 import PROTOCOL
 from usami_v2.contracts import CommunicationObligation, FactEvidence, PublicRequest, ServiceMessage
 from usami_v2.commerce.models import Operation, PARAMETERS, Quote, World
-from usami_v2.evaluation.checkpoints import DecisionCheckpoint
-from usami_v2.evaluation.challenge_quality import ChallengeDescriptor, PreRunQuality, PreRunQualityV1
-from usami_v2.evaluation.readiness import ReadinessPolicy, ReadinessReport
 from usami_v2.runtime.observations import WorkingState
 from usami_v2.scenarios.builder import BuildResult, build_world, verify_build
 from usami_v2.scenarios.distribution import DistributionSpec
@@ -33,19 +30,13 @@ def contract_schemas():
         OfferPresentation, PrivateCustomerFact,
     )
     from usami_v2.runtime.runner import EpisodeBudget, EpisodeEvent, EpisodeRecord, EpisodeReplay, ToolExecution
-    from usami_v2.scenarios.designer import (
-        CandidateConsequenceDiagnostic, ChallengeQualityVector, ChallengeQualityVectorV1,
-        DesignerCall, DesignerRun, DesignerTrainingEvidence, PostRunQualityVector,
-        ScenarioDraft, TaskDesignAttempt, TaskDraft, WorldDesignAttempt,
-    )
+    from usami_v2.scenarios.designer import ScenarioDraft, TaskDraft
     from usami_v2.scenarios.distribution import SamplingSlot
     from usami_v2.scenarios.tasks import GroundedRemedyGoal, TaskSpecV2
     from usami_v2.evaluation.outcomes import OutcomeV2
 
     models = (CommunicationObligation, FactEvidence, PublicRequest, ServiceMessage,
-              Quote, World, Operation, DecisionCheckpoint, ChallengeDescriptor,
-              PreRunQuality, PreRunQualityV1,
-              ReadinessPolicy, ReadinessReport, WorkingState, DistributionSpec,
+              Quote, World, Operation, WorkingState, DistributionSpec,
               ScenarioSpec, BuildBudget, BuildResult, RemedyGoal,
               InformationObjective, TaskSpec, CustomerScenario, ReviewPlan,
               ProofBudget, ProofStep, PlanCandidate, ProofAttempt, TaskCertification,
@@ -56,10 +47,7 @@ def contract_schemas():
               AuthorityProof, CustomerEvent, CustomerTransition,
               AgentMessage, AgentCall, CustomerPrompt, ServicePrompt, ServiceAction,
               EpisodeBudget, EpisodeEvent, EpisodeRecord, EpisodeReplay, ToolExecution,
-              SamplingSlot, ScenarioDraft, TaskDraft, DesignerCall, DesignerRun,
-              TaskDesignAttempt, WorldDesignAttempt, DesignerTrainingEvidence,
-              CandidateConsequenceDiagnostic, ChallengeQualityVectorV1, ChallengeQualityVector,
-              PostRunQualityVector)
+              SamplingSlot, ScenarioDraft, TaskDraft)
     schemas = {model.__name__: model.model_json_schema() for model in models}
     schemas["BusinessToolParameters"] = {
         "protocol": "commerce-tool-parameters-v1",
@@ -76,7 +64,7 @@ def export_schemas(root):
     for name, schema in schemas.items():
         atomic_json(root / (name + ".json"), schema, immutable=True)
     manifest = {
-        "protocol": "commerce-schema-bundle-v1", "research_protocol": PROTOCOL,
+        "protocol": "commerce-schema-bundle-v2", "research_protocol": PROTOCOL,
         "schema_hashes": {name: digest(schema) for name, schema in schemas.items()},
         "model_calls": 0,
         "claim_boundary": "Contract schemas only; no business task, real-model run or readiness PASS.",
@@ -92,7 +80,7 @@ def verify_schemas(root):
     expected_hash = manifest.get("manifest_hash")
     if expected_hash != digest({k: v for k, v in manifest.items() if k != "manifest_hash"}):
         raise ValueError("schema manifest integrity differs")
-    if manifest.get("protocol") != "commerce-schema-bundle-v1" or manifest.get("model_calls") != 0:
+    if manifest.get("protocol") != "commerce-schema-bundle-v2" or manifest.get("model_calls") != 0:
         raise ValueError("unrecognized or falsely attributed contract artifact")
     expected = contract_schemas()
     if manifest.get("schema_hashes") != {name: digest(schema) for name, schema in expected.items()}:

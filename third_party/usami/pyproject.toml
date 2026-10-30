@@ -5,31 +5,28 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "usami"
 version = "0.2.0"
-description = "A Compositional Business World Benchmark for Interactive AI Agents"
+description = "RIFT-maintained Usami v2 Commerce runtime subset"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = ["pydantic>=2.12,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "jsonschema>=4,<5", "hypothesis>=6,<7"]
-web = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "httpx>=0.27,<1"]
 service = ["httpx>=0.27,<1", "jsonschema>=4,<5"]
 
 [project.urls]
-Repository = "https://github.com/hjy8848/Usami"
-
-[project.scripts]
-usami = "usami.__main__:main"
-usami-service = "usami.service.__main__:main"
-usami-interaction = "usami.interaction.__main__:main"
-usami-benchmark = "usami.benchmark.__main__:main"
-usami-cloudops = "usami_cloudops.__main__:main"
-usami-fulfillment = "usami_fulfillment.__main__:main"
-usami-stayops = "usami_stayops.__main__:main"
-usami-coevo = "integrations.usami.cli:main"
+Repository = "https://github.com/hjy8848/RIFT-RSI"
+Upstream = "https://github.com/hjy8848/Usami"
 
 [tool.setuptools.packages.find]
-include = ["usami*", "web", "web.backend*", "vast_coevo*", "integrations*", "rsi_core*"]
+where = ["."]
+include = [
+    "usami", "usami.service", "usami.world",
+    "usami_harness",
+    "usami_v2", "usami_v2.commerce", "usami_v2.evaluation",
+    "usami_v2.runtime", "usami_v2.scenarios",
+    "vast_coevo", "vast_coevo.skills",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

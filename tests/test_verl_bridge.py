@@ -322,9 +322,7 @@ def test_mock_coordinator_recovers_without_repeating_service_update():
 
 def test_native_usami_session_steps_through_real_runner_without_model():
     import json
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
-    from test_usami_v2_runtime import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
+    from rift_usami_fixtures import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.benchmark.usami import public_episode
     from rift.verl.usami_session import NativeUsamiSession
@@ -361,9 +359,7 @@ def test_native_usami_session_steps_through_real_runner_without_model():
 
 def test_native_budget_cancellation_is_unknown_and_replayable():
     import json
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
-    from test_usami_v2_runtime import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
+    from rift_usami_fixtures import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
     from usami_v2.runtime.runner import EpisodeBudget, replay_episode
     from rift.benchmark.usami import public_episode
     from rift.verl.usami_session import NativeUsamiSession
@@ -395,9 +391,7 @@ def test_native_budget_cancellation_is_unknown_and_replayable():
 def test_native_capture_builds_two_distinct_grouped_trajectories(tmp_path, monkeypatch):
     """Fake parser/attestor only; native Engine and Replay are real CPU code."""
     import json
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
-    from test_usami_v2_runtime import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
+    from rift_usami_fixtures import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.verl.usami_session import NativeUsamiSession
     from rift.verl.capture_store import NativeCaptureStore
@@ -474,9 +468,7 @@ def test_native_capture_builds_two_distinct_grouped_trajectories(tmp_path, monke
 def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkeypatch):
     """The native business runner is real; token generation and templates are test doubles."""
     import json
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
-    from test_usami_v2_runtime import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
+    from rift_usami_fixtures import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.verl.usami_session import NativeUsamiSession
     from rift.verl.capture_store import NativeCaptureStore
@@ -641,9 +633,7 @@ def test_designer_on_policy_capture_precedes_delayed_reward(tmp_path):
     assert not store.verify_designer_action(pending.trace.tokens, cp, 'package', pending.rollout_id, 'group')
 
 def test_native_session_abort_unblocks_waiting_runner():
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
-    from test_usami_v2_runtime import frozen, refund_task, refund_profile, ScriptedCustomer
+    from rift_usami_fixtures import frozen, refund_task, refund_profile, ScriptedCustomer
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.verl.usami_session import NativeUsamiSession
     world, aliases = frozen()
@@ -726,9 +716,7 @@ def test_probe_seed_reaches_customer_and_is_checkpoint_independent(monkeypatch):
     assert first.sampling_scope == second.sampling_scope
 
 def test_parser_runtime_failure_is_retained_as_unknown_native_episode(tmp_path):
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
-    from test_usami_v2_runtime import frozen, refund_task, refund_profile, ScriptedCustomer
+    from rift_usami_fixtures import frozen, refund_task, refund_profile, ScriptedCustomer
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.benchmark.usami import public_episode
     from rift.verl.usami_session import NativeUsamiSession
@@ -765,9 +753,7 @@ def test_parser_runtime_failure_is_retained_as_unknown_native_episode(tmp_path):
     assert store.verify_trajectory(episode, checkpoint)
 
 def test_malformed_service_tool_is_a_native_business_failure_not_runtime_abort():
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
-    from test_usami_v2_runtime import frozen, refund_task, refund_profile, ScriptedCustomer
+    from rift_usami_fixtures import frozen, refund_task, refund_profile, ScriptedCustomer
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.benchmark.usami import public_episode
     from rift.verl.usami_session import NativeUsamiSession

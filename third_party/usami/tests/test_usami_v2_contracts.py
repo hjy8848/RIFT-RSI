@@ -1,6 +1,4 @@
 """Executable P0 contracts. All evidence here is an offline test fixture."""
-from datetime import datetime, timezone
-
 import pytest
 from pydantic import ValidationError
 
@@ -10,13 +8,6 @@ from usami_v2.contracts import (
 )
 from usami_v2.evaluation.communication import evaluate_communication, render_fact
 from usami_v2.evaluation.outcomes import GoalResult, evaluate_outcome
-from usami_v2.evaluation.checkpoints import DecisionCheckpoint, CheckpointAttempt, compare_checkpoints
-from usami_v2.evaluation.challenge_quality import (
-    AlternativeEvidence, ChallengeDescriptor, Consequence, evaluate_challenge,
-)
-from usami_v2.evaluation.readiness import (
-    ReadinessPolicy, ReadinessEpisode, ReferenceContractCheck, binomial_interval, check_readiness,
-)
 from usami_v2.runtime.observations import ContextItem, WorkingFact, WorkingState, project
 from usami_v2.scenarios.distribution import (
     BusinessSource, BusinessStratum, DistributionSpec, GenerationAttempt,
@@ -226,176 +217,19 @@ def test_sampling_keeps_unknown_rejection_and_prevents_best_run_replacement():
         audit_sampling(spec, schedule, (unknown, success, same_world))
 
 
-def quality_descriptor():
-    outcome = Consequence(phase="choose", goal_effects=("replacement_completed",),
-                          constraint_effects=("deadline_met", "budget_met"),
-                          money_delta_cents=2000, delay_seconds=100)
-    return ChallengeDescriptor(
-        world_hash="world", task_hash="task", task_kind="transaction",
-        business_certificate_hash="business-proof", interaction_certificate_hash="interaction-proof",
-        goal_relations=("replacement_for_owned_line",), constraint_relations=("budget", "date"),
-        information_relations=("ask_for_deadline",), replay_inputs_hash="replay",
-        alternatives=tuple(AlternativeEvidence(
-            alternative_id=label, world_hash="world", task_hash="task", proof_hash="proof-" + label,
-            consequence=outcome) for label in ("sku_A", "sku_B")))
-
-
-def test_quality_counts_consequences_not_ids_and_is_not_a_performance_gate():
-    descriptor = quality_descriptor()
-    first = evaluate_challenge(descriptor, verify_proof=lambda ref: True)
-    assert first.consequence_class_lower_bound == 1
-    assert not first.consequence_count_exact
-    assert first.novelty_status == "NOT_EVALUATED"
-    assert first.novel_against_history is None
-    renamed = reseal(descriptor, alternatives=[
-        reseal(row, alternative_id="renamed" + str(i)).model_dump(mode="json")
-        for i, row in enumerate(descriptor.alternatives)])
-    second = evaluate_challenge(renamed, verify_proof=lambda ref: True,
-                                history_signatures=(first.structural_signature,))
-    assert second.structural_signature == first.structural_signature
-    assert second.novel_against_history is False
-    assert second.selection_power == "diagnostic_only"
-    repriced = reseal(descriptor, alternatives=[
-        reseal(row, consequence=reseal(row.consequence, money_delta_cents=9876, delay_seconds=777).model_dump(mode="json")).model_dump(mode="json")
-        for row in descriptor.alternatives])
-    assert evaluate_challenge(repriced, verify_proof=lambda ref: True).structural_signature == first.structural_signature
-    with pytest.raises(ValueError, match="search-completion"):
-        reseal(descriptor, search_complete=True)
-    with pytest.raises(ValueError, match="verified certificates"):
-        evaluate_challenge(descriptor, verify_proof=lambda ref: ref != "business-proof")
-    info = reseal(descriptor, task_kind="information", alternatives=[])
-    assert evaluate_challenge(info, verify_proof=lambda ref: True).business_valid
-
-
-def test_contract_bundle_exports_versioned_designer_capabilities_and_history_compatibility():
+def test_contract_bundle_exports_task_compiler_contracts_without_legacy_designer():
     from usami_v2.cli import contract_schemas
 
     schemas = contract_schemas()
     assert "TaskDesignCapabilities" in schemas
     assert "CustomerTaskScope" in schemas
-    assert "ChallengeQualityVectorV1" in schemas
-    assert "ChallengeQualityVector" in schemas
-    assert "PreRunQualityV1" in schemas and "PreRunQuality" in schemas
+    assert "ScenarioDraft" in schemas and "TaskDraft" in schemas
+    assert "DesignerRun" not in schemas
+    assert "ChallengeQualityVectorV1" not in schemas
+    assert "ChallengeQualityVector" not in schemas
+    assert "PreRunQualityV1" not in schemas and "PreRunQuality" not in schemas
     assert schemas["TaskDesignCapabilities"]["properties"]["protocol"]["default"] == \
         "commerce-task-design-capabilities-v1"
-
-
-def checkpoint():
-    return DecisionCheckpoint(
-        checkpoint_id="point", provenance="independent_validation", partition="validation",
-        source_record_hash="fresh-certificate", world_prestate_hash="same-world",
-        rules_version="commerce-2.0.0", identity="buyer", delegation_hash="delegation",
-        consent_hash="none", public_goal_history_hash="goals", visible_history_hash="history",
-        initial_working_state_hash="working", baseline_prompt_hash="base",
-        virtual_time=datetime(2026, 1, 15, tzinfo=timezone.utc).isoformat(),
-        event_cursor_hash="events", tool_schema_hash="tools", model_sampling_hash="model",
-        objective="choose replacement", subject_binding="line_A", evaluation_window="NEXT_DECISION",
-        continuation_policy_hash="no_continuation", max_model_calls=1, max_tool_calls=1,
-        training_lineage_excluded=True)
-
-
-def attempt(point, outcome, skill="old"):
-    return CheckpointAttempt(checkpoint=point, system_snapshot_hash=skill,
-                             injected_experience_hash=skill, execution_hash="execution-" + skill,
-                             replay_verified=True, outcome=outcome)
-
-
-def test_checkpoint_same_tool_is_not_same_information_and_query_is_not_repair():
-    point = checkpoint()
-    parent = attempt(point, "INCORRECT")
-    candidate = attempt(point, "CORRECT", "new")
-    result = compare_checkpoints(parent, candidate, verify_attempt=lambda row: True)
-    assert result.local_improvement is True
-    assert result.end_to_end_improvement == "not_evaluated"
-    acquired = attempt(reseal(point, visible_history_hash="extra inventory facts"), "CORRECT", "new")
-    result = compare_checkpoints(parent, acquired, verify_attempt=lambda row: True)
-    assert not result.equivalent_start and result.local_improvement is None
-    assert result.differing_fields == ("visible_history_hash",)
-    queried = attempt(point, "REQUEST_MORE_INFORMATION", "new")
-    assert compare_checkpoints(parent, queried, verify_attempt=lambda row: True).local_improvement is None
-    with pytest.raises(ValueError, match="independently replayed"):
-        compare_checkpoints(parent, candidate, verify_attempt=lambda row: False)
-    with pytest.raises(ValueError, match="exclude training"):
-        reseal(point, training_lineage_excluded=False)
-    training = reseal(point, provenance="diagnostic_training", partition="train", training_lineage_excluded=False)
-    assert not compare_checkpoints(attempt(training, "INCORRECT"), attempt(training, "CORRECT", "new"),
-                                   verify_attempt=lambda row: True).independent_validation
-
-
-def policy():
-    # Permissive constants test control flow, not a proposed research threshold.
-    return ReadinessPolicy(
-        status="FROZEN", environment_hash="env", model_hash="model", distribution_hash="distribution",
-        strata=(("synthetic", 12, 1),), confidence_level=.8, required_half_width=.49,
-        maximum_nonbusiness_rate=.99, maximum_customer_failure_rate=.99,
-        maximum_unresolved_rate=.99, minimum_opportunity_rate=.01,
-        minimum_verified_error_episodes=1, maximum_model_calls=500, maximum_tokens=100000,
-        maximum_wall_seconds=1000, sample_size_justification="Offline simulation for contract unit tests only")
-
-
-def readiness_evidence(value):
-    rows = tuple(ReadinessEpisode(
-        episode_id=str(i), world_hash="world" + str(i), independence_key="lineage" + str(i),
-        stratum_id="synthetic", environment_hash="env", model_hash="model", distribution_hash="distribution",
-        origin="scripted_fixture", purpose="formal_readiness", replay_hash="replay" + str(i),
-        decision_opportunity_proof_refs=("decision" + str(i),), verified_business_error_refs=("error",) if i == 0 else (),
-        model_calls=0, known_tokens=0, usage_complete=True, wall_seconds=100) for i in range(12))
-    reference = tuple(ReferenceContractCheck(check_id=name, passed=True, evidence_hash="proof-" + name)
-                      for name in value.required_contract_checks)
-    return rows, reference
-
-
-def readiness(value, rows, refs, **kwargs):
-    return check_readiness(value, rows, refs, verify_episode=lambda row: True,
-                           verify_reference=lambda row: True, elapsed_wall_seconds=200, **kwargs)
-
-
-def test_frozen_gate_rejects_missing_policy_and_scripts_never_prove_real_model_readiness():
-    draft = ReadinessPolicy(environment_hash="env", model_hash="model", distribution_hash="distribution")
-    with pytest.raises(ValueError, match="missing"):
-        reseal(draft, status="FROZEN")
-    with pytest.raises(ValueError, match="frozen"):
-        readiness(draft, (), ())
-    value = policy()
-    rows, refs = readiness_evidence(value)
-    report = readiness(value, rows, refs, mode="contract_test")
-    assert report.decision == "PASS" and not report.formal_learning_allowed
-    # Concurrency means elapsed time (200), not the sum of episode times (1200).
-    assert report.elapsed_wall_seconds == 200
-    formal = readiness(value, rows, refs)
-    assert formal.decision == "INCONCLUSIVE"
-    assert "scripted_evidence_is_not_a_real_S0_baseline" in formal.reasons
-    assert not formal.formal_learning_allowed
-
-
-def test_smoke_zero_errors_correlation_and_reference_failures_are_not_passes():
-    value = policy()
-    rows, refs = readiness_evidence(value)
-    smoke = tuple(reseal(row, purpose="smoke") for row in rows[:8])
-    result = readiness(value, smoke, refs, mode="contract_test")
-    assert result.decision == "INCONCLUSIVE" and "smoke_is_not_formal_readiness" in result.reasons
-    no_errors = tuple(reseal(row, verified_business_error_refs=[]) for row in rows)
-    assert "insufficient_natural_learnable_business_errors" in readiness(
-        value, no_errors, refs, mode="contract_test").reasons
-    repeated = rows[:-1] + (reseal(rows[-1], independence_key=rows[0].independence_key),)
-    with pytest.raises(ValueError, match="independent"):
-        readiness(value, repeated, refs, mode="contract_test")
-    failed_refs = refs[:-1] + (reseal(refs[-1], passed=False),)
-    assert readiness(value, rows, failed_refs, mode="contract_test").decision == "FAIL"
-    unknown_usage = rows[:-1] + (reseal(rows[-1], usage_complete=False),)
-    assert readiness(value, unknown_usage, refs, mode="contract_test").decision == "INCONCLUSIVE"
-
-
-def test_confidence_endpoints_are_exact_for_zero_and_all_successes():
-    alpha = .05
-    low, high = binomial_interval(0, 10, alpha)
-    assert low == 0 and high == pytest.approx(1 - (alpha / 2) ** (1 / 10), abs=1e-10)
-    low2, high2 = binomial_interval(10, 10, alpha)
-    assert high2 == 1 and low2 == pytest.approx(1 - high, abs=1e-10)
-    a, b = binomial_interval(5, 10, alpha)
-    assert a == pytest.approx(.1870860284474, abs=1e-10)
-    assert b == pytest.approx(1 - a, abs=1e-10)
-
 
 def test_actual_schema_export_is_immutable_offline_and_tamper_detecting(tmp_path):
     import json
@@ -407,7 +241,7 @@ def test_actual_schema_export_is_immutable_offline_and_tamper_detecting(tmp_path
     assert result["model_calls"] == 0
     with pytest.raises(FileExistsError):
         export_schemas(bundle)
-    file = bundle / "ReadinessPolicy.json"
+    file = bundle / "TaskDesignCapabilities.json"
     content = json.loads(file.read_text())
     content["title"] = "tampered title"
     file.write_text(json.dumps(content))

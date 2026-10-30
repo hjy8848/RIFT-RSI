@@ -1,9 +1,11 @@
 """CPU only: native Usami fixtures exercise actual certification and engine/replay."""
 import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
-from test_usami_v2_task_certification import frozen_world, make_task, customer_scenario
-from test_usami_v2_runtime import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
+
+from rift_usami_fixtures import (
+    NoConsentSandboxService, RejectedThenRefundService, ScriptedCustomer,
+    ScriptedRefundService, customer_scenario, distribution_and_slot, frozen,
+    frozen_world, make_task, refund_profile, refund_task, scenario_draft, scene,
+)
 from usami_v2.scenarios.task_certification import ProofBudget
 from usami_v2.runtime.runner import EpisodeBudget
 from rift.benchmark.usami import certify, run_episode, public_episode
@@ -16,6 +18,40 @@ def test_native_certification():
     result = certify('proposal', world, task, customer_scenario(aliases), ProofBudget(max_plan_candidates=16, max_operation_steps=16, max_witnesses=2))
     assert result.status is CertificationStatus.CERTIFIED and result.task_ref == task.record_hash
     assert set(result.__dict__) == {'proposal_id', 'status', 'task_ref'}
+
+def test_designer_diagnostic_removal_preserves_frozen_usami_results():
+    from usami_v2.scenarios.task_certification import certify_task, verify_task_certificate
+    from usami_v2.runtime.runner import run_episode, replay_episode
+    from rift.benchmark.private_evaluation import public_business_outcome
+    from rift.benchmark.public_feedback import service_reward
+
+    world, aliases = frozen_world(13)
+    task = make_task(world, aliases, attributes=({'name':'interface','value':'USB_C'},))
+    scenario = customer_scenario(aliases)
+    certificate = certify_task(world, task, scenario,
+        ProofBudget(max_plan_candidates=16, max_operation_steps=16, max_witnesses=2),
+        minimum_witnesses=2)
+    assert world.state_hash == '136651c71bc21af5ffb39fce47eba0a6d438078faaf9338087296a8f3c50a21c'
+    assert task.record_hash == '7d51d32e779ffa50ee14cc8b2ad3cb2bde12ee438c54329e2b9516751270fd3a'
+    assert certificate.record_hash == 'f1eaf9e63d8ec42f6b758dbf84ea5ee5ee9f6d5a85e99ea41b8d878a9ac365e0'
+    assert certificate.status == 'CERTIFIED'
+    assert verify_task_certificate(world, task, scenario, certificate)['verified']
+
+    episode_world, episode_aliases = frozen(17)
+    episode_task = refund_task(episode_world, episode_aliases)
+    profile = refund_profile(episode_aliases)
+    episode = run_episode(episode_world, episode_task, profile, ScriptedCustomer(),
+        ScriptedRefundService(episode_world, episode_aliases), budget=EpisodeBudget(
+            max_customer_turns=3, max_service_decisions=10, max_service_tool_calls=8,
+            max_model_calls=0))
+    replay = replay_episode(episode)
+    assert episode_world.state_hash == '2b76cf04eb0c03c1f43284e5431a66cef43ac05dea76de45b790e031cc2fb238'
+    assert episode_task.record_hash == '4a8f7ee4e3b7cb89382145b1554d8b4f7f79db3d26d3dbcaf34e3b4b6aa44861'
+    assert episode.record_hash == 'c9211ae1c07b72c0be47cd0ad9bc9b938596aa5bb63d7d1da26429f7d8310584'
+    assert episode.outcome.record_hash == '0ff86d2ee98792a35102bcd115ad1d69c9b9fc1df97af80dbc572517cd0d6c0e'
+    assert replay.verified and episode.outcome.business_goal_success is True
+    assert public_business_outcome(episode, replay.verified) is Outcome.SUCCESS
+    assert service_reward(Outcome.SUCCESS) == 1.0
 
 def test_native_episode_execution_replay_and_projection():
     world, aliases = frozen()
@@ -42,7 +78,6 @@ def test_designer_receives_only_native_projected_training_episode():
     assert propose(Designer(), [TrainingExperience(identity, record)], SplitRegistry([identity]))[0].proposal_id == 'p'
 
 def test_native_business_success_does_not_use_privileged_strict_score():
-    from test_usami_v2_runtime import NoConsentSandboxService
     from rift.benchmark.public_feedback import service_reward
     world, aliases = frozen()
     record = run_episode(world, refund_task(world, aliases), refund_profile(aliases), ScriptedCustomer(),
@@ -55,7 +90,6 @@ def test_native_business_success_does_not_use_privileged_strict_score():
 
 def test_native_public_tool_error_survives_without_oracle_fields():
     import json
-    from test_usami_v2_runtime import RejectedThenRefundService
     world, aliases = frozen()
     record = run_episode(world, refund_task(world, aliases), refund_profile(aliases), ScriptedCustomer(),
         RejectedThenRefundService(world, aliases),
@@ -91,7 +125,6 @@ def test_native_service_prompts_exclude_private_state_and_future_results():
 
 def test_native_grounding():
     import json
-    from test_usami_v2_builder import scene
     from usami_v2.scenarios.builder import build_world
     from rift.tasks import Proposal
     from rift.benchmark.usami import ground
@@ -106,7 +139,6 @@ def test_native_grounding():
 
 def test_native_ground_compile_certify_chain():
     import json
-    from test_usami_v2_designer import distribution_and_slot, scenario_draft
     from usami_v2.scenarios.builder import build_world
     from usami_v2.scenarios.task_certification import CustomerScenario
     from rift.tasks import Proposal
@@ -151,7 +183,6 @@ def test_scripted_episode_cannot_generate_service_training_data():
 
 def test_native_commerce_host_certification():
     import json
-    from test_usami_v2_designer import distribution_and_slot, scenario_draft
     from usami_v2.scenarios.builder import build_world
     from rift.tasks import Proposal
     from rift.benchmark.usami import CommerceHost
@@ -188,7 +219,6 @@ def test_native_commerce_host_certification():
 
 def test_default_host_ground_certify_and_scripted_rollout():
     import json
-    from test_usami_v2_designer import distribution_and_slot, scenario_draft
     from usami_v2.scenarios.builder import build_world
     from rift.tasks import Proposal
     from rift.benchmark.usami import CommerceHost
@@ -212,7 +242,6 @@ def test_default_host_ground_certify_and_scripted_rollout():
 
 def test_host_certifies_next_grounding_candidate_after_first_rejection(monkeypatch):
     from types import SimpleNamespace
-    from test_usami_v2_designer import distribution_and_slot, scenario_draft
     from usami_v2.scenarios.builder import build_world
     from usami_v2.scenarios.designer import TaskDraft, compile_task
     from rift import benchmark
@@ -264,7 +293,6 @@ def test_host_certifies_next_grounding_candidate_after_first_rejection(monkeypat
 
 def test_default_customer_runs_information_only_native_usami_task():
     import json
-    from test_usami_v2_designer import distribution_and_slot, scenario_draft
     from usami_v2.scenarios.builder import build_world
     from usami_v2.scenarios.designer import TaskDraft, compile_task, task_design_capabilities
     from usami_v2.runtime.agents import Operation, ServiceAction
@@ -272,7 +300,6 @@ def test_default_customer_runs_information_only_native_usami_task():
     from usami_v2.scenarios.task_certification import ProofBudget, certify_task
     from rift.benchmark.usami import default_customer_profile, default_customer_scenario
     from rift.schemas import Outcome
-    from test_usami_v2_runtime import ScriptedCustomer
     distribution, _ = distribution_and_slot(23)
     spec = scenario_draft().compile(distribution)
     build = build_world(spec, 23)
@@ -326,7 +353,6 @@ def test_default_customer_runs_information_only_native_usami_task():
 def test_offline_round_reaches_ready_with_explicit_fake_recording():
     """Exercise wiring only; the recorded calls and token verifier are test doubles."""
     import json
-    from test_usami_v2_designer import distribution_and_slot, scenario_draft
     from usami_v2.scenarios.builder import build_world
     from usami_v2.runtime.agents import AgentCall
     from rift.agents import TrainingExperience
