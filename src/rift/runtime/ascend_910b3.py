@@ -297,13 +297,17 @@ class Ascend910B3RoleRuntime:
     def __init__(self, role, checkpoint, *, model_path, run_root,
                  checkpoint_store, serving_attestor, agent_loop_config=None,
                  worker_manifest_path=None, open_agent_loop=False,
-                 backend_bindings=None):
+                 backend_bindings=None, initialize_vllm=True):
         if role not in ("service", "designer"):
             raise ValueError("Ascend policy role must be Service or Designer")
         if open_agent_loop and (role != "service" or agent_loop_config is None):
             raise ValueError("only Service may start the RIFT AgentLoop and it needs its config")
         if open_agent_loop and (checkpoint is None or worker_manifest_path is None):
             raise ValueError("Service AgentLoop needs a verified checkpoint and worker-side manifest")
+        if open_agent_loop and not initialize_vllm:
+            raise ValueError("Service AgentLoop needs an initialized vLLM server")
+        if checkpoint is not None and not initialize_vllm:
+            raise ValueError("restoring an active role checkpoint needs an initialized vLLM server")
         self.role, self.checkpoint = role, checkpoint
         self.model_path, self.run_root = Path(model_path), Path(run_root)
         self.checkpoint_store, self.serving_attestor = checkpoint_store, serving_attestor
@@ -320,13 +324,17 @@ class Ascend910B3RoleRuntime:
                    worker_manifest_path=worker_manifest_path, checkpoint=checkpoint)
         try:
             self._construct_workers()
-            self._construct_vllm()
+            if initialize_vllm:
+                self._construct_vllm()
+            else:
+                self.llm_server_manager = None
+                self.checkpoint_manager = None
             if checkpoint is not None:
                 self.worker_group.load_checkpoint(checkpoint_store.resolve(checkpoint))
                 self._loaded_checkpoint = checkpoint
             else:
                 self._loaded_checkpoint = None
-            if checkpoint is not None:
+            if checkpoint is not None and initialize_vllm:
                 self.synchronize(checkpoint)
             if open_agent_loop:
                 from verl.experimental.agent_loop import AgentLoopManager
@@ -348,11 +356,15 @@ class Ascend910B3RoleRuntime:
                 self.agent_loop_manager = None
                 self.service_batch = None
                 self.probe_batch = None
-                from transformers import AutoTokenizer
-                self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_path),
-                    trust_remote_code=False, local_files_only=True)
-                self.designer_client = _SleepingLLMClient(
-                    self.llm_server_manager.get_client(), self.checkpoint_manager)
+                if initialize_vllm:
+                    from transformers import AutoTokenizer
+                    self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_path),
+                        trust_remote_code=False, local_files_only=True)
+                    self.designer_client = _SleepingLLMClient(
+                        self.llm_server_manager.get_client(), self.checkpoint_manager)
+                else:
+                    self.tokenizer = None
+                    self.designer_client = None
         except BaseException:
             _stop_ray()
             raise
@@ -403,7 +415,7 @@ class Ascend910B3RoleRuntime:
             replicas=self.llm_server_manager.get_replicas())
         _resolve(self.checkpoint_manager.sleep_replicas())
 
-    def save_initial_checkpoint(self, destination, tokenizer_id=None):
+    def save_initial_checkpoint(self, destination, tokenizer_id=None, *, synchronize=True):
         """Save a genuine FSDP2 actor/model/optimizer/RNG checkpoint from this WorkerGroup."""
         if self._loaded_checkpoint is not None:
             raise ValueError("initial checkpoint can only be saved from the HF-initialized actor")
@@ -417,7 +429,8 @@ class Ascend910B3RoleRuntime:
         if self.checkpoint_store.verify(checkpoint) is not True:
             raise RuntimeError("VERL FSDP2 initial checkpoint failed full artifact verification")
         self._loaded_checkpoint = checkpoint
-        self.synchronize(checkpoint)
+        if synchronize:
+            self.synchronize(checkpoint)
         return checkpoint
 
     def synchronize(self, checkpoint):
@@ -442,7 +455,13 @@ class Ascend910B3RoleRuntime:
                 and str(self.config.actor_rollout_ref.rollout.name) == "vllm")
 
     def verify_resident_training_state(self, role, worker_group, checkpoint):
-        return False  # RIFT restores the exact full FSDP2 checkpoint before every update.
+        # This runtime owns the worker group and records its state only after a
+        # verified load/save. Rollout uses the colocated vLLM replica; it does
+        # not mutate the FSDP actor, optimizer, scheduler or RNG state. The
+        # backend verifies the checkpoint artifact before asking this gate.
+        return (self.verify_runtime_environment(role, worker_group)
+                and self._loaded_checkpoint == checkpoint
+                and self.serving_attestor.verify_serving(checkpoint) is True)
 
     def verify_runtime(self, role, worker_group, checkpoint):
         return (self.verify_runtime_environment(role, worker_group)
@@ -491,14 +510,17 @@ class Ascend910B3RoleRuntime:
 
 
 def initialize_checkpoint(role, model_path, output_dir, *, checkpoint_store,
-                          serving_attestor, run_root, agent_loop_config=None):
+                          serving_attestor, run_root, agent_loop_config=None,
+                          initialize_vllm=True, synchronize=True):
     """Create and verify one true starting checkpoint through VERL's FSDP2 worker."""
     tokenizer_id = str(Path(model_path).resolve())
     runtime = Ascend910B3RoleRuntime(role, None, model_path=model_path,
         run_root=run_root, checkpoint_store=checkpoint_store,
-        serving_attestor=serving_attestor, agent_loop_config=agent_loop_config)
+        serving_attestor=serving_attestor, agent_loop_config=agent_loop_config,
+        initialize_vllm=initialize_vllm)
     try:
-        return runtime.save_initial_checkpoint(output_dir, tokenizer_id=tokenizer_id)
+        return runtime.save_initial_checkpoint(output_dir, tokenizer_id=tokenizer_id,
+            synchronize=synchronize)
     finally:
         runtime.close()
 
@@ -613,7 +635,8 @@ def run_service_smoke(*, service_model, run_root, verl_config_dir):
     serving_attestor = VerlServingAttestor(root / "serving", checkpoint_store)
     checkpoint = initialize_checkpoint("service", service_model,
         root / "checkpoints" / "service-initial", checkpoint_store=checkpoint_store,
-        serving_attestor=serving_attestor, run_root=root)
+        serving_attestor=serving_attestor, run_root=root,
+        initialize_vllm=False, synchronize=False)
     if checkpoint.tokenizer != tokenizer_id:
         raise RuntimeError("initial Service checkpoint is bound to a different tokenizer")
     checkpoint_manifest = root / "checkpoints" / "initial.json"

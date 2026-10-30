@@ -80,10 +80,11 @@ def test_initial_checkpoint_uses_resolved_model_identity(monkeypatch, tmp_path):
 
     class Runtime:
         def __init__(self, *args, **kwargs):
-            pass
+            seen["runtime_options"] = kwargs
 
-        def save_initial_checkpoint(self, output_dir, *, tokenizer_id):
+        def save_initial_checkpoint(self, output_dir, *, tokenizer_id, synchronize=True):
             seen["tokenizer_id"] = tokenizer_id
+            seen["synchronize"] = synchronize
             return "checkpoint"
 
         def close(self):
@@ -91,11 +92,58 @@ def test_initial_checkpoint_uses_resolved_model_identity(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ascend_910b3, "Ascend910B3RoleRuntime", Runtime)
     result = initialize_checkpoint("service", model_path, tmp_path / "checkpoint",
-        checkpoint_store=None, serving_attestor=None, run_root=tmp_path)
+        checkpoint_store=None, serving_attestor=None, run_root=tmp_path,
+        initialize_vllm=False, synchronize=False)
 
     assert result == "checkpoint"
     assert seen["tokenizer_id"] == str(model_path.resolve())
+    assert seen["runtime_options"]["initialize_vllm"] is False
+    assert seen["synchronize"] is False
     assert seen["closed"] is True
+
+
+def test_checkpoint_only_runtime_skips_vllm_and_tokenizer(monkeypatch, tmp_path):
+    from rift.runtime import ascend_910b3
+
+    monkeypatch.setattr(ascend_910b3, "_verl_config", lambda *args, **kwargs: object())
+    monkeypatch.setattr(ascend_910b3, "_start_ray", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ascend_910b3, "_stop_ray", lambda: None)
+    monkeypatch.setattr(ascend_910b3.Ascend910B3RoleRuntime, "_construct_workers",
+        lambda runtime: setattr(runtime, "worker_group", SimpleNamespace(world_size=8)))
+    monkeypatch.setattr(ascend_910b3.Ascend910B3RoleRuntime, "_construct_vllm",
+        lambda runtime: pytest.fail("checkpoint-only initialization must not start vLLM"))
+
+    runtime = ascend_910b3.Ascend910B3RoleRuntime("service", None,
+        model_path=tmp_path, run_root=tmp_path,
+        checkpoint_store=object(), serving_attestor=object(), initialize_vllm=False)
+
+    assert runtime.llm_server_manager is None
+    assert runtime.checkpoint_manager is None
+    assert runtime.tokenizer is None
+    runtime.close()
+
+
+def test_resident_training_state_requires_matching_runtime_checkpoint():
+    from rift.runtime.ascend_910b3 import Ascend910B3RoleRuntime
+
+    checkpoint = object()
+    worker = SimpleNamespace(world_size=8)
+    runtime = object.__new__(Ascend910B3RoleRuntime)
+    runtime.role = "service"
+    runtime.worker_group = worker
+    runtime.closed = False
+    runtime._loaded_checkpoint = checkpoint
+    runtime.config = SimpleNamespace(actor_rollout_ref=SimpleNamespace(
+        actor=SimpleNamespace(strategy="fsdp2"),
+        rollout=SimpleNamespace(name="vllm")))
+    runtime.serving_attestor = SimpleNamespace(
+        verify_serving=lambda candidate: candidate is checkpoint)
+
+    assert runtime.verify_resident_training_state("service", worker, checkpoint)
+    assert not runtime.verify_resident_training_state("designer", worker, checkpoint)
+    assert not runtime.verify_resident_training_state("service", worker, object())
+    assert not runtime.verify_resident_training_state(
+        "service", SimpleNamespace(world_size=8), checkpoint)
 
 
 def test_production_config_pins_complete_grpo_and_measured_overlay(monkeypatch):
