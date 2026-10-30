@@ -8,7 +8,8 @@ from rift.training.records import designer_reward_source, reward_scalar
 # sampling transformations unless their behavior-policy correction is added.
 _ALLOWED_SAMPLING = {'temperature','top_p','top_k','min_p','repetition_penalty',
     'presence_penalty','frequency_penalty','logprobs','seed','max_tokens','min_tokens',
-    'stop','stop_token_ids','ignore_eos','skip_special_tokens'}
+    'stop','stop_token_ids','ignore_eos','skip_special_tokens',
+    'include_stop_str_in_output'}
 
 def unmodified_sampling(params):
     return (isinstance(params, dict) and not (set(params) - _ALLOWED_SAMPLING)
@@ -16,7 +17,11 @@ def unmodified_sampling(params):
         and params.get('top_k', -1) == -1 and params.get('min_p', 0.0) == 0.0
         and params.get('repetition_penalty', 1.0) == 1.0
         and params.get('presence_penalty', 0.0) == 0.0
-        and params.get('frequency_penalty', 0.0) == 0.0)
+        and params.get('frequency_penalty', 0.0) == 0.0
+        # This controls whether vLLM returns a sampled stop string in the
+        # captured output; it does not alter token sampling. Require inclusion
+        # when explicitly configured so exact tool-call evidence is retained.
+        and params.get('include_stop_str_in_output', True) is True)
 
 def _group_records(records):
     if len(records) < 2 or len({r['rollout_id'] for r in records}) != len(records): return False

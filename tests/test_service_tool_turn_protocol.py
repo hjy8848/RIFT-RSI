@@ -30,6 +30,24 @@ def test_hermes_stop_accepts_string_and_none_and_is_idempotent():
     assert single_tool_turn_sampling_params(existing, parser)["stop"] == ["</tool_call>"]
 
 
+def test_hermes_stop_capture_setting_is_accepted_as_on_policy():
+    from rift.verl.rollout_evidence import unmodified_sampling
+
+    parser = SimpleNamespace(tool_call_end_token="</tool_call>")
+    configured = single_tool_turn_sampling_params({
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+    }, parser)
+
+    assert unmodified_sampling(configured)
+    assert not unmodified_sampling({**configured, "include_stop_str_in_output": False})
+
+
 def test_other_parser_keeps_generation_settings_unchanged():
     parser = SimpleNamespace(tool_call_end_token="<tool_call|>")
     original = {"temperature": 0.4, "stop": ["<|im_end|>"]}
