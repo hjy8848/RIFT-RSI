@@ -36,6 +36,7 @@ def test_ray_runtime_env_forwards_sourced_cann_paths_without_device_binding():
     runtime_env = {"env_vars": {"VERL_KEEP": "yes"}}
     source = {
         "PATH": "/cann/bin:/usr/bin",
+        "PYTHONPATH": "/usr/local/Ascend/cann-9.1.0/python/site-packages",
         "LD_LIBRARY_PATH": "/cann/lib64:/cann/opp/vendors/customize/op_api/lib",
         "ASCEND_HOME_PATH": "/usr/local/Ascend/ascend-toolkit/latest",
         "ASCEND_OPP_PATH": "/usr/local/Ascend/ascend-toolkit/latest/opp",
@@ -51,6 +52,7 @@ def test_ray_runtime_env_forwards_sourced_cann_paths_without_device_binding():
     result = _forward_ascend_worker_environment(runtime_env, source)
 
     assert result["env_vars"]["VERL_KEEP"] == "yes"
+    assert result["env_vars"]["PYTHONPATH"] == source["PYTHONPATH"]
     assert result["env_vars"]["LD_LIBRARY_PATH"] == source["LD_LIBRARY_PATH"]
     assert result["env_vars"]["ASCEND_HOME_PATH"] == source["ASCEND_HOME_PATH"]
     assert result["env_vars"]["ATB_HOME_PATH"] == source["ATB_HOME_PATH"]
