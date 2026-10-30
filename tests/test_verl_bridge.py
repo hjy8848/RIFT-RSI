@@ -540,6 +540,23 @@ def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkey
     from rift.verl.sampling import rollout_seed
     assert [row['seed'] for row in loop.server_manager.sampling] == [
         rollout_seed(23, 'paired-probe-scope', turn) for turn in range(loop.server_manager.i)]
+    script = ScriptedRefundService(world, aliases)
+    session = NativeUsamiSession(world, refund_task(world,aliases), refund_profile(aliases), ScriptedCustomer(), FakeParser(),
+        group_id='group', sampling_seed=23, sampling_scope='paired-probe-scope',
+        rollout_id='native-over-budget', group_size=4, task_ref='opaque', rift_mode='train', customer_seed=91,
+        budget=EpisodeBudget(max_customer_turns=3,max_service_decisions=10,max_service_tool_calls=8,max_model_calls=10))
+    loop.server_manager = FakeServer()
+    loop.rollout_config.response_length = 2
+    async def overflow():
+        output = await loop.run({'temperature':1.0}, rift_task_ref='opaque', uid='group', session_id=0,
+            rift_request_id='request-over-budget', rift_mode='train', rift_group_size=4,
+            rift_rollout_id='native-over-budget', rift_sampling_seed=23, rift_customer_seed=91,
+            rift_expected_checkpoint={'policy':'service','revision':'v1','tokenizer':'tok','weights_digest':'fake-weights'})
+        episode = await session.finish()
+        assert output.reward_score is None and output.extra_fields['rift_outcome'] == Outcome.UNKNOWN.value
+        assert output.response_ids == [11] and output.response_mask == [1]
+        assert sink.verify_trajectory(episode, cp)
+    asyncio.run(overflow())
     monkeypatch.delattr(extension, 'UsamiServiceAgentLoop', raising=False)
 
 def test_designer_on_policy_capture_precedes_delayed_reward(tmp_path):
