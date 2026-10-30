@@ -312,6 +312,7 @@ class Ascend910B3RoleRuntime:
         self.role, self.checkpoint = role, checkpoint
         self.model_path, self.run_root = Path(model_path), Path(run_root)
         self.checkpoint_store, self.serving_attestor = checkpoint_store, serving_attestor
+        self.initialize_vllm = initialize_vllm
         self.backend_bindings = dict(backend_bindings or {})
         self.closed = False
         if not self.model_path.is_dir():
@@ -380,7 +381,10 @@ class Ascend910B3RoleRuntime:
         from verl.trainer.ppo.utils import Role
         from verl.workers.engine_workers import ActorRolloutRefWorker
 
-        role_enum = Role.ActorRollout
+        # Initial checkpoint creation only needs the trainable actor. VERL's
+        # ActorRolloutRefWorker.init_model() constructs the rollout engine when
+        # its role includes "rollout", even if no LLMServerManager is started.
+        role_enum = Role.ActorRollout if self.initialize_vllm else Role.Actor
         self.resource_pool_manager = ResourcePoolManager(
             resource_pool_spec={"global_pool": [WORLD_SIZE]},
             mapping={role_enum: "global_pool"}, max_colocate_count=1)
