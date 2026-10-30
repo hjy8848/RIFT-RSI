@@ -1,9 +1,30 @@
 Status: implementation tracking
 Owner: RIFT-RSI maintainers
 Last verified: 2026-10-30
-Scope: dual-bank code coverage, production adapter, offline evidence, and deployment gaps
+Scope: dual-bank code coverage, production adapter, offline evidence, deployment gaps, and target-hardware validation
 
 This document records which pieces of the dual-bank RIFT protocol have code and offline tests. The research objective is defined in [RESEARCH_SPEC.md](RESEARCH_SPEC.md); executable contracts are in `src/rift/` and defaults in `configs/dual_bank.yaml`.
+
+## Roadmap
+
+This roadmap separates the completed Service hardware smoke from the still-unverified full dual-model RIFT loop.
+
+### Completed: Service training smoke on Ascend
+
+- On 2026-10-30, `npu30001` (8× Ascend 910B3, aarch64) ran VERL 0.9.1 at commit `1876b06d0a3e4e71e06230be10af14492ca8a75b` with the configured Qwen2.5-3B Service model and two GRPO groups of four rollouts each.
+- The run used one native Usami smoke task and recorded 8 generations and 8 Episodes. Generation evidence contains actual `generated_token_ids` and `logprobs`.
+- VERL restored the initial FSDP2 checkpoint, performed global step 1, saved all eight model/optimizer/state shards, published checkpoint revision 1, and returned a vLLM weight-sync receipt. The before/after weight digests differ.
+- The update receipt reports `service_smoke_completed`; all 8 business rewards were `0.0`. This verifies the Service inference, capture, update, checkpoint, and synchronization path. It does not demonstrate a positive task reward or measured capability improvement.
+- Run artifacts are on the NPU host at `/data/zju-48/hejingyu/rift-runs/smoke-6135942-20261030-r2`; the update receipt is `updates/rift-service-smoke-step-1.json` and the checkpoint transition is recorded in `checkpoints/service-step-1.json`.
+
+### Next: run one complete dual-bank RIFT round
+
+1. Bind the production round to the target Usami assets, persistent evidence stores, split registries, and separately identified Service and Designer model checkpoints.
+2. Run the Designer proposal and native Usami certification, then execute Service training and frozen Recovery/Retention evaluation before and after the update.
+3. Verify the task-success Replay reward and assign it to the exact captured Designer rollout; perform the Designer update and verify both role checkpoints, serving synchronization, and resumable round state.
+4. Only after the full round succeeds, begin multi-round and held-out TEST evaluation and collect hardware throughput measurements.
+
+The Ascend entry point exercised above runs the Service smoke only. A complete Designer→Service→Recovery/Retention→Designer round has not run on the target machine; Designer's checkpoint path and the full-round deployment binding still need to be supplied and validated.
 
 ## Implemented
 
@@ -42,14 +63,15 @@ On 2026-10-30, the complete CPU suite reported **94 passed** in 125.60 seconds w
 
 ## Still required for target deployment
 
-- A deployment-owned `ProductionDeployment` factory that points to the actual Usami world/task/customer assets and model/tokenizer roots, constructs persistent stores and authoritative identity/split registries, and binds the verified initial checkpoints. This application-specific binding is intentionally not guessed or committed as a fake default.
-- Real pinned VERL v0.9.1 FSDP2 worker groups and role handles that implement `service_batch`, `probe_batch`, `create_update_backend`, checkpoint restore/save, `verify_loaded_state`, and `close()` using the official Agent Loop, checkpoint, and weight-sync interfaces. The repository now has the RIFT assembly and adapters; the target application's worker construction remains deployment code.
-- A deployment runner that supplies the actual Designer Agent Loop batch and on-policy generation capture while preserving the exact pending action across interruption, plus the production update/reward/action/trial verifiers.
+- A deployment-owned `ProductionDeployment` factory that binds the full round to the actual Usami world/task/customer assets, model/tokenizer roots, persistent stores, authoritative identity/split registries, and verified initial checkpoints. The Service smoke used a single generated Usami task and does not provide this full-round binding.
+- Real Designer role execution and an explicitly configured Designer checkpoint. The Service role's pinned VERL v0.9.1 FSDP2/vLLM worker group has completed one restore, rollout, update, checkpoint-save, and serving-sync cycle; the Designer path and exclusive two-role lifecycle have not run on hardware.
+- A deployment runner that supplies the actual Designer Agent Loop batch and on-policy generation capture while preserving the exact pending action across interruption, plus production update/reward/action/trial verifiers for the complete round.
+- Recovery/Retention before-and-after evaluation on independent frozen tasks, current-checkpoint baselines for historical tasks, Replay reward computation, delayed Designer credit, and TEST isolation in a real target-hardware round.
 - Target-run selection and profiling of Dynamic Batch token budget, Agent Loop worker count, vLLM concurrency, and NPU memory/throughput. No NPU-specific values are guessed in the overlay.
 - The target CustomerFactory must apply the supplied probe seed to its stochastic behavior, and use the same recorded Service sampling protocol before and after updates.
 - The deployment must persist real Bootstrap and subsequent task/Probe observations with trusted evidence and use the included plan factory's current-Checkpoint baseline records for historical Recovery and Retention candidates.
-- A tested exclusive lifecycle for two full-parameter policies sharing the eight NPU devices, including optimizer/RNG restore, serving weight synchronization, and safe resource release between Designer and Service phases.
-- Integration validation with the configured VERL parser, real inference server, production CustomerFactory, persistent task/Episode stores, and Agent Loop token capture.
-- Resolution and validation of the requested software image. The pinned VERL v0.9.1 source requires `numpy>=2.0.0`, which conflicts with requested NumPy 1.26.4; no dependency override is claimed safe.
+- Full-round validation of the exclusive lifecycle for two full-parameter policies sharing the eight NPU devices, including optimizer/RNG restore and safe resource release between Designer and Service phases. Service checkpoint save/restore and serving synchronization are smoke-validated; this does not establish the two-role handoff.
+- Full-round validation with the production CustomerFactory, persistent task/Episode stores, Recovery/Retention probes, and TEST isolation. The Service smoke has already exercised the configured parser, real inference server, native Usami execution, and token capture.
+- Confirm the supported software image for the complete workload. The pinned VERL v0.9.1 source declares `numpy>=2.0.0`, while the requested image specifies NumPy 1.26.4. The Service smoke ran in the configured environment, but the full dependency set has not been validated; no dependency override is claimed safe.
 
-No real training, model inference, checkpoint update, replay measurement, capability acquisition, forgetting measurement, or Ascend job has been run. Probe batching and resident-state restore have only offline interface tests; speedup is not established. A real experiment remains unverified until performed in the target environment using `configs/dual_bank.yaml` and independently frozen TEST tasks.
+The 2026-10-30 run is the first real Ascend Service training smoke, not a complete RIFT experiment. It performed inference and one FSDP2 update, but all eight business rewards were `0.0`; it therefore provides no evidence of capability acquisition or improvement. No full-round Replay reward, Designer update, forgetting measurement, or independent TEST evaluation has run on the target hardware. Probe batching and resident-state restore remain supported by offline interface tests only; speedup is not established.
