@@ -206,6 +206,19 @@ class NativeUsamiSession:
         if self._finished is None: raise ValueError('native episode has not finished')
         return self._finished
 
+    async def cancel_for_budget(self):
+        """Cancel a pending decision when its public context cannot fit."""
+        if not self._waiting:
+            raise ValueError('no pending Service decision to cancel')
+        self._parser_failure = RuntimeError('policy context exceeds token budget')
+        self._waiting = False
+        self._responses.put(self._parser_failure)
+        kind, value = await self._events.get()
+        await self._worker
+        if kind != 'finished':
+            raise RuntimeError('native Usami failed while cancelling an over-budget episode') from value
+        self._finished = value
+
     async def abort(self):
         worker = getattr(self, '_worker', None)
         if worker is not None and not worker.done():

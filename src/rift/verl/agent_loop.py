@@ -135,6 +135,17 @@ def __getattr__(name):
                         len(capture.decisions))
                     turn_sampling_params = single_tool_turn_sampling_params(
                         turn_sampling_params, getattr(session, 'parser', None))
+                    remaining = self.rollout_config.response_length - len(capture.mask)
+                    model_limit = getattr(self.rollout_config, 'max_model_len', None)
+                    if model_limit is not None:
+                        remaining = min(remaining, model_limit - len(prefix))
+                    if remaining < 1:
+                        await session.cancel_for_budget()
+                        break
+                    requested = turn_sampling_params.pop('max_new_tokens', None)
+                    explicit = turn_sampling_params.get('max_tokens')
+                    limits = [remaining] + [x for x in (requested, explicit) if x is not None]
+                    turn_sampling_params['max_tokens'] = min(limits)
                     output = await self.server_manager.generate(request_id=model_request_id, prompt_ids=prefix,
                                                                 sampling_params=turn_sampling_params)
                     token_ids = list(output.token_ids)
@@ -167,11 +178,16 @@ def __getattr__(name):
                     if done: break
                     previous = list(messages)
                     messages.extend(additions)
-                    merged, masks, logprobs = await self.ct_merge_context_msg(
+                    merged, next_masks, next_logprobs = await self.ct_merge_context_msg(
                         previous, messages, list(capture.current), masks, logprobs, tools=tools)
+                    if (len(next_masks) >= self.rollout_config.response_length
+                            or (model_limit is not None and len(merged.token_ids) >= model_limit)):
+                        # The environment output was never sent to the model. Keep
+                        # the observed policy trace intact and mark the episode UNKNOWN.
+                        await session.cancel_for_budget()
+                        break
+                    masks, logprobs = next_masks, next_logprobs
                     capture.add_context(merged.token_ids, masks)
-                    if len(capture.mask) >= self.rollout_config.response_length:
-                        raise ValueError('rollout exceeds response budget; no truncation of evidence')
                 episode = await session.finish()
                 tokens = capture.output()
                 if logprobs is not None and len(logprobs) != len(tokens.response):

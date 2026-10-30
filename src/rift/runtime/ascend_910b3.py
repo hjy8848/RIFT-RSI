@@ -59,6 +59,13 @@ def _require_cann_atb_library():
             "The ATB profile adds the ABI-matched libatb.so path required by "
             "vLLM-Ascend; VERL and vLLM workers inherit these variables."
         ) from exc
+    try:
+        from acl.rt import memcpy  # noqa: F401 - required by vLLM-Ascend workers
+    except ImportError as exc:
+        raise RuntimeError(
+            "CANN Python acl.rt is unavailable. Source CANN set_env.sh and preserve "
+            "its PYTHONPATH when adding RIFT paths before launching workers."
+        ) from exc
 
 
 def _check_ray_socket_path(ray_dir):
@@ -87,7 +94,7 @@ def _resolve(value):
 
 
 def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
-                 group_size=4, response_length=4096):
+                 group_size=4, response_length=8192):
     """Compose the installed VERL v0.9.1 defaults and apply the RIFT target config."""
     import torch_npu  # noqa: F401 - load CANN platform support before VERL config inspection.
     import verl
@@ -107,8 +114,10 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.actor.use_kl_loss = False
     config.actor_rollout_ref.actor.ppo_mini_batch_size = WORLD_SIZE
     config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu = 1
-    config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu = 8192
+    max_sequence_length = 2048 + response_length
+    config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu = max_sequence_length
     config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu = 1
+    config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu = max_sequence_length
     config.actor_rollout_ref.actor.optim.lr = 1.0e-6
     config.actor_rollout_ref.actor.optim.total_training_steps = 1
     config.actor_rollout_ref.actor.checkpoint.save_contents = ["model", "optimizer", "extra"]
@@ -119,8 +128,8 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.rollout.data_parallel_size = 1
     config.actor_rollout_ref.rollout.dtype = "bfloat16"
     config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.45
-    config.actor_rollout_ref.rollout.max_model_len = 6144
-    config.actor_rollout_ref.rollout.max_num_batched_tokens = 8192
+    config.actor_rollout_ref.rollout.max_model_len = max_sequence_length
+    config.actor_rollout_ref.rollout.max_num_batched_tokens = max_sequence_length
     config.actor_rollout_ref.rollout.calculate_log_probs = True
     config.actor_rollout_ref.rollout.agent.num_workers = WORLD_SIZE
     config.actor_rollout_ref.rollout.response_length = response_length

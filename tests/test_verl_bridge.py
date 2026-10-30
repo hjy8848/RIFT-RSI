@@ -52,9 +52,10 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
     cls = extension.UsamiServiceAgentLoop
     loop = cls()
     class Server:
-        def __init__(self): self.inputs = []
+        def __init__(self): self.inputs = []; self.sampling = []
         async def generate(self, request_id, *, prompt_ids, sampling_params):
             self.inputs.append(prompt_ids)
+            self.sampling.append(dict(sampling_params))
             return SimpleNamespace(token_ids=[2, 3] if len(self.inputs)==1 else [4],
                 log_probs=[-0.1, -0.2] if len(self.inputs)==1 else [-0.3],
                 extra_fields={'global_steps':1,'min_global_steps':1,'max_global_steps':1})
@@ -65,12 +66,13 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
             self.rollout_id, self.group_id = rollout_id, group_id
             self.sampling_seed, self.customer_seed = sampling_seed, customer_seed
             self.sampling_scope = f'test:{rollout_id}'
-            self.n=0; self.expected_group_size=group_size
+            self.n=0; self.expected_group_size=group_size; self.cancelled=False
         async def start(self): return ([{'role':'user','content':'refund'}], [])
         async def advance(self, tokens, prefix, sampling_params, token_logprobs, generation_id, serving_fields=None):
             self.n += 1
             return ({'role':'assistant','content':'action'}, [{'role':'tool','content':'EVIDENCE_REQUIRED'}], self.n == 2)
-        async def finish(self): return SimpleNamespace(record_hash='e' * 64, replay_verified=True)
+        async def cancel_for_budget(self): self.cancelled = True
+        async def finish(self): return SimpleNamespace(record_hash='e' * 64, replay_verified=True, cancelled=self.cancelled)
         def public_outcome(self, episode): return Outcome.SUCCESS
     class Verifier:
         def verify(self, checkpoint): return True
@@ -105,11 +107,26 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
         rift_rollout_id='rollout-good', rift_sampling_seed=3, rift_customer_seed=4,
         rift_expected_checkpoint={'policy':'service','revision':'v1','tokenizer':'tok','weights_digest':'weights'}))
     assert loop.server_manager.inputs == [[1], [1, 2, 3, 7]]
+    assert [params['max_tokens'] for params in loop.server_manager.sampling] == [20, 17]
     assert result.response_ids == [2, 3, 7, 4] and result.response_mask == [1, 1, 0, 1]
     assert result.response_logprobs == [-0.1, -0.2, 0.0, -0.3]
     assert result.reward_score == 1 and sink.decisions[1].tokens.prompt == (1, 2, 3, 7)
     assert host.sessions[-1].expected_group_size == 4
     assert host.session_ids[-1] == 0 and type(host.session_ids[-1]) is int
+    # A tool result that leaves no room is never added to the model's trace.
+    monkeypatch.setattr('rift.benchmark.usami.public_episode', lambda episode:
+        SimpleNamespace(outcome=Outcome.UNKNOWN if episode.cancelled else Outcome.SUCCESS))
+    loop.server_manager = Server()
+    loop.rollout_config.response_length = 3
+    limited = asyncio.run(loop.run({}, rift_task_ref='opaque', uid='group', session_id=0,
+        rift_request_id='request-limited', rift_mode='train', rift_group_size=4,
+        rift_rollout_id='rollout-limited', rift_sampling_seed=3, rift_customer_seed=4,
+        rift_expected_checkpoint={'policy':'service','revision':'v1','tokenizer':'tok','weights_digest':'weights'}))
+    assert host.sessions[-1].cancelled is True
+    assert limited.response_ids == [2, 3] and limited.response_mask == [1, 1]
+    assert limited.reward_score is None and limited.extra_fields['rift_outcome'] == Outcome.UNKNOWN.value
+    assert len(loop.server_manager.inputs) == 1
+    assert loop.server_manager.sampling[0]['max_tokens'] == 3
     monkeypatch.delattr(extension, 'UsamiServiceAgentLoop', raising=False)
 
 def test_checkpoint_store_checks_all_rank_files_and_weights(tmp_path, monkeypatch):
@@ -333,6 +350,39 @@ def test_native_usami_session_steps_through_real_runner_without_model():
             episode = await session.finish()
             assert public_episode(episode).outcome is Outcome.SUCCESS
             assert len(episode.model_calls) == step
+            assert episode.model_calls[0].response['generated_token_ids'] == [10]
+        finally:
+            await session.abort()
+    asyncio.run(exercise())
+
+def test_native_budget_cancellation_is_unknown_and_replayable():
+    import json
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'third_party' / 'usami' / 'tests'))
+    from test_usami_v2_runtime import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
+    from usami_v2.runtime.runner import EpisodeBudget, replay_episode
+    from rift.benchmark.usami import public_episode
+    from rift.verl.usami_session import NativeUsamiSession
+    world, aliases = frozen()
+    script = ScriptedRefundService(world, aliases)
+    class Parser:
+        async def extract_tool_calls(self, tokens, schemas):
+            op = script.decide(None).operation
+            return '', [SimpleNamespace(name=op.name, arguments=json.dumps({
+                'scope_id': op.scope_id, 'resource_id': op.resource_id, 'params': op.params}), tool_call_id=None)]
+    async def exercise():
+        session = NativeUsamiSession(world, refund_task(world, aliases), refund_profile(aliases),
+            ScriptedCustomer(), Parser(), budget=EpisodeBudget(max_customer_turns=3,
+            max_service_decisions=10, max_service_tool_calls=8, max_model_calls=10))
+        try:
+            await session.start()
+            _, _, done = await session.advance([10], [1], {'max_tokens': 1})
+            assert not done
+            await session.cancel_for_budget()
+            episode = await session.finish()
+            assert episode.status == 'cancelled'
+            assert replay_episode(episode).verified
+            assert public_episode(episode).outcome is Outcome.UNKNOWN
             assert episode.model_calls[0].response['generated_token_ids'] == [10]
         finally:
             await session.abort()

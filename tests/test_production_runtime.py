@@ -74,6 +74,20 @@ def test_missing_cann_atb_library_fails_before_ray_with_setup_command(monkeypatc
         _require_cann_atb_library()
 
 
+def test_missing_acl_fails_before_ray(monkeypatch):
+    import builtins
+    import ctypes
+    real_import = builtins.__import__
+    def missing_acl(name, *args, **kwargs):
+        if name == 'acl.rt':
+            raise ModuleNotFoundError('acl')
+        return real_import(name, *args, **kwargs)
+    monkeypatch.setattr(ctypes, 'CDLL', lambda _: object())
+    monkeypatch.setattr(builtins, '__import__', missing_acl)
+    with pytest.raises(RuntimeError, match='preserve.*PYTHONPATH'):
+        _require_cann_atb_library()
+
+
 def test_initial_checkpoint_uses_resolved_model_identity(monkeypatch, tmp_path):
     from rift.runtime import ascend_910b3
 
