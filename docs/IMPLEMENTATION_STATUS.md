@@ -14,15 +14,17 @@ This roadmap separates the completed Service hardware smoke from the still-unver
 - On 2026-10-30, `npu30001` (8× Ascend 910B3, aarch64) ran VERL 0.9.1 at commit `1876b06d0a3e4e71e06230be10af14492ca8a75b` with the configured Qwen2.5-3B Service model and two GRPO groups of four rollouts each.
 - The run used one native Usami smoke task and recorded 8 generations and 8 Episodes. Generation evidence contains actual `generated_token_ids` and `logprobs`.
 - VERL restored the initial FSDP2 checkpoint, performed global step 1, saved all eight model/optimizer/state shards, published checkpoint revision 1, and returned a vLLM weight-sync receipt. The before/after weight digests differ.
-- The update receipt reports `service_smoke_completed`; all 8 business rewards were `0.0`. This verifies the Service inference, capture, update, checkpoint, and synchronization path. It does not demonstrate a positive task reward or measured capability improvement.
+- All 8 Episodes ended with `service_protocol_error`, and `tool_executions` is empty in every Episode. Five saved generations contain multiple parseable `<tool_call>` blocks in one response; RIFT deliberately rejects more than one call for a native Service decision. The other three contain one parseable call, but their arguments violate the exposed tool schema (`request_policy_review` received nonempty params; `get_case_status` received an unsupported `messages` param). The system prompt already requires exactly one call. The saved token IDs decode into valid Hermes JSON blocks, so the observed failures are model output/turn-boundary failures rather than missing token capture.
+- The update receipt reports `service_smoke_completed`; all 8 business rewards were `0.0`, so both four-sample GRPO groups had no reward variation. This verifies real inference, token capture, actor update/checkpoint plumbing, and weight synchronization, but not successful tool execution or reward-driven learning.
 - Run artifacts are on the NPU host at `/data/zju-48/hejingyu/rift-runs/smoke-6135942-20261030-r2`; the update receipt is `updates/rift-service-smoke-step-1.json` and the checkpoint transition is recorded in `checkpoints/service-step-1.json`.
 
-### Next: run one complete dual-bank RIFT round
+### Next: validate Service tool turns, then run one complete dual-bank round
 
-1. Bind the production round to the target Usami assets, persistent evidence stores, split registries, and separately identified Service and Designer model checkpoints.
-2. Run the Designer proposal and native Usami certification, then execute Service training and frozen Recovery/Retention evaluation before and after the update.
-3. Verify the task-success Replay reward and assign it to the exact captured Designer rollout; perform the Designer update and verify both role checkpoints, serving synchronization, and resumable round state.
-4. Only after the full round succeeds, begin multi-round and held-out TEST evaluation and collect hardware throughput measurements.
+1. Align the generation turn boundary with Usami's one-operation-per-decision contract and verify the emitted arguments against the actual tool schemas, preserving the original generated token trace. Re-run a small Service batch; require valid tool execution and reward variation before treating it as a learning smoke.
+2. Bind the full round to the target Usami assets, persistent evidence stores, split registries, and separately identified Service and Designer model checkpoints.
+3. Run the Designer proposal and native Usami certification, then execute Service training and frozen Recovery/Retention evaluation before and after the update.
+4. Verify the task-success Replay reward and assign it to the exact captured Designer rollout; perform the Designer update and verify both role checkpoints, serving synchronization, and resumable round state.
+5. Only after the full round succeeds, begin multi-round and held-out TEST evaluation and collect hardware throughput measurements.
 
 The Ascend entry point exercised above runs the Service smoke only. A complete Designer→Service→Recovery/Retention→Designer round has not run on the target machine; Designer's checkpoint path and the full-round deployment binding still need to be supplied and validated.
 
@@ -66,6 +68,7 @@ On 2026-10-30, the complete CPU suite reported **94 passed** in 125.60 seconds w
 - A deployment-owned `ProductionDeployment` factory that binds the full round to the actual Usami world/task/customer assets, model/tokenizer roots, persistent stores, authoritative identity/split registries, and verified initial checkpoints. The Service smoke used a single generated Usami task and does not provide this full-round binding.
 - Real Designer role execution and an explicitly configured Designer checkpoint. The Service role's pinned VERL v0.9.1 FSDP2/vLLM worker group has completed one restore, rollout, update, checkpoint-save, and serving-sync cycle; the Designer path and exclusive two-role lifecycle have not run on hardware.
 - A deployment runner that supplies the actual Designer Agent Loop batch and on-policy generation capture while preserving the exact pending action across interruption, plus production update/reward/action/trial verifiers for the complete round.
+- Service tool-turn validation before the next learning run: the target smoke produced 5 multi-call responses and 3 single-call responses with schema-invalid arguments, so Usami recorded zero tool executions.
 - Recovery/Retention before-and-after evaluation on independent frozen tasks, current-checkpoint baselines for historical tasks, Replay reward computation, delayed Designer credit, and TEST isolation in a real target-hardware round.
 - Target-run selection and profiling of Dynamic Batch token budget, Agent Loop worker count, vLLM concurrency, and NPU memory/throughput. No NPU-specific values are guessed in the overlay.
 - The target CustomerFactory must apply the supplied probe seed to its stochastic behavior, and use the same recorded Service sampling protocol before and after updates.
