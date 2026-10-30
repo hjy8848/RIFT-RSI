@@ -22,16 +22,18 @@ This roadmap separates the completed Service hardware smoke from the still-unver
 
 - Commit `0129198` ran on 2026-10-30 at `npu30001` with VERL 0.9.1 (`1876b06d0a3e4e71e06230be10af14492ca8a75b`) and the configured 8×910B3 runtime. It recorded 8 Episodes, 28 model responses, and 18 native Usami tool executions. The rollout evidence verifier accepted the true `include_stop_str_in_output` setting.
 - VERL completed global step 1, saved 8 model, optimizer, and extra-state shards, published checkpoint revision 1, and passed UpdateLedger verification. The before/after weight digests differ; the update receipt is `/data/zju-48/hejingyu/rift-runs/smoke-0129198-20261030-fast-r5/updates/rift-service-smoke-step-1.json`.
-- The Episodes ended as 6 `service_protocol_error` and 2 `budget_exhausted`; the verified business reward counts were `{"0.0": 8}`. This validates real token capture, Usami execution, the GRPO update path, checkpoint save/restore, and serving synchronization. It does not demonstrate reward-driven learning because neither GRPO group had reward variation.
+- The Episodes ended as 6 `service_protocol_error` and 2 `budget_exhausted`. Of 18 native Usami tool executions, 7 succeeded and 11 returned `RESOURCE_NOT_FOUND`; the verified business reward counts were `{"0.0": 8}`. This validates real token capture, tool dispatch, the GRPO update path, checkpoint save/restore, and serving synchronization. It does not demonstrate successful task completion or reward-driven learning because neither GRPO group had reward variation.
+- The current evidence does not identify whether the six protocol failures or missing-resource arguments came from model outputs or an RIFT prompt/parser/tool-adapter mismatch. The saved generations must be compared with their public prompts and exposed tool schemas, then traced through parsed `ServiceAction` to native Usami results. One task and eight Episodes are not enough to conclude that a 3B model cannot follow instructions.
 - The run took about 18 minutes end to end. The initial checkpoint stage took about 4 minutes, compared with about 8 minutes 48 seconds in the earlier baseline. This reduced that stage, but cold FSDP/vLLM initialization and checkpoint IO still dominate the full smoke; this is not a throughput benchmark.
 - After the driver returned `service_smoke_completed`, one vLLM EngineCore and eight `VLLMWorker_TP` processes remained on the NPUs. TERM did not stop them. The user approved KILL for the exact run-owned PIDs, after which all eight NPUs were confirmed free. Automatic vLLM child cleanup remains unverified. Artifacts: `/data/zju-48/hejingyu/rift-runs/smoke-0129198-20261030-fast-r5`.
 
-### Next: complete one dual-bank target round
+### Next: diagnose Service smoke outcomes, then complete one dual-bank target round
 
-1. Bind the full round to the target Usami assets, persistent evidence stores, split registries, and separately identified Service and Designer model checkpoints.
-2. Run the Designer proposal and native Usami certification, then execute Service training and frozen Recovery/Retention evaluation before and after the update.
-3. Verify the task-success Replay reward and assign it to the exact captured Designer rollout; perform the Designer update and verify both role checkpoints, serving synchronization, and resumable round state.
-4. Only after the full round succeeds, begin multi-round and held-out TEST evaluation and collect hardware throughput measurements.
+1. Audit the saved generations and tool results offline: classify the six protocol failures and 11 `RESOURCE_NOT_FOUND` results by tracing public prompt and schema → captured tokens → parsed action → native result. Use the evidence to distinguish model behavior from adapter behavior before changing either.
+2. Bind the full round to the target Usami assets, persistent evidence stores, split registries, and separately identified Service and Designer model checkpoints.
+3. Run the Designer proposal and native Usami certification, then execute Service training and frozen Recovery/Retention evaluation before and after the update.
+4. Verify the task-success Replay reward and assign it to the exact captured Designer rollout; perform the Designer update and verify both role checkpoints, serving synchronization, and resumable round state.
+5. Only after the full round succeeds, begin multi-round and held-out TEST evaluation and collect hardware throughput measurements.
 
 The Ascend entry point exercised above runs the Service smoke only. A complete Designer→Service→Recovery/Retention→Designer round has not run on the target machine; Designer's checkpoint path and the full-round deployment binding still need to be supplied and validated.
 
