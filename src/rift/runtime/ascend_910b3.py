@@ -94,7 +94,7 @@ def _resolve(value):
 
 
 def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
-                 group_size=4, response_length=8192):
+                 group_size=4, prompt_length=4096, response_length=8192):
     """Compose the installed VERL v0.9.1 defaults and apply the RIFT target config."""
     import torch_npu  # noqa: F401 - load CANN platform support before VERL config inspection.
     import verl
@@ -114,7 +114,7 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.actor.use_kl_loss = False
     config.actor_rollout_ref.actor.ppo_mini_batch_size = WORLD_SIZE
     config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu = 1
-    max_sequence_length = 2048 + response_length
+    max_sequence_length = prompt_length + response_length
     config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu = max_sequence_length
     config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu = 1
     config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu = max_sequence_length
@@ -132,8 +132,9 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.rollout.max_num_batched_tokens = max_sequence_length
     config.actor_rollout_ref.rollout.calculate_log_probs = True
     config.actor_rollout_ref.rollout.agent.num_workers = WORLD_SIZE
+    config.actor_rollout_ref.rollout.prompt_length = prompt_length
     config.actor_rollout_ref.rollout.response_length = response_length
-    config.data.max_prompt_length = 2048
+    config.data.max_prompt_length = prompt_length
     config.data.max_response_length = response_length
     config.algorithm.adv_estimator = "grpo" if role == "service" else "reinforce_plus_plus"
     config.algorithm.use_kl_in_reward = False

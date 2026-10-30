@@ -51,6 +51,10 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
     monkeypatch.delattr(extension, 'UsamiServiceAgentLoop', raising=False)
     cls = extension.UsamiServiceAgentLoop
     loop = cls()
+    loop.rollout_config.prompt_length = 3
+    assert loop._cap_text_prompt_length([1, 2, 3]) == [1, 2, 3]
+    with pytest.raises(ValueError, match='initial Service prompt exceeds'):
+        loop._cap_text_prompt_length([1, 2, 3, 4])
     class Server:
         def __init__(self): self.inputs = []; self.sampling = []
         async def generate(self, request_id, *, prompt_ids, sampling_params):

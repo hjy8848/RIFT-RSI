@@ -33,6 +33,11 @@ def __getattr__(name):
     from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput
 
     class UsamiServiceAgentLoop(AgentLoopBase):
+        def _cap_text_prompt_length(self, prompt_ids):
+            if len(prompt_ids) > self.rollout_config.prompt_length:
+                raise ValueError('initial Service prompt exceeds the configured prompt budget')
+            return prompt_ids
+
         def __init__(self, *args, rift_host_provider=None,
                      rift_host_provider_factory=None, **kwargs):
             super().__init__(*args, **kwargs)
