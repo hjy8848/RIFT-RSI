@@ -125,6 +125,10 @@ def __getattr__(name):
                     if logprobs_present is not None and logprobs_present != (token_logprobs is not None):
                         raise ValueError('inconsistent generation log-probability capture')
                     logprobs_present = token_logprobs is not None
+                    # VERL's continuous-token builder requires a response-side
+                    # accumulator before appending the first assistant logprobs.
+                    if token_logprobs is not None and logprobs is None:
+                        logprobs = []
                     merged, masks, logprobs = await self.ct_merge_assistant_token(
                         prefix, token_ids, masks, logprobs, assistant_logprobs=token_logprobs)
                     capture.add_generation(prefix, token_ids, token_logprobs, merged.token_ids, masks)

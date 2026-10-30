@@ -31,9 +31,15 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
         def __init__(self): self.rollout_config = SimpleNamespace(response_length=20, n=4); self.tokenizer = None
         async def ct_build_initial_tokens(self, messages, tools=None): return [1]
         async def ct_merge_assistant_token(self, old, output, mask, logs, assistant_logprobs=None):
-            return SimpleNamespace(token_ids=old + output), mask + [1] * len(output), None
+            if assistant_logprobs is not None and logs is None:
+                raise ValueError('response_logprobs is required when assistant_logprobs is provided')
+            merged_logs = logs
+            if assistant_logprobs is not None:
+                merged_logs = logs + assistant_logprobs
+            return SimpleNamespace(token_ids=old + output), mask + [1] * len(output), merged_logs
         async def ct_merge_context_msg(self, prev, new, old, mask, logs, tools=None):
-            return SimpleNamespace(token_ids=old + [7]), mask + [0], None
+            merged_logs = None if logs is None else logs + [0.0]
+            return SimpleNamespace(token_ids=old + [7]), mask + [0], merged_logs
     class Output:
         def __init__(self, **fields): self.__dict__.update(fields)
     for name in ('verl', 'verl.experimental', 'verl.experimental.agent_loop'):
@@ -49,7 +55,8 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
         def __init__(self): self.inputs = []
         async def generate(self, request_id, *, prompt_ids, sampling_params):
             self.inputs.append(prompt_ids)
-            return SimpleNamespace(token_ids=[2, 3] if len(self.inputs)==1 else [4], log_probs=None,
+            return SimpleNamespace(token_ids=[2, 3] if len(self.inputs)==1 else [4],
+                log_probs=[-0.1, -0.2] if len(self.inputs)==1 else [-0.3],
                 extra_fields={'global_steps':1,'min_global_steps':1,'max_global_steps':1})
     loop.server_manager = Server()
     class Session:
@@ -99,6 +106,7 @@ def test_agent_loop_captures_server_tokens_and_business_only_reward(monkeypatch)
         rift_expected_checkpoint={'policy':'service','revision':'v1','tokenizer':'tok','weights_digest':'weights'}))
     assert loop.server_manager.inputs == [[1], [1, 2, 3, 7]]
     assert result.response_ids == [2, 3, 7, 4] and result.response_mask == [1, 1, 0, 1]
+    assert result.response_logprobs == [-0.1, -0.2, 0.0, -0.3]
     assert result.reward_score == 1 and sink.decisions[1].tokens.prompt == (1, 2, 3, 7)
     assert host.sessions[-1].expected_group_size == 4
     assert host.session_ids[-1] == 0 and type(host.session_ids[-1]) is int
