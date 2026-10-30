@@ -9,6 +9,27 @@ from queue import Queue
 from uuid import uuid4
 
 
+def service_tool_protocol_reminder(tools):
+    """Build public schema reminders without exposing private task data."""
+    empty_param_tools = []
+    for row in tools:
+        function = row.get("function", {})
+        spec = (function.get("parameters", {}).get("properties", {})
+                .get("params", {}))
+        if (spec.get("type") == "object" and spec.get("properties") == {}
+                and spec.get("additionalProperties") is False):
+            empty_param_tools.append(function["name"])
+    return (
+        "RIFT Service turn protocol: emit exactly ONE complete tool call, then "
+        "stop and let the environment return the tool result. Never output "
+        "multiple <tool_call> blocks in the same assistant turn. Tool arguments "
+        "must match the supplied function JSON schema exactly. In particular, "
+        "do not add fields such as 'messages' to params. For these operations "
+        "the params field MUST be the empty object {}: "
+        + ", ".join(sorted(empty_param_tools)) + "."
+    )
+
+
 class _ParserExecutionFailure(Exception):
     def __init__(self, call, cause):
         super().__init__(str(cause))
@@ -90,7 +111,8 @@ class NativeUsamiSession:
             raise ValueError('native episode ended before the first Service decision') from (value if kind == 'error' else None)
         self._prompt = value
         self._waiting = True
-        messages = [{'role': 'system', 'content': OpenAIServiceAgent.SYSTEM},
+        messages = [{'role': 'system', 'content': OpenAIServiceAgent.SYSTEM + "\n\n"
+                    + service_tool_protocol_reminder(self._tools)},
             {'role': 'user', 'content': json.dumps({'authenticated_customer_id': value.customer_id,
                 'available_merchant_scope_ids': list(value.available_merchant_scope_ids),
                 'customer_request': value.customer_request}, ensure_ascii=False)}]

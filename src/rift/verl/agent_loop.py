@@ -4,6 +4,29 @@ import json
 from uuid import uuid4
 from rift.verl.capture import ContinuousCapture
 
+
+def single_tool_turn_sampling_params(sampling_params, parser):
+    """Stop after one complete Hermes tool call and keep its closing marker."""
+    params = dict(sampling_params)
+    if getattr(parser, "tool_call_end_token", None) != "</tool_call>":
+        return params
+    existing = params.get("stop")
+    if existing is None:
+        stops = []
+    elif isinstance(existing, str):
+        stops = [existing]
+    elif isinstance(existing, (list, tuple)) and all(
+            isinstance(stop, str) and stop for stop in existing):
+        stops = list(existing)
+    else:
+        raise ValueError("vLLM stop must be a string or a sequence of nonempty strings")
+    if "</tool_call>" not in stops:
+        stops.append("</tool_call>")
+    params["stop"] = stops
+    params["include_stop_str_in_output"] = True
+    return params
+
+
 def __getattr__(name):
     if name != 'UsamiServiceAgentLoop':
         raise AttributeError(name)
@@ -110,6 +133,8 @@ def __getattr__(name):
                         turn_sampling_params.get('seed', 0) if base_seed is None else base_seed,
                         session.rollout_id if seed_scope is None else seed_scope,
                         len(capture.decisions))
+                    turn_sampling_params = single_tool_turn_sampling_params(
+                        turn_sampling_params, getattr(session, 'parser', None))
                     output = await self.server_manager.generate(request_id=model_request_id, prompt_ids=prefix,
                                                                 sampling_params=turn_sampling_params)
                     token_ids = list(output.token_ids)
