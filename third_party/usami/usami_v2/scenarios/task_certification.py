@@ -161,6 +161,7 @@ class TaskCertification(Sealed):
     business_reachability_certified: bool
     full_task_reachability_certified: bool
     interaction_certified: bool = False
+    witness_cost: Dict[str, object] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def budget_binding(self):
@@ -187,70 +188,32 @@ def _bind_scenario(world: World, task: TaskSpec, scenario: CustomerScenario):
 
 
 def _base_candidate_options(world: World, goal: RemedyGoal, scenario: CustomerScenario, blockers):
+    """Phase 1 candidate grammar: the atomic delivered-items refund only."""
     line = world.lines[goal.line_id]
     original = world.skus[line.sku_id]
-    indices = tuple(range(goal.quantity))
-    credit = unit_credit(line, indices)
-    evidence = [row for row in world.evidence.values()
-                if row.line_id == line.id and row.customer_id == scenario.customer_id and row.valid]
-    if not evidence:
-        return ()
+    credit = unit_credit(line, tuple(range(goal.quantity)))
     options = []
     for remedy in goal.allowed_remedies:
         if remedy not in scenario.accepted_remedies:
             continue
-        if remedy == "refund":
-            if goal.required_attributes or goal.latest_arrival is not None:
-                continue
-            if original.return_required and (not scenario.return_pickup_slot
-                                             or scenario.return_received_after_days is None):
-                blockers.append("return_receipt_event_not_registered_in_frozen_customer_scenario")
-                continue
-            review_plan = next((row for row in scenario.reviews if row.line_id == line.id), None)
-            if (credit > world.merchants[world.orders[line.order_id].merchant_id].refund_approval_limit_cents
-                    and review_plan is None):
-                blockers.append("policy_review_event_not_registered_in_frozen_customer_scenario")
-                continue
-            options.append(PlanCandidate(goal_id=goal.goal_id, remedy=remedy))
+        if remedy != "refund":
+            blockers.append("replacement_path_not_migrated_in_phase_1")
             continue
-        targets = sorted(world.skus.values(), key=lambda row: row.id)
-        warehouses = sorted(world.warehouses.values(), key=lambda row: row.id)
-        for target in targets:
-            if target.merchant_id != original.merchant_id or target.product_family != original.product_family:
-                continue
-            if remedy == "reship" and target.id != original.id:
-                continue
-            if any(target.attributes.get(row.name) != row.value for row in goal.required_attributes):
-                continue
-            for warehouse in warehouses:
-                inv = next((row for row in world.inventory.values()
-                            if row.sku_id == target.id and row.warehouse_id == warehouse.id), None)
-                route = next((row for row in world.routes.values()
-                              if row.warehouse_id == warehouse.id), None)
-                if not inv or not route or inv.available < goal.quantity:
-                    continue
-                if original.return_required and (not scenario.return_pickup_slot
-                                                 or scenario.return_received_after_days is None):
-                    blockers.append("return_receipt_event_not_registered_in_frozen_customer_scenario")
-                    continue
-                delta = target.price_cents * goal.quantity + route.fee_cents - credit
-                extra = max(delta, 0) if remedy == "exchange" else 0
-                arrival = world.clock + timedelta(days=route.days)
-                if extra > scenario.maximum_extra_charge_cents:
-                    continue
-                if goal.maximum_extra_charge_cents is not None and extra > goal.maximum_extra_charge_cents:
-                    continue
-                if goal.latest_arrival is not None and arrival > goal.latest_arrival:
-                    continue
-                if scenario.latest_arrival is not None and arrival > scenario.latest_arrival:
-                    continue
-                if goal.target_stage == "delivered":
-                    blockers.append("delivery_confirmation_event_not_registered_in_commerce_v1")
-                    continue
-                options.append(PlanCandidate(goal_id=goal.goal_id, remedy=remedy,
-                                             target_sku_id=target.id, warehouse_id=warehouse.id))
+        if goal.required_attributes or goal.latest_arrival is not None:
+            continue
+        if goal.target_stage == "delivered":
+            blockers.append("delivery_confirmation_event_not_registered_in_commerce_v1")
+            continue
+        if original.return_required:
+            blockers.append("physical_return_path_not_migrated_in_phase_1")
+            continue
+        if goal.quantity > line.quantity:
+            continue
+        if credit > world.merchants[world.orders[line.order_id].merchant_id].refund_approval_limit_cents:
+            blockers.append("refund_exceeds_approval_limit_without_review_path_in_phase_1")
+            continue
+        options.append(PlanCandidate(goal_id=goal.goal_id, remedy=remedy))
     return tuple(options)
-
 
 def _step(kind, before, after, **evidence):
     return ProofStep(kind=kind, before_state_hash=before.state_hash,
@@ -366,89 +329,17 @@ def _run_candidate(world, task, scenario, candidates, attempt_id, max_steps):
 
     for candidate in candidates:
         goal = goals[candidate.goal_id]
-        line = state.lines[goal.line_id]
-        evidence = next((row for row in sorted(state.evidence.values(), key=lambda row: row.id)
-                         if row.line_id == line.id and row.customer_id == scenario.customer_id and row.valid), None)
-        if evidence is None:
-            reason = "no_valid_customer_evidence"
+        if candidate.remedy != "refund":
+            reason = "replacement_path_not_migrated_in_phase_1"
             break
-        error = act("open_remedy_case", line.id, {"quantity": goal.quantity, "issue": evidence.issue})
+        # Phase 1: the single atomic refund validates delivery, window, quantity,
+        # duplicate refunds, approval limit and payment method inside the Engine,
+        # and the Reference recomputes the same state transition independently.
+        error = act("return_delivered_order_items", goal.line_id,
+                    {"quantity": goal.quantity, "payment_method": "original"})
         if error:
             reason = error
             break
-        opened = steps[-1].evidence["result"]["data"]
-        case_id = opened["case_id"]
-        error = act("verify_submitted_evidence", case_id, {"evidence_id": evidence.id})
-        if error:
-            reason = error
-            break
-        original = state.skus[line.sku_id]
-        credit = unit_credit(line, tuple(range(goal.quantity)))
-        review_plan = next((row for row in scenario.reviews if row.line_id == line.id), None)
-        if candidate.remedy == "refund" and credit > state.merchants[state.orders[line.order_id].merchant_id].refund_approval_limit_cents:
-            if review_plan is None:
-                reason = "refund_requires_unregistered_policy_review_event"
-                break
-            error = act("request_policy_review", case_id, {})
-            if error:
-                reason = error
-                break
-            event_id = "review_" + digest([scenario.record_hash, case_id])[:20]
-            event = ExternalEvent(id=event_id, kind="review_result", target_id=case_id,
-                                  at=state.clock + timedelta(days=review_plan.result_after_days),
-                                  approved=review_plan.approved)
-            state, event_steps = _apply_event(state, event)
-            steps.extend(event_steps)
-            if not review_plan.approved:
-                reason = "policy_review_denied_in_frozen_customer_scenario"
-                break
-        pickup = scenario.return_pickup_slot if original.return_required else None
-        params = {"remedy": candidate.remedy,
-                  "target_sku_id": candidate.target_sku_id,
-                  "warehouse_id": candidate.warehouse_id,
-                  "pickup_slot": pickup}
-        error = act("prepare_remedy_quote", case_id, params)
-        if error:
-            reason = error
-            break
-        prepared = steps[-1].evidence["result"]["data"]["quote"]["id"]
-        state, consent_step, error = _customer_consent(state, prepared, "commit_accepted_quote", task, scenario)
-        if error:
-            reason = error
-            break
-        steps.append(consent_step)
-        error = act("commit_accepted_quote", prepared, {})
-        if error:
-            reason = error
-            break
-        quote = state.quotes[prepared]
-        if quote.return_required:
-            if scenario.return_received_after_days is None:
-                reason = "return_receipt_absent_from_frozen_event_plan"
-                break
-            case = state.cases[quote.case_id]
-            error = act("schedule_authorized_return", case.id, {})
-            if error:
-                reason = error
-                break
-            event_id = "return_" + digest([scenario.record_hash, case.id])[:20]
-            event = ExternalEvent(id=event_id, kind="return_received", target_id=case.id,
-                                  at=state.clock + timedelta(days=scenario.return_received_after_days))
-            state, event_steps = _apply_event(state, event)
-            steps.extend(event_steps)
-            if quote.remedy == "refund":
-                state, consent_step, error = _customer_consent(
-                    state, prepared, "release_accepted_refund", task, scenario)
-                if error:
-                    reason = error
-                    break
-                steps.append(consent_step)
-                error = act("release_accepted_refund", case.id, {})
-            else:
-                error = act("ship_accepted_replacement", case.id, {})
-            if error:
-                reason = error
-                break
     else:
         score = evaluate_state_goals(world, state, task)
         result_map = tuple((row.goal_id, row.status) for row in score)
@@ -536,8 +427,28 @@ def certify_task(world: World, task: TaskSpec, customer_scenario: CustomerScenar
         minimum_witnesses=minimum_witnesses,
         minimum_witnesses_met=len(witnesses) >= minimum_witnesses,
         business_reachability_certified=bool(witnesses),
-        full_task_reachability_certified=full, interaction_certified=False)
+        full_task_reachability_certified=full, interaction_certified=False,
+        witness_cost=_witness_cost(tuple(attempts)))
 
+
+
+def _witness_cost(attempts) -> Dict[str, int]:
+    """Minimum episode cost implied by the first certified witness path."""
+    witnesses = [row for row in attempts if row.status == "WITNESS"]
+    if not witnesses:
+        return {}
+    steps = witnesses[0].steps
+    operations = sum(1 for row in steps if row.kind == "operation")
+    consents = sum(1 for row in steps if row.kind == "customer_consent")
+    return {"tool_calls": operations,
+            "service_decisions": operations + 1,
+            "customer_turns": consents + 1,
+            "model_calls": operations + consents + 1}
+
+
+def certification_cost(certification: TaskCertification) -> Dict[str, int]:
+    """Public accessor for the certified minimum episode cost."""
+    return dict(certification.witness_cost) or _witness_cost(certification.attempts)
 
 def _product_size(option_sets):
     total = 1

@@ -64,30 +64,32 @@ def test_hermes_stop_rejects_invalid_stop_settings(stop):
         single_tool_turn_sampling_params({"stop": stop}, parser)
 
 
-def test_protocol_reminder_lists_schema_empty_params_tools_only():
-    tools = [
-        {"function": {"name": "request_policy_review", "parameters": {
-            "type": "object", "properties": {"params": {
-                "type": "object", "properties": {}, "additionalProperties": False}}}}},
-        {"function": {"name": "search_catalog", "parameters": {
-            "type": "object", "properties": {"params": {
-                "type": "object", "properties": {"query": {"type": "string"}},
-                "additionalProperties": False}}}}},
-    ]
+def test_protocol_reminder_states_flat_argument_contract():
+    tools = [{"function": {"name": "list_customer_orders", "parameters": {
+        "type": "object", "properties": {}, "additionalProperties": False}}},
+        {"function": {"name": "get_order_details", "parameters": {
+            "type": "object", "properties": {"order_id": {"type": "string"}},
+            "additionalProperties": False}}}]
 
     reminder = service_tool_protocol_reminder(tools)
 
     assert "exactly ONE complete tool call" in reminder
     assert "Never output multiple <tool_call> blocks" in reminder
-    assert "params field MUST be the empty object {}: request_policy_review." in reminder
-    assert "search_catalog" not in reminder
+    assert "never wrap them in a 'params' object" in reminder
+    assert "list_customer_orders" in reminder and "get_order_details" in reminder
 
 
 def test_protocol_reminder_matches_native_service_tool_schemas():
     from usami_v2.runtime.agents import service_tools
 
-    reminder = service_tool_protocol_reminder(service_tools())
+    tools = service_tools()
+    reminder = service_tool_protocol_reminder(tools)
 
-    assert "get_case_status" in reminder
-    assert "request_policy_review" in reminder
+    assert "return_delivered_order_items" in reminder
+    assert "respond_to_customer" in reminder
+    assert "open_remedy_case" not in reminder
     assert "search_catalog" not in reminder
+    for tool in tools:
+        properties = tool["function"]["parameters"]["properties"]
+        assert "params" not in properties
+        assert "scope_id" not in properties

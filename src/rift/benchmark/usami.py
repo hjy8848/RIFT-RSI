@@ -216,6 +216,14 @@ class CommerceHost:
                             'status':public_result.status.value, 'native_status':native_status,
                             'reason':list(reasons)})
                         continue
+                    from usami_v2.scenarios.task_certification import certification_cost
+                    witness_cost = certification_cost(native_certificate)
+                    if not self._budget_covers(witness_cost):
+                        attempts.append({'candidate_index':index, 'task_ref':task.record_hash,
+                            'status':'UNKNOWN', 'native_status':native_status,
+                            'reason':['certified_witness_cost_exceeds_episode_budget'],
+                            'witness_cost':witness_cost})
+                        continue
                     identity = self.identity_factory(task, spec, build)
                     from rift.schemas import DataPurpose, Identity, Split
                     if (not isinstance(identity, Identity) or identity.split is not Split.TRAIN
@@ -231,7 +239,7 @@ class CommerceHost:
                         proposal.proposal_id, native_certificate, verified=True)
                     attempts.append({'candidate_index':index, 'task_ref':task.record_hash,
                         'status':public_result.status.value, 'native_status':native_status,
-                        'reason':list(reasons)})
+                        'reason':list(reasons), 'witness_cost':witness_cost})
                     certifications.append(public_result)
                     tasks.append(task)
                     selected_task = task
@@ -265,6 +273,14 @@ class CommerceHost:
         return DesignerTrainingWorld(proposal.proposal_id, self.distribution.record_hash,
             world_ref, spec, build, build_verification, tuple(challenge_results),
             tuple(certifications), tuple(tasks))
+
+    def _budget_covers(self, cost):
+        """Reject tasks whose certified witness path cannot fit the episode budget."""
+        budget = self.episode_budget
+        return (cost.get('tool_calls', 0) <= budget.max_service_tool_calls
+                and cost.get('customer_turns', 0) <= budget.max_customer_turns
+                and cost.get('model_calls', 0) <= budget.max_model_calls
+                and cost.get('service_decisions', 0) <= budget.max_service_decisions)
 
     def rollout(self, task, service):
         record = self.task_registry.resolve_record(task.record_hash)

@@ -145,7 +145,7 @@ def decide(world, actor, op):
     else:
         if op.name == "get_order_details":
             order = world.orders.get(key)
-        elif op.name in ("open_remedy_case", "get_refundable_balance"):
+        elif op.name in ("open_remedy_case", "get_refundable_balance", "return_delivered_order_items"):
             line = world.lines.get(key)
         elif op.name in ("commit_accepted_quote", "cancel_pending_commitment"):
             quote = world.quotes.get(key)
@@ -171,6 +171,54 @@ def decide(world, actor, op):
                 for row in world.delegations.values()):
             return deny("BUSINESS_DELEGATION_REQUIRED")
     expected, data = world.clone(), {}
+    if op.name == "return_delivered_order_items":
+        # Independent mirror of the atomic refund contract: identity scope,
+        # delivery/window/quantity/duplicate and payment-method policy are all
+        # re-derived here; no Evidence, damage issue or quote consent applies.
+        if not any(row.customer_id == actor and line.id in row.line_ids
+                   and not row.withdrawn and row.expires_at >= world.clock
+                   and row.source_customer_event_hash
+                   for row in world.delegations.values()):
+            return deny("BUSINESS_DELEGATION_REQUIRED")
+        if p["payment_method"] != "original":
+            return deny("PAYMENT_METHOD_UNSUPPORTED")
+        sku = world.skus[line.sku_id]
+        if order.delivered_at > world.clock:
+            return deny("ORDER_NOT_DELIVERED")
+        if world.clock > order.delivered_at + timedelta(days=sku.return_days):
+            return deny("RETURN_WINDOW_EXPIRED")
+        if sku.return_required:
+            return deny("RETURN_REQUIRED")
+        settled = set()
+        for row in world.settlements.values():
+            if row.line_id == line.id:
+                settled.update(row.unit_indices)
+        occupied = set(settled)
+        for row in world.cases.values():
+            if row.line_id == line.id and row.status not in ("cancelled", "resolved"):
+                occupied.update(row.unit_indices)
+        available = [index for index in range(line.quantity) if index not in occupied]
+        if not available:
+            return deny("ALREADY_REFUNDED")
+        if len(available) < p["quantity"]:
+            return deny("PURCHASED_QUANTITY_UNAVAILABLE")
+        indices = tuple(available[:p["quantity"]])
+        amount = unit_credit(line, indices)
+        if amount > world.merchants[order.merchant_id].refund_approval_limit_cents:
+            return deny("APPROVAL_REQUIRED")
+        cid, qid = case_id(line.id, indices), quote_id(case_id(line.id, indices), 1)
+        refund = Quote(id=qid, case_id=cid, customer_id=actor, remedy="refund",
+                       quantity=len(indices), refund_cents=amount, extra_charge_cents=0,
+                       payment_channel=order.payment_channel, return_required=False,
+                       status="committed", revision=1,
+                       valid_until=world.clock + timedelta(hours=1))
+        expected.cases[cid] = RemedyCase(id=cid, line_id=line.id, unit_indices=indices,
+                                         committed_quote_id=qid)
+        expected.quotes[qid] = refund
+        _project_settlement(expected, refund, False)
+        data = {"status": "refund_issued", "line_id": line.id, "quantity": len(indices),
+                "refund_cents": amount, "payment_channel": order.payment_channel}
+        return Decision(allowed=True, expected_state=expected, data=data)
     if op.name == "open_remedy_case":
         sku = world.skus[line.sku_id]
         if order.delivered_at > world.clock:

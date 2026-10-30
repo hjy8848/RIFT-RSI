@@ -24,7 +24,7 @@ def _hard_scope(world, actor, op):
     key = op.resource_id
     if op.name in ("get_order_details",):
         order = world.orders.get(key)
-    elif op.name in ("open_remedy_case", "get_refundable_balance"):
+    elif op.name in ("open_remedy_case", "get_refundable_balance", "return_delivered_order_items"):
         line = world.lines.get(key)
         order = world.orders.get(line.order_id) if line else None
     else:
@@ -91,7 +91,48 @@ def apply(world, actor, op, event_index):
             return world.clone(), Result(success=False, error_code="QUERY_NOT_REPRESENTABLE")
     new, p, key = world.clone(), op.params, op.resource_id
     try:
-        if op.name == "open_remedy_case":
+        if op.name == "return_delivered_order_items":
+            # One Agent-facing business action: validate the delivered purchase
+            # and issue the refund to the original payment channel. Internal
+            # case/quote/settlement rows stay Agent-invisible and are never
+            # fabricated: no Evidence, no damage issue, no consent lifecycle.
+            line = new.lines[key]
+            order = new.orders[line.order_id]
+            sku = new.skus[line.sku_id]
+            if p["payment_method"] != "original":
+                return world.clone(), Result(success=False, error_code="PAYMENT_METHOD_UNSUPPORTED")
+            if order.delivered_at > new.clock:
+                return world.clone(), Result(success=False, error_code="ORDER_NOT_DELIVERED")
+            if new.clock > order.delivered_at + timedelta(days=sku.return_days):
+                return world.clone(), Result(success=False, error_code="RETURN_WINDOW_EXPIRED")
+            if sku.return_required:
+                return world.clone(), Result(success=False, error_code="RETURN_REQUIRED")
+            refunded = {i for row in new.settlements.values()
+                        if row.line_id == key for i in row.unit_indices}
+            in_progress = {i for row in new.cases.values() if row.line_id == key
+                           and row.status not in ("cancelled", "resolved")
+                           for i in row.unit_indices}
+            available = [i for i in range(line.quantity) if i not in refunded and i not in in_progress]
+            if not available:
+                return world.clone(), Result(success=False, error_code="ALREADY_REFUNDED")
+            if len(available) < p["quantity"]:
+                return world.clone(), Result(success=False, error_code="PURCHASED_QUANTITY_UNAVAILABLE")
+            indices = tuple(available[:p["quantity"]])
+            amount = unit_credit(line, indices)
+            if amount > new.merchants[order.merchant_id].refund_approval_limit_cents:
+                return world.clone(), Result(success=False, error_code="APPROVAL_REQUIRED")
+            cid, qid = case_id(key, indices), quote_id(case_id(key, indices), 1)
+            new.cases[cid] = RemedyCase(id=cid, line_id=key, unit_indices=indices,
+                                        committed_quote_id=qid)
+            refund = Quote(id=qid, case_id=cid, customer_id=actor, remedy="refund",
+                           quantity=len(indices), refund_cents=amount, extra_charge_cents=0,
+                           payment_channel=order.payment_channel, return_required=False,
+                           status="committed", revision=1, valid_until=new.clock + timedelta(hours=1))
+            new.quotes[qid] = refund
+            _settle(new, refund, inventory_pre_reserved=False)
+            data = {"status": "refund_issued", "line_id": key, "quantity": len(indices),
+                    "refund_cents": amount, "payment_channel": order.payment_channel}
+        elif op.name == "open_remedy_case":
             line = new.lines[key]
             occupied = {i for row in new.cases.values() if row.line_id == key and row.status != "cancelled"
                         for i in row.unit_indices}

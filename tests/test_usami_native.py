@@ -14,7 +14,7 @@ from rift.tasks import CertificationStatus
 
 def test_native_certification():
     world, aliases = frozen_world()
-    task = make_task(world, aliases, attributes=({'name':'interface','value':'USB_C'},))
+    task = make_task(world, aliases, remedy=('refund',))
     result = certify('proposal', world, task, customer_scenario(aliases), ProofBudget(max_plan_candidates=16, max_operation_steps=16, max_witnesses=2))
     assert result.status is CertificationStatus.CERTIFIED and result.task_ref == task.record_hash
     assert set(result.__dict__) == {'proposal_id', 'status', 'task_ref'}
@@ -26,14 +26,14 @@ def test_designer_diagnostic_removal_preserves_frozen_usami_results():
     from rift.benchmark.public_feedback import service_reward
 
     world, aliases = frozen_world(13)
-    task = make_task(world, aliases, attributes=({'name':'interface','value':'USB_C'},))
+    task = make_task(world, aliases, remedy=('refund',))
     scenario = customer_scenario(aliases)
     certificate = certify_task(world, task, scenario,
         ProofBudget(max_plan_candidates=16, max_operation_steps=16, max_witnesses=2),
         minimum_witnesses=2)
     assert world.state_hash == '136651c71bc21af5ffb39fce47eba0a6d438078faaf9338087296a8f3c50a21c'
-    assert task.record_hash == '7d51d32e779ffa50ee14cc8b2ad3cb2bde12ee438c54329e2b9516751270fd3a'
-    assert certificate.record_hash == 'f1eaf9e63d8ec42f6b758dbf84ea5ee5ee9f6d5a85e99ea41b8d878a9ac365e0'
+    assert task.record_hash == 'a265fdaa9318b247b15cf916a386146fcba7f39610182c2734092f09c9d7a70c'
+    assert certificate.record_hash == '3ad0e030db560baa5629e30b1b64731b789fa90deb42ec7a2ff3f7ca04c1f3da'
     assert certificate.status == 'CERTIFIED'
     assert verify_task_certificate(world, task, scenario, certificate)['verified']
 

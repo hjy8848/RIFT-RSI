@@ -89,7 +89,8 @@ class RemedyCase(Model):
     id: str
     line_id: str
     unit_indices: Tuple[StrictInt, ...] = Field(min_length=1)
-    issue: Literal["damaged", "wrong_item", "missing_parts"]
+    # ordinary refunds do not inspect or fabricate a damage issue/Evidence
+    issue: Optional[Literal["damaged", "wrong_item", "missing_parts"]] = None
     status: Literal["open", "verified", "awaiting_return", "ready", "resolved", "cancelled"] = "open"
     evidence_id: Optional[str] = None
     review_requested: bool = False
@@ -274,6 +275,12 @@ class PrepareQuoteInput(Model):
     pickup_slot: Optional[str] = None
 
 
+class ReturnItemsInput(Model):
+    quantity: int = Field(gt=0, strict=True)
+    # Phase 1: an ordinary refund always returns to the original payment channel.
+    payment_method: Literal["original"] = "original"
+
+
 PARAMETERS = {
     "list_customer_orders": Empty, "get_order_details": Empty,
     "search_catalog": CatalogInput, "get_sku_details": Empty,
@@ -284,6 +291,7 @@ PARAMETERS = {
     "commit_accepted_quote": Empty, "schedule_authorized_return": Empty,
     "release_accepted_refund": Empty, "ship_accepted_replacement": Empty,
     "cancel_pending_commitment": Empty,
+    "return_delivered_order_items": ReturnItemsInput,
 }
 QUERIES = frozenset(name for name in PARAMETERS if name.startswith(("get_", "list_", "search_", "estimate_")))
 PREPARATIONS = frozenset({"open_remedy_case", "verify_submitted_evidence",

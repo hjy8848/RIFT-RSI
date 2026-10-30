@@ -59,7 +59,7 @@ class ServiceAction(Sealed):
     call_id: str = ""
 
     @classmethod
-    def from_tool_message(cls, raw, customer_id, observed_subject_ids=()):
+    def from_tool_message(cls, raw, customer_id, observed_subject_ids=(), merchant_scope_ids=()):
         message = _one_tool_call(raw)
         call = message["tool_calls"][0]
         name, args = call["function"]["name"], _json_arguments(call["function"]["arguments"])
@@ -75,16 +75,40 @@ class ServiceAction(Sealed):
             return cls(kind="reply", message=args["message"], present_quote_id=args.get("present_quote_id"),
                        present_for=args.get("present_for") or "commit_accepted_quote", subject_ids=subjects,
                        call=completion, call_id=call["id"])
-        if name not in PARAMETERS:
+        if name not in PUBLIC_PARAMETERS:
             raise ServiceError("MODEL_OUTPUT_INVALID", "Service selected an unregistered commerce tool")
+        scope = _single_merchant_scope(merchant_scope_ids)
+        if name == "list_customer_orders":
+            resource, params = scope, {}
+        elif name == "get_order_details":
+            order_id = args.get("order_id")
+            if not isinstance(order_id, str) or not order_id:
+                raise ServiceError("MODEL_OUTPUT_INVALID", "get_order_details requires an order_id")
+            resource, params = order_id, {}
+        else:
+            line_id = args.get("line_id")
+            if not isinstance(line_id, str) or not line_id:
+                raise ServiceError("MODEL_OUTPUT_INVALID", "return_delivered_order_items requires a line_id")
+            resource = line_id
+            params = {"quantity": args.get("quantity"),
+                      "payment_method": args.get("payment_method") or "original"}
         try:
-            operation = Operation(name=name, scope_id=args["scope_id"], resource_id=args["resource_id"],
-                                  params=args.get("params", {}))
+            operation = Operation(name=name, scope_id=scope, resource_id=resource, params=params)
         except (KeyError, TypeError, ValueError):
             raise ServiceError("MODEL_OUTPUT_INVALID", "Service tool arguments do not match the native schema") from None
         # A Request is created only by the Runner for this exact tool call; the
-        # Reference still independently checks identity, delegation and consent.
+        # Reference still independently checks identity, delegation, ownership
+        # and the refund business rules.
         return cls(kind="operation", operation=operation, call=completion, call_id=call["id"])
+
+
+def _single_merchant_scope(merchant_scope_ids):
+    """Phase 1 worlds expose one merchant scope; no model-supplied tenant ID."""
+    scopes = tuple(merchant_scope_ids or ())
+    if len(scopes) != 1:
+        raise ServiceError("MODEL_OUTPUT_INVALID",
+                           "this world exposes exactly one merchant scope for customer-scoped tools")
+    return scopes[0]
 
 
 def _usage(raw, name):
@@ -140,64 +164,50 @@ def _schema_with_defs(model):
     return schema, definitions
 
 
+PUBLIC_TOOLS = ("list_customer_orders", "get_order_details", "return_delivered_order_items")
+PUBLIC_PARAMETERS = frozenset(PUBLIC_TOOLS)
+
+
+def _public_tool(name, description, properties, required):
+    return {"type": "function", "function": {
+        "name": name, "description": description,
+        "parameters": {"type": "object", "properties": properties,
+                       "required": required, "additionalProperties": False}}}
+
+
 def service_tools():
-    descriptions = {
-        "list_customer_orders": "List orders belonging to the authenticated customer in a merchant scope. Set scope_id to a merchant ID and resource_id to that same merchant ID; params is an empty object.",
-        "get_order_details": "Read an order and its lines. resource_id is the order ID; scope_id is its merchant ID; params is empty.",
-        "search_catalog": "Search a merchant catalog. Set scope_id and resource_id to the same merchant ID; use params to filter product_family and attributes.",
-        "get_sku_details": "Read one SKU. resource_id is the SKU ID and scope_id is its merchant ID; params is empty.",
-        "get_inventory": "Read inventory rows for one SKU. resource_id is the SKU ID and scope_id is its merchant ID; params is empty.",
-        "estimate_delivery": "Estimate delivery for one SKU. resource_id is the SKU ID, scope_id is its merchant ID, and params supplies warehouse_id and optionally quantity.",
-        "get_refundable_balance": "Read the unrefunded purchased units and original credit for one order line. resource_id is the order-line ID; scope_id is its merchant ID; params is empty.",
-        "get_case_status": "Read one remedy case, its quotes and returns, and submitted evidence references for the case line. Evidence references are not pre-verified. resource_id is the case ID; scope_id is its merchant ID; params is empty.",
-        "open_remedy_case": "Prepare a remedy case for one purchased order line after customer delegation. resource_id is the order-line ID; params supplies quantity and issue.",
-        "verify_submitted_evidence": "Verify already submitted evidence for a remedy case. First use get_case_status to obtain an evidence_id for this case; resource_id is the case ID and params supplies that evidence_id. Querying does not verify the evidence.",
-        "request_policy_review": "Request policy review for an existing remedy case. resource_id is the case ID; params is empty.",
-        "prepare_remedy_quote": "Prepare refund, exchange, or reship terms for a verified remedy case. resource_id is the case ID; params supplies remedy and any replacement details.",
-        "commit_accepted_quote": "Commit an existing quote only when the runtime has recorded exact customer consent. resource_id is the quote ID; params is empty.",
-        "schedule_authorized_return": "Schedule the return required by a committed quote. resource_id is the case ID; params is empty.",
-        "release_accepted_refund": "Release a refund for a committed case only when the runtime has recorded exact refund-release consent. resource_id is the case ID; params is empty.",
-        "ship_accepted_replacement": "Ship the replacement for a committed case after required return conditions are met. resource_id is the case ID; params is empty.",
-        "cancel_pending_commitment": "Cancel an existing pending quote commitment. resource_id is the quote ID; params is empty.",
-    }
-    tools = []
-    for name, parameter_model in sorted(PARAMETERS.items()):
-        schema, definitions = _schema_with_defs(parameter_model)
-        tools.append({"type": "function", "function": {
-            "name": name, "description": descriptions[name],
-            "parameters": {"type": "object", "properties": {
-                "scope_id": {"type": "string", "description": "Merchant ID defining the business scope."},
-                "resource_id": {"type": "string", "description": descriptions[name]}, "params": schema,
-            }, "required": ["scope_id", "resource_id", "params"], "additionalProperties": False,
-                **({"$defs": definitions} if definitions else {})}}})
-    tools.append({"type": "function", "function": {
-        "name": "respond_to_customer", "description": (
-            "Send the next customer-facing message. The runtime automatically includes any actual "
-            "quote that is awaiting the Customer's decision."
-        ),
-        "parameters": {"type": "object", "properties": {
-            "message": {"type": "string"},
-            "subject_ids": {"type": "array", "items": {"type": "string"}},
-        }, "required": ["message", "subject_ids"],
-           "additionalProperties": False}}})
-    return tools
+    """The small Agent-facing surface; internal case/quote/consent steps stay hidden."""
+    return [
+        _public_tool("list_customer_orders",
+                     "List the orders belonging to the authenticated customer.", {}, []),
+        _public_tool("get_order_details",
+                     "Read one order and its purchased line items.",
+                     {"order_id": {"type": "string",
+                                   "description": "Order ID returned by list_customer_orders."}},
+                     ["order_id"]),
+        _public_tool("return_delivered_order_items",
+                     "Return delivered items of one order line and refund the original payment "
+                     "channel in a single step. Only items that were delivered, are inside the "
+                     "merchant return window and have not already been refunded can be returned.",
+                     {"line_id": {"type": "string",
+                                  "description": "Order line ID from get_order_details."},
+                      "quantity": {"type": "integer", "minimum": 1,
+                                   "description": "Number of purchased units to refund."},
+                      "payment_method": {"type": "string", "enum": ["original"],
+                                         "description": "Refund target; Phase 1 supports only 'original'."}},
+                     ["line_id", "quantity"]),
+        _public_tool("respond_to_customer",
+                     "Send the next customer-facing message.",
+                     {"message": {"type": "string"}}, ["message"]),
+    ]
 
 
 CUSTOMER_TOOLS = [{"type": "function", "function": {
-    "name": "customer_turn", "description": "Respond naturally and declare only Customer-side intent.",
+    "name": "customer_turn", "description": "Reply to the service agent as the customer, or finish.",
     "parameters": {"type": "object", "properties": {
         "message": {"type": "string"},
-        "delegate_line_ids": {"type": "array", "items": {"type": "string"}},
-        "allowed_preparations": {"type": "array", "items": {"type": "string"}},
-        "accept_quote_id": {"type": ["string", "null"]},
-        "accept_operation": {"type": ["string", "null"], "enum": ["commit_accepted_quote", "release_accepted_refund", None]},
-        "reject_quote_id": {"type": ["string", "null"]},
-        "withdraw_delegation_ids": {"type": "array", "items": {"type": "string"}},
-        "disclose_fact_ids": {"type": "array", "items": {"type": "string"}},
         "finish": {"type": "boolean"},
-    }, "required": ["message", "delegate_line_ids", "allowed_preparations", "accept_quote_id",
-                    "accept_operation", "reject_quote_id", "withdraw_delegation_ids", "disclose_fact_ids", "finish"],
-       "additionalProperties": False}}}]
+    }, "required": ["message", "finish"], "additionalProperties": False}}}]
 
 
 class OpenAICustomerAgent:
@@ -214,10 +224,10 @@ class OpenAICustomerAgent:
         self.last_call = None
         profile = profile.checked()
         system = (
-            "Simulate the authenticated customer. You may disclose only facts in the private profile, "
-            "delegate only the listed business lines/preparations, and accept only the exact quote shown. "
-            "Do not claim an operation completed. A quote acceptance is transaction consent only for the "
-            "named quote and operation. Keep natural-language preferences consistent across turns.\n"
+            "Simulate the authenticated customer in a support conversation. Write short, natural replies "
+            "consistent with your private profile. Disclose only what the conversation actually requires, "
+            "and never invent order, item or payment details. Never claim that an operation was already "
+            "completed. Set finish=true when your request is settled or you no longer want to continue.\n"
             "PRIVATE CUSTOMER PROFILE: " + json.dumps(profile.model_dump(mode="json"), ensure_ascii=False)
         )
         messages = [{"role": "system", "content": system},
@@ -254,19 +264,19 @@ class OpenAIServiceAgent:
     uses_model = True
 
     SYSTEM = (
-        "You are a commerce customer-service agent. Decide what to query and what action to take from "
-        "the customer's public request and public tool results. You never receive hidden TaskSpec goals, "
-        "Customer preferences, proof witnesses or Oracle decisions. Tool writes are not Customer consent. "
-        "Never commit a quote unless the Customer runtime has separately recorded exact consent; never claim "
-        "completion without a successful tool result. After you prepare a quote, the runtime automatically "
-        "shows its exact terms to the Customer with your next customer-facing reply. Explain the quote and "
-        "ask whether the Customer accepts; do not choose a quote-presentation action or invent quote terms. "
-        "After a registered return receipt, the runtime likewise shows the committed refund terms before "
-        "requesting any release consent. The caller is already authenticated; use the supplied customer ID and merchant "
-        "scope IDs instead of asking the Customer for account or order identifiers that the tools can look up. "
-        "Use one function call for a business operation. A normal assistant message is also allowed for a "
-        "customer-facing clarification or status update, but it has no business side effect and must not claim "
-        "that an operation was performed. Never make multiple function calls in one response."
+        "You are a commerce customer-service agent. Resolve the customer's request with the tools shown. "
+        "You only see the public customer request and public tool results; never assume hidden task goals, "
+        "private customer preferences, proof witnesses or oracle decisions. \n"
+        "Typical flow: call list_customer_orders to find the authenticated customer's orders, "
+        "get_order_details to read one order and its line items, then return_delivered_order_items with "
+        "the line ID and the quantity of units to refund. That single call records the returned items and "
+        "credits the original payment channel; physical return logistics happen outside this dialogue. \n"
+        "The environment enforces ownership, delivery status, the return window, quantities, duplicate "
+        "refunds and the refund method, and answers with an explicit error_code when a request is invalid. "
+        "Do not ask the customer to upload evidence or to read internal case, quote, settlement or consent "
+        "identifiers; those objects are environment internals and are never shown to you. \n"
+        "Never claim that a refund or return happened without a successful tool result. Use "
+        "respond_to_customer for every customer-facing reply. Never make multiple function calls in one response."
     )
 
     def __init__(self, client: CompletionClient, *, skill_snapshot=None,
@@ -359,7 +369,8 @@ class OpenAIServiceAgent:
                 return ServiceAction(kind="reply", message=content, call=self.last_call)
         except (KeyError, TypeError, IndexError, AttributeError):
             pass
-        action = ServiceAction.from_tool_message(raw, prompt.customer_id, prompt.observed_subject_ids)
+        action = ServiceAction.from_tool_message(raw, prompt.customer_id, prompt.observed_subject_ids,
+                                                prompt.available_merchant_scope_ids)
         data = action.model_dump(mode="json", exclude={"record_hash"})
         data["call"] = self.last_call.model_dump(mode="json")
         return ServiceAction.model_validate(data)

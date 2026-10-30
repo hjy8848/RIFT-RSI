@@ -11,22 +11,16 @@ from uuid import uuid4
 
 def service_tool_protocol_reminder(tools):
     """Build public schema reminders without exposing private task data."""
-    empty_param_tools = []
-    for row in tools:
-        function = row.get("function", {})
-        spec = (function.get("parameters", {}).get("properties", {})
-                .get("params", {}))
-        if (spec.get("type") == "object" and spec.get("properties") == {}
-                and spec.get("additionalProperties") is False):
-            empty_param_tools.append(function["name"])
+    names = sorted(row["function"]["name"] for row in tools
+                   if isinstance(row, dict) and isinstance(row.get("function"), dict))
     return (
         "RIFT Service turn protocol: emit exactly ONE complete tool call, then "
         "stop and let the environment return the tool result. Never output "
         "multiple <tool_call> blocks in the same assistant turn. Tool arguments "
-        "must match the supplied function JSON schema exactly. In particular, "
-        "do not add fields such as 'messages' to params. For these operations "
-        "the params field MUST be the empty object {}: "
-        + ", ".join(sorted(empty_param_tools)) + "."
+        "must match the supplied function JSON schema exactly and are flat: pass "
+        "the named arguments directly, never wrap them in a 'params' object and "
+        "never add fields such as 'messages' or 'scope_id'. Available tools: "
+        + ", ".join(names) + "."
     )
 
 
@@ -157,7 +151,8 @@ class NativeUsamiSession:
             elif calls:
                 try:
                     parsed = ServiceAction.from_tool_message(
-                        response, self._prompt.customer_id, self._prompt.observed_subject_ids)
+                        response, self._prompt.customer_id, self._prompt.observed_subject_ids,
+                        self._prompt.available_merchant_scope_ids)
                 except ServiceError as exc:
                     if getattr(exc, 'code', None) != 'MODEL_OUTPUT_INVALID':
                         raise

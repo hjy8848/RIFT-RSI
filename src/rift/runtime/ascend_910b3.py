@@ -166,23 +166,15 @@ class _UsamiCustomer:
 
     def __init__(self, seed):
         self.seed = seed
-        self.delegated = False
+        self.turns = 0
 
     def decide(self, prompt, profile):
         from usami_v2.runtime.customer import CustomerDecision
-        if prompt.offer is not None:
-            if prompt.offer.operation in ("commit_accepted_quote", "release_accepted_refund"):
-                return CustomerDecision(message="I accept this offer.",
-                    accept_quote_id=prompt.offer.quote_id,
-                    accept_operation=prompt.offer.operation, finish=True)
-            return CustomerDecision(message="I cannot accept this offer.",
-                reject_quote_id=prompt.offer.quote_id)
-        if not self.delegated:
-            self.delegated = True
-            return CustomerDecision(message="Please help me with this request.",
-                delegate_line_ids=profile.delegated_line_ids,
-                allowed_preparations=profile.allowed_preparations)
-        return CustomerDecision(message="Please continue with my request.")
+        self.turns += 1
+        if self.turns == 1:
+            return CustomerDecision(
+                message="The device I received is damaged and I want a refund.")
+        return CustomerDecision(message="Thanks, that is all.", finish=True)
 
 
 class _UsamiCustomerFactory:
@@ -602,7 +594,7 @@ def _create_smoke_task_registry(root):
         task_registry=task_registry)
     challenge = {
         "task_id": "smoke-refund-task", "customer_alias": "customer",
-        "hypothesis": "Check evidence and customer authorization before a refund.",
+        "hypothesis": "Check delivery, return window and original payment, then refund atomically.",
         "remedy_goals": [{"goal_id": "refund", "line_alias": "item",
             "quantity": 1, "allowed_remedies": ["refund"]}],
         "line_selectors": [{"alias": "item", "family": "device",
