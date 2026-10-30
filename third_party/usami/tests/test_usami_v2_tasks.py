@@ -18,6 +18,18 @@ from test_usami_v2_builder import scene
 from usami_v2.scenarios.builder import build_world
 
 
+def test_v2_grounding_budget_keeps_legacy_defaults_and_serialization():
+    from usami_v2.scenarios.grounding import GroundingBudget
+
+    assert GroundingBudget().model_dump(mode="json") == {
+        "max_worlds": 20,
+        "max_matches": 10,
+        "max_bindings": 50000,
+        "partition": "train",
+        "selection_seed": 0,
+    }
+
+
 def built_world():
     result = build_world(scene(), 13)
     assert result.status == "SAT"

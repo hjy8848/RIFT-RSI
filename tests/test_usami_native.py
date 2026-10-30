@@ -219,7 +219,8 @@ def test_host_certifies_next_grounding_candidate_after_first_rejection(monkeypat
     from rift.benchmark.usami import CommerceHost
     from rift.replay.splits import SplitRegistry
     from rift.schemas import Identity, Split
-    from rift.tasks import Certification, CertificationStatus, Proposal
+    from rift.tasks import CertificationStatus, Proposal
+    import usami_v2.scenarios.task_certification as task_certification
     distribution, _ = distribution_and_slot(13)
     spec = scenario_draft().compile(distribution)
     build = build_world(spec, 13)
@@ -239,15 +240,25 @@ def test_host_certifies_next_grounding_candidate_after_first_rejection(monkeypat
     def certify_candidate(proposal_id, world, task, scenario, budget):
         attempted.append(task.task_id)
         if task == task_a:
-            return Certification(proposal_id, CertificationStatus.REJECTED), None
+            return SimpleNamespace(status='UNSAT',
+                full_task_reachability_certified=False, blockers=())
         return native_certify(proposal_id, world, task, scenario, budget)
     monkeypatch.setattr(benchmark.usami, 'certify_native', certify_candidate)
+    verify_certificate = task_certification.verify_task_certificate
+    verified_tasks = []
+    def verify_candidate(world, task, scenario, certificate):
+        if task == task_a:
+            return {'verified': True}
+        verified_tasks.append(task.record_hash)
+        return verify_certificate(world, task, scenario, certificate)
+    monkeypatch.setattr(task_certification, 'verify_task_certificate', verify_candidate)
     host = CommerceHost([('world', spec, build)], distribution, None, None, ScriptedCustomer(),
         registry=SplitRegistry(), identity_factory=lambda task, spec, build: Identity(
             build.world_hash, task.record_hash, 'family', 'lineage', Split.TRAIN),
         proof_budget=ProofBudget(), episode_budget=EpisodeBudget())
     result, selected = host.certify_proposal(Proposal('p','preconditions','refund','{}'))
     assert attempted == ['candidate-a', 'candidate-b']
+    assert verified_tasks == [task_b.record_hash]
     assert result.status is CertificationStatus.CERTIFIED and selected == task_b
     assert host.task_registry.resolve_record(task_b.record_hash).task == task_b
 

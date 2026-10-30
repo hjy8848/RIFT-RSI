@@ -18,14 +18,14 @@ class DesignerTrainingWorld:
     tasks: tuple[object, ...]
 
 def certify_native(proposal_id, world, task, customer_scenario, budget):
-    from usami_v2.scenarios.task_certification import certify_task, verify_task_certificate
-    certificate = certify_task(world, task, customer_scenario, budget)
-    verification = verify_task_certificate(world, task, customer_scenario, certificate)
-    return (public_certification(proposal_id, certificate, verified=verification["verified"]),
-            certificate if verification["verified"] else None)
+    from usami_v2.scenarios.task_certification import certify_task
+    return certify_task(world, task, customer_scenario, budget)
 
 def certify(proposal_id, world, task, customer_scenario, budget):
-    return certify_native(proposal_id, world, task, customer_scenario, budget)[0]
+    from usami_v2.scenarios.task_certification import verify_task_certificate
+    certificate = certify_native(proposal_id, world, task, customer_scenario, budget)
+    verification = verify_task_certificate(world, task, customer_scenario, certificate)
+    return public_certification(proposal_id, certificate, verified=verification["verified"])
 
 def run_episode(*args, **kwargs):
     from usami_v2.runtime.runner import run_episode as native_run
@@ -123,9 +123,16 @@ class CommerceHost:
                 unresolved = Certification(proposal.proposal_id, CertificationStatus.UNKNOWN)
                 continue
             scenario = self.scenario_factory(task, spec, build)
-            certification, native_certificate = certify_native(
+            native_certificate = certify_native(
                 proposal.proposal_id, build.world, task, scenario, self.proof_budget)
-            if certification.status is not CertificationStatus.CERTIFIED:
+            if (native_certificate.status != 'CERTIFIED'
+                    or not native_certificate.full_task_reachability_certified):
+                from usami_v2.scenarios.task_certification import verify_task_certificate
+                verification = verify_task_certificate(
+                    build.world, task, scenario, native_certificate)
+                certification = public_certification(
+                    proposal.proposal_id, native_certificate,
+                    verified=verification['verified'])
                 if certification.status is CertificationStatus.UNKNOWN:
                     unresolved = certification
                 else:
@@ -138,9 +145,10 @@ class CommerceHost:
                 raise ValueError('training identity must match the certified task and world')
             profile = self.profile_factory(task, spec, build)
             from rift.verl.task_registry import CertifiedNativeTask
-            self.registry.register(identity)
             self.task_registry.register(CertifiedNativeTask(
                 build.world, task, profile, scenario, native_certificate, identity))
+            certification = public_certification(
+                proposal.proposal_id, native_certificate, verified=True)
             return certification, task
         return unresolved or last_rejection or Certification(
             proposal.proposal_id, CertificationStatus.UNKNOWN), None
@@ -192,14 +200,21 @@ class CommerceHost:
                             'reason':str(exc), 'reason_code':exc.code})
                         continue
                     scenario = self.scenario_factory(task, spec, build)
-                    public_result, native_certificate = certify_native(
+                    native_certificate = certify_native(
                         proposal.proposal_id, build.world, task, scenario, self.proof_budget)
-                    native_status = 'UNKNOWN' if native_certificate is None else native_certificate.status
-                    reasons = () if native_certificate is None else tuple(native_certificate.blockers)
-                    attempts.append({'candidate_index':index, 'task_ref':task.record_hash,
-                        'status':public_result.status.value, 'native_status':native_status,
-                        'reason':list(reasons)})
-                    if public_result.status is not CertificationStatus.CERTIFIED:
+                    native_status = native_certificate.status
+                    reasons = tuple(native_certificate.blockers)
+                    if (native_status != 'CERTIFIED'
+                            or not native_certificate.full_task_reachability_certified):
+                        from usami_v2.scenarios.task_certification import verify_task_certificate
+                        verification = verify_task_certificate(
+                            build.world, task, scenario, native_certificate)
+                        public_result = public_certification(
+                            proposal.proposal_id, native_certificate,
+                            verified=verification['verified'])
+                        attempts.append({'candidate_index':index, 'task_ref':task.record_hash,
+                            'status':public_result.status.value, 'native_status':native_status,
+                            'reason':list(reasons)})
                         continue
                     identity = self.identity_factory(task, spec, build)
                     from rift.schemas import DataPurpose, Identity, Split
@@ -210,9 +225,13 @@ class CommerceHost:
                         raise ValueError('Designer task identity must bind this verified TRAIN World')
                     profile = self.profile_factory(task, spec, build)
                     from rift.verl.task_registry import CertifiedNativeTask
-                    self.registry.register(identity)
                     self.task_registry.register(CertifiedNativeTask(
                         build.world, task, profile, scenario, native_certificate, identity))
+                    public_result = public_certification(
+                        proposal.proposal_id, native_certificate, verified=True)
+                    attempts.append({'candidate_index':index, 'task_ref':task.record_hash,
+                        'status':public_result.status.value, 'native_status':native_status,
+                        'reason':list(reasons)})
                     certifications.append(public_result)
                     tasks.append(task)
                     selected_task = task

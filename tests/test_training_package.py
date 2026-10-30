@@ -321,11 +321,10 @@ def test_package_service_data_wrapper_uses_existing_native_task_registry(native_
 
 def test_native_package_grounding_falls_through_rejected_candidate(native_fixture, monkeypatch):
     from types import SimpleNamespace
+    import usami_v2.scenarios.task_certification as task_certification
     import usami_v2.scenarios.grounding as native_grounding
     import rift.benchmark.usami as adapter
     from usami_v2.scenarios.designer import TaskDraft, compile_task
-    from rift.tasks import Certification, CertificationStatus
-
     plan, host, result, *_ = native_fixture
     proposal = Proposal('candidate-fallback', 'package-level ability',
         world_draft=plan.world_draft, challenges=(_challenge('fallback-challenge'),))
@@ -343,9 +342,15 @@ def test_native_package_grounding_falls_through_rejected_candidate(native_fixtur
     def certify(proposal_id, world, task, scenario, budget):
         attempted.append(task.task_id)
         if task.task_id == 'fallback-a':
-            return Certification(proposal_id, CertificationStatus.REJECTED), None
+            return SimpleNamespace(status='UNSAT',
+                full_task_reachability_certified=False, blockers=())
         return native_certifier(proposal_id, world, task, scenario, budget)
     monkeypatch.setattr(adapter, 'certify_native', certify)
+    verify_certificate = task_certification.verify_task_certificate
+    monkeypatch.setattr(task_certification, 'verify_task_certificate',
+        lambda world, task, scenario, certificate: {'verified': True}
+        if task.task_id == 'fallback-a'
+        else verify_certificate(world, task, scenario, certificate))
 
     trained = host.certify_training_plan(proposal, world_seed=121)
     assert attempted == ['fallback-a', 'fallback-b']
@@ -392,6 +397,49 @@ def test_certified_task_registry_reloads_and_reverifies_native_records(tmp_path,
     task_path.write_text(json.dumps(tampered), encoding='utf-8')
     with pytest.raises(ValueError, match='content digest'):
         CertifiedTaskRegistry.load(task_path, restored_splits)
+
+
+def test_task_registry_caches_verified_content_and_detects_in_memory_changes(
+        tmp_path, native_fixture, monkeypatch):
+    import copy
+    import usami_v2.scenarios.task_certification as task_certification
+    from rift.verl.task_registry import CertifiedTaskRegistry
+
+    _, _, _, source_registry, _, split_registry, _, _ = native_fixture
+    original = source_registry.resolve_record(source_registry.task_refs[0])
+    verify = task_certification.verify_task_certificate
+    calls = []
+
+    def count_verification(*args, **kwargs):
+        calls.append(args[3].record_hash)
+        return verify(*args, **kwargs)
+
+    monkeypatch.setattr(task_certification, 'verify_task_certificate', count_verification)
+    cached = CertifiedTaskRegistry(split_registry)
+    cached.register(original)
+    assert len(calls) == 1
+
+    cached.resolve(original.task.record_hash)
+    cached.resolve_record(original.task.record_hash)
+    assert cached.verify_task(original.task.record_hash, original.world,
+                              original.task, original.profile)
+    path = tmp_path / 'one-task-registry.json'
+    cached.save(path)
+    assert len(calls) == 1
+
+    restored = CertifiedTaskRegistry.load(path, split_registry)
+    assert restored.task_refs == (original.task.record_hash,)
+    assert len(calls) == 2
+
+    mutable = copy.deepcopy(original)
+    changed = CertifiedTaskRegistry(split_registry)
+    changed.register(mutable)
+    customer = next(iter(mutable.world.customers.values()))
+    customer.name += ' changed after validation'
+    with pytest.raises(ValueError, match='evidence unavailable'):
+        changed.resolve_record(original.task.record_hash)
+    with pytest.raises(ValueError, match='changed after validation'):
+        changed.save(tmp_path / 'changed-task-registry.json')
 
 
 def test_production_factory_builds_runtime_without_model_or_worker_start(tmp_path, native_fixture):

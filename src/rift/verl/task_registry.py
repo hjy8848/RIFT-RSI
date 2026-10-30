@@ -22,26 +22,53 @@ class CertifiedTaskRegistry:
         self.split_registry = split_registry
         self.storage_path = None if storage_path is None else Path(storage_path)
         self._records = {}
+        self._validated_digests = {}
     @property
     def task_refs(self):
         return tuple(sorted(self._records))
     def register(self, record):
         if not isinstance(record, CertifiedNativeTask): raise TypeError('native certified task required')
+        return self._register(record, add_identity=True)
+
+    def _register(self, record, *, add_identity):
         ref = record.task.record_hash
+        content_digest = self._record_digest(record)
         existing = self._records.get(ref)
         if existing is not None:
-            if existing == record and self._check(existing):
+            if (self._validated_digests.get(ref) == content_digest
+                    and self._is_currently_registered(existing)):
                 return existing
             raise ValueError('TaskRef is already bound to different certified task evidence')
-        if not self._check(record): raise ValueError('task or certificate is not authorized')
+        if not self._check(record, require_registered_identity=not add_identity):
+            raise ValueError('task or certificate is not authorized')
+        if add_identity:
+            self.split_registry.register(record.identity)
         self._records[ref] = record
+        self._validated_digests[ref] = content_digest
         try:
             if self.storage_path is not None:
                 self.save()
         except BaseException:
             del self._records[ref]
+            del self._validated_digests[ref]
             raise
         return record
+
+    def _record_digest(self, record):
+        payload = json.dumps({'split_policy_version': self.split_registry.policy_version,
+                              'record': self._encode_record(record)},
+                             sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+        return sha256(payload.encode('utf-8')).hexdigest()
+
+    def _is_currently_registered(self, record):
+        ref = record.task.record_hash
+        if not self.split_registry.contains(record.identity):
+            return False
+        try:
+            # World is mutable, so bind the cached proof to its current full content.
+            return self._validated_digests.get(ref) == self._record_digest(record)
+        except (AttributeError, TypeError, ValueError):
+            return False
 
     @staticmethod
     def _encode_record(record):
@@ -64,6 +91,9 @@ class CertifiedTaskRegistry:
         target = Path(path) if path is not None else self.storage_path
         if target is None:
             raise ValueError('a persistent CertifiedTaskRegistry path is required')
+        for ref, record in self._records.items():
+            if not self._is_currently_registered(record):
+                raise ValueError(f'certified task evidence changed after validation: {ref}')
         entries = {ref: self._encode_record(record)
                    for ref, record in sorted(self._records.items())}
         canonical = json.dumps(entries, sort_keys=True, ensure_ascii=False,
@@ -115,10 +145,12 @@ class CertifiedTaskRegistry:
                 tuple(ExternalEvent.model_validate(event) for event in row['external_events']))
             if record.task.record_hash != task_ref:
                 raise ValueError('CertifiedTaskRegistry key differs from native TaskRef')
-            registry.register(record)
+            if not split_registry.contains(identity):
+                raise ValueError('CertifiedTaskRegistry identity is absent from split registry')
+            registry._register(record, add_identity=False)
         registry.storage_path = source
         return registry
-    def _check(self, record):
+    def _check(self, record, *, require_registered_identity=True):
         from usami_v2.scenarios.task_certification import verify_task_certificate
         identity, task, world, profile, scenario, cert = (record.identity, record.task, record.world,
             record.profile, record.scenario, record.certificate)
@@ -141,7 +173,8 @@ class CertifiedTaskRegistry:
                                   else Split.VALIDATION if task.partition == "validation"
                                   else None)
         if (identity.split is not expected_split
-                or not self.split_registry.contains(identity) or identity.task != task.record_hash
+                or (require_registered_identity and not self.split_registry.contains(identity))
+                or identity.task != task.record_hash
                 or identity.world != world.state_hash or task.partition not in partitions
                 or task.world_hash != world.state_hash or profile.customer_id != task.customer_id
                 or scenario.customer_id != task.customer_id or cert.task_hash != task.record_hash
@@ -162,11 +195,12 @@ class CertifiedTaskRegistry:
         return verify_task_certificate(world, task, scenario, cert)['verified'] is True
     def resolve(self, task_ref):
         record = self._records.get(task_ref)
-        if record is None or not self._check(record): raise ValueError('certified task evidence unavailable')
+        if record is None or not self._is_currently_registered(record):
+            raise ValueError('certified task evidence unavailable')
         return record.world, record.task, record.profile, record.external_events
     def resolve_record(self, task_ref):
         record = self._records.get(task_ref)
-        if record is None or not self._check(record):
+        if record is None or not self._is_currently_registered(record):
             raise ValueError('certified task evidence unavailable')
         return record
     def purpose(self, task_ref):
@@ -174,5 +208,5 @@ class CertifiedTaskRegistry:
     def verify_task(self, task_ref, world, task, profile, *, purpose=None):
         record = self._records.get(task_ref)
         return bool(record is not None and record.world == world and record.task == task
-                    and record.profile == profile and self._check(record)
+                    and record.profile == profile and self._is_currently_registered(record)
                     and (purpose is None or record.identity.purpose is purpose))

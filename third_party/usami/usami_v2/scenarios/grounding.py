@@ -9,11 +9,24 @@ from typing import Literal, Optional, Tuple
 
 from pydantic import Field, model_validator
 
-from usami_benchmark.grounder import GroundingBudget
-from usami_harness.models import digest
+from usami_harness.models import Model, digest
 from usami_v2.contracts import Sealed
 from .designer import TaskDraft, compile_task, task_design_capabilities
 from .schema import Attribute
+
+
+class GroundingBudget(Model):
+    """Search limits for structured-intent grounding in Usami v2.
+
+    Keep the legacy wire fields and defaults so existing RIFT configs remain
+    valid without importing the legacy benchmark Grounder and its domains.
+    """
+
+    max_worlds: int = Field(default=20, strict=True, ge=1, le=1000)
+    max_matches: int = Field(default=10, strict=True, ge=1, le=100)
+    max_bindings: int = Field(default=50000, strict=True, ge=1, le=1000000)
+    partition: Literal["train", "validation"] = "train"
+    selection_seed: int = Field(default=0, strict=True)
 
 
 class LineSelector(Sealed):
