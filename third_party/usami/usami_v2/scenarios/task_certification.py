@@ -191,7 +191,15 @@ def _base_candidate_options(world: World, goal: RemedyGoal, scenario: CustomerSc
     """Phase 1 candidate grammar: the atomic delivered-items refund only."""
     line = world.lines[goal.line_id]
     original = world.skus[line.sku_id]
-    credit = unit_credit(line, tuple(range(goal.quantity)))
+    occupied = {unit for row in world.settlements.values() if row.line_id == line.id
+                for unit in row.unit_indices}
+    occupied.update(unit for row in world.cases.values()
+                    if row.line_id == line.id and row.status not in ("cancelled", "resolved")
+                    for unit in row.unit_indices)
+    available = tuple(unit for unit in range(line.quantity) if unit not in occupied)
+    if len(available) < goal.quantity:
+        return ()
+    credit = unit_credit(line, available[:goal.quantity])
     options = []
     for remedy in goal.allowed_remedies:
         if remedy not in scenario.accepted_remedies:
@@ -455,27 +463,28 @@ def certify_task(world: World, task: TaskSpec, customer_scenario: CustomerScenar
 
 
 
-# A refund is only issued after the customer agrees in the conversation, so the
-# witness path always contains one reply that asks for confirmation and one final
-# reply. Each reply is one service decision, one model call, and one customer turn
-# in the runtime; the certified cost would be dishonest if it ignored them.
-_CONFIRMATION_TURNS = 2
-
-
+# A refund is only issued after the customer agrees in the conversation, so every
+# refund on the witness path costs one confirmation exchange, plus one closing
+# reply that lets the customer finish. Each reply is one service decision, one
+# model call and one customer turn in the runtime; the certified cost would be
+# dishonest if it ignored them, and it must grow with the number of goals.
 def _witness_cost(attempts) -> Dict[str, int]:
     """Minimum episode cost implied by the first certified witness path."""
     witnesses = [row for row in attempts if row.status == "WITNESS"]
     if not witnesses:
         return {}
     steps = witnesses[0].steps
-    operations = sum(1 for row in steps if row.kind == "operation")
+    operations = [row for row in steps if row.kind == "operation"]
+    refunds = sum(1 for row in operations
+                  if row.evidence.get("request", {}).get("operation", {}).get("name")
+                  == "return_delivered_order_items")
     consents = sum(1 for row in steps if row.kind == "customer_consent")
-    customer_turns = _CONFIRMATION_TURNS + consents
-    return {"tool_calls": operations,
-            "service_decisions": operations + _CONFIRMATION_TURNS + consents,
-            "customer_turns": customer_turns,
+    confirmations = refunds + consents + 1
+    return {"tool_calls": len(operations),
+            "service_decisions": len(operations) + confirmations,
+            "customer_turns": confirmations,
             # Every service decision and every customer turn is one model call.
-            "model_calls": operations + _CONFIRMATION_TURNS + consents + customer_turns}
+            "model_calls": len(operations) + 2 * confirmations}
 
 
 def certification_cost(certification: TaskCertification) -> Dict[str, int]:

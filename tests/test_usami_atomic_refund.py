@@ -17,7 +17,7 @@ from usami_v2.commerce.reference import decide
 from usami_v2.runtime.agents import ServiceAction, service_tools
 from usami_v2.runtime.customer import CustomerDecision, CustomerRuntime
 from usami_v2.runtime.runner import EpisodeBudget, replay_episode, run_episode
-from usami_harness.engine import Engine
+from usami_harness.engine import Engine, replay_trace
 from usami_harness.models import Request
 from usami_harness.oracle import evaluate
 
@@ -41,6 +41,8 @@ def _run_operation(world, actor, line_id, params):
     event = engine.execute(actor, operation, request.id, mode="reference")
     trace = engine.finish()
     oracle = evaluate(adapter, trace, {request.id: request})
+    replayed = replay_trace(adapter, trace, {request.id: request})
+    assert replayed.state == engine.state
     return engine.state, event.payload["result"], oracle
 
 
@@ -141,6 +143,23 @@ class ConfirmingCustomer:
         return CustomerDecision(message="Thanks, that is all.", finish=True)
 
 
+@pytest.mark.xfail(strict=True, reason="dialogue confirmation is a Service-prompt contract; the environment only validates business rules")
+def test_customer_refusal_prevents_atomic_refund():
+    class RefusingCustomer:
+        uses_model = False
+        last_call = None
+
+        def decide(self, prompt, profile):
+            return CustomerDecision(message="No, please do not refund.")
+
+    world, aliases = frozen(17)
+    episode = run_episode(world, refund_task(world, aliases), refund_profile(aliases),
+                          RefusingCustomer(), AtomicRefundService(aliases["damaged"]),
+                          budget=EpisodeBudget(max_customer_turns=3, max_service_decisions=10,
+                                               max_service_tool_calls=8, max_model_calls=0))
+    assert not episode.final_world.settlements
+
+
 
 def test_atomic_refund_episode_changes_state_and_replays():
     world, aliases = frozen(17)
@@ -237,6 +256,17 @@ def test_quantity_above_purchased_is_rejected():
     assert after == world
 
 
+def test_another_customer_cannot_refund_owned_order_line():
+    world, aliases, _, _ = _delegated_world()
+    owner = world.customers[aliases["customer"]]
+    stranger = owner.model_copy(update={"id": "other-customer"})
+    world.customers[stranger.id] = stranger
+    after, result, oracle = _run_operation(world, stranger.id, aliases["damaged"],
+                                            {"quantity": 1, "payment_method": "original"})
+    assert not result["success"] and result["error_code"] == "OBJECT_ACCESS_DENIED"
+    assert after == world and oracle["status"] == "pass"
+
+
 def test_duplicate_refund_is_rejected():
     world, aliases, task, profile = _delegated_world()
     line_id = aliases["damaged"]
@@ -247,6 +277,37 @@ def test_duplicate_refund_is_rejected():
                                          {"quantity": 1, "payment_method": "original"})
     assert not duplicate["success"] and duplicate["error_code"] == "ALREADY_REFUNDED"
     assert after == settled
+
+
+@pytest.mark.parametrize("paid,parts", [(10000, (1, 1, 1)), (10001, (1, 1, 1)),
+                                        (10001, (2, 1))])
+def test_partial_refunds_preserve_units_and_total(paid, parts):
+    world, aliases, _, profile = _delegated_world()
+    line_id = aliases["damaged"]
+    line = world.lines[line_id]
+    order = world.orders[line.order_id]
+    world.lines[line_id] = line.model_copy(update={"quantity": 3, "allocated_paid_cents": paid})
+    world.orders[order.id] = order.model_copy(update={"paid_cents": order.paid_cents - line.allocated_paid_cents + paid})
+    total, units = 0, set()
+    for quantity in parts:
+        operation = Operation(name="return_delivered_order_items", scope_id=order.merchant_id,
+                              resource_id=line_id,
+                              params={"quantity": quantity, "payment_method": "original"})
+        decision = decide(world, profile.customer_id, operation)
+        after, result, oracle = _run_operation(world, profile.customer_id, line_id, operation.params)
+        assert decision.allowed and result["success"] and after == decision.expected_state
+        assert oracle["status"] == "pass" and not invariants(after)
+        added = [row for key, row in after.settlements.items() if key not in world.settlements]
+        assert len(added) == 1 and len(added[0].unit_indices) == quantity
+        assert not units.intersection(added[0].unit_indices)
+        units.update(added[0].unit_indices)
+        total += result["data"]["refund_cents"]
+        assert result["data"]["payment_channel"] == order.payment_channel
+        world = after
+    assert units == {0, 1, 2} and total == paid
+    after, result, _ = _run_operation(world, profile.customer_id, line_id,
+                                      {"quantity": 1, "payment_method": "original"})
+    assert not result["success"] and after == world
 
 
 def test_approval_limit_requires_policy_review():
@@ -331,6 +392,38 @@ def test_certified_witness_cost_fits_episode_budget():
     assert cost == {"tool_calls": 3, "service_decisions": 5, "customer_turns": 2, "model_calls": 7}
     assert certificate.full_task_reachability_certified
 
+
+def test_certification_step_budget_exhaustion_is_unknown():
+    from usami_v2.scenarios.task_certification import ProofBudget, certify_task
+    world, aliases = frozen_world(13)
+    task = make_task(world, aliases, remedy=("refund",))
+    result = certify_task(world, task, customer_scenario(aliases),
+                          ProofBudget(max_plan_candidates=16, max_operation_steps=2,
+                                      max_witnesses=1))
+    assert result.status == "UNKNOWN"
+    assert "proof_operation_budget_exhausted" in result.blockers
+    assert not result.full_task_reachability_certified
+
+
+def test_certification_uses_remaining_unit_credit_after_partial_refund():
+    from usami_v2.scenarios.task_certification import _base_candidate_options
+    from usami_v2.scenarios.tasks import RemedyGoal
+    world, aliases, _, profile = _delegated_world()
+    line_id = aliases["damaged"]
+    line = world.lines[line_id]
+    order = world.orders[line.order_id]
+    world.lines[line_id] = line.model_copy(update={"quantity": 3, "allocated_paid_cents": 10001})
+    world.orders[order.id] = order.model_copy(update={"paid_cents": order.paid_cents - line.allocated_paid_cents + 10001})
+    world, result, _ = _run_operation(world, profile.customer_id, line_id,
+                                       {"quantity": 2, "payment_method": "original"})
+    assert result["success"] and result["data"]["refund_cents"] == 6668
+    merchant = world.merchants[order.merchant_id]
+    world.merchants[merchant.id] = merchant.model_copy(update={"refund_approval_limit_cents": 3333})
+    goal = RemedyGoal(goal_id="remaining", line_id=line_id, quantity=1, allowed_remedies=("refund",))
+    blockers = []
+    assert _base_candidate_options(world, goal, customer_scenario(aliases), blockers)
+    assert not blockers
+
 def test_certification_witness_arguments_come_from_public_results():
     world, aliases = frozen_world(13)
     task = make_task(world, aliases, remedy=("refund",))
@@ -350,6 +443,75 @@ def test_certification_witness_arguments_come_from_public_results():
     assert refunded == aliases["damaged"]
     assert any(row["id"] == refunded for row in public_lines)
     assert refund.evidence["result"]["data"]["status"] == "refund_issued"
+
+
+def test_two_line_task_requires_both_refunds_and_certifies():
+    from usami_v2.scenarios.tasks import RemedyGoal, TaskSpec, evaluate_state_goals
+    from usami_v2.scenarios.task_certification import ProofBudget, certify_task, verify_task_certificate, _customer_delegation
+    from usami_harness.models import digest
+
+    world, aliases = frozen_world(13)
+    lines = (aliases["damaged"], aliases["accessory"])
+    task = TaskSpec(task_id="two-line-refund", world_hash=world.state_hash,
+                    customer_id=aliases["customer"], customer_request="Please refund both items.",
+                    remedy_goals=tuple(RemedyGoal(goal_id=f"goal-{i}", line_id=line_id,
+                                                  quantity=1, allowed_remedies=("refund",))
+                                       for i, line_id in enumerate(lines)),
+                    partition="train", source_distribution_hash=digest("two-line-test"))
+    scenario = customer_scenario(aliases, delegated_line_ids=lines)
+    certificate = certify_task(world, task, scenario, ProofBudget(max_plan_candidates=16,
+                                                                    max_operation_steps=16,
+                                                                    max_witnesses=1))
+    assert certificate.status == "CERTIFIED"
+    assert verify_task_certificate(world, task, scenario, certificate)["verified"]
+    delegated, _ = _customer_delegation(world, task, scenario)
+    after_first, result, oracle = _run_operation(delegated, aliases["customer"], lines[0],
+                                                 {"quantity": 1, "payment_method": "original"})
+    assert result["success"] and oracle["status"] == "pass"
+    assert [row.status for row in evaluate_state_goals(world, after_first, task)] == ["PASS", "FAIL"]
+    after_second, result, oracle = _run_operation(after_first, aliases["customer"], lines[1],
+                                                  {"quantity": 1, "payment_method": "original"})
+    assert result["success"] and oracle["status"] == "pass"
+    assert [row.status for row in evaluate_state_goals(world, after_second, task)] == ["PASS", "PASS"]
+
+
+def test_two_orders_require_each_independent_refund():
+    from rift_usami_fixtures import scene, fixed
+    from usami_v2.scenarios.builder import build_world
+    from usami_v2.scenarios.schema import OrderVariable, LineVariable
+    from usami_v2.scenarios.tasks import RemedyGoal, TaskSpec, evaluate_state_goals
+    from usami_v2.scenarios.task_certification import ProofBudget, certify_task, _customer_delegation
+    from usami_harness.models import digest
+
+    spec = scene()
+    second = OrderVariable(alias="second_purchase", customer_alias="customer",
+                           delivered_days_ago=fixed(1), lines=(
+                               LineVariable(alias="second_line", original_sku="cable",
+                                            quantity=fixed(1), paid_cents=fixed(2000)),))
+    data = spec.model_dump(exclude={"record_hash"})
+    data["orders"] = spec.orders + (second,)
+    spec = type(spec).model_validate(data)
+    built = build_world(spec, 13)
+    assert built.status == "SAT"
+    world, aliases = built.world, dict(built.private_aliases)
+    lines = (aliases["damaged"], aliases["second_line"])
+    assert world.lines[lines[0]].order_id != world.lines[lines[1]].order_id
+    task = TaskSpec(task_id="two-orders", world_hash=world.state_hash,
+                    customer_id=aliases["customer"], customer_request="Please refund both items.",
+                    remedy_goals=tuple(RemedyGoal(goal_id=f"g{i}", line_id=line_id, quantity=1,
+                                                  allowed_remedies=("refund",))
+                                       for i, line_id in enumerate(lines)),
+                    partition="train", source_distribution_hash=digest("two-orders"))
+    scenario = customer_scenario(aliases, delegated_line_ids=lines)
+    certificate = certify_task(world, task, scenario, ProofBudget(max_operation_steps=16))
+    assert certificate.status == "CERTIFIED"
+    state, _ = _customer_delegation(world, task, scenario)
+    for index, line_id in enumerate(lines):
+        state, result, oracle = _run_operation(state, aliases["customer"], line_id,
+                                               {"quantity": 1, "payment_method": "original"})
+        assert result["success"] and oracle["status"] == "pass"
+        assert [row.status for row in evaluate_state_goals(world, state, task)] == (
+            ["PASS", "FAIL"] if index == 0 else ["PASS", "PASS"])
 
 def test_certified_cost_rejects_an_episode_budget_that_cannot_run_it():
     from types import SimpleNamespace
