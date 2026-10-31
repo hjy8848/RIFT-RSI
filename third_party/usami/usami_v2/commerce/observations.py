@@ -4,6 +4,24 @@ from datetime import timedelta
 from .models import unit_credit
 
 
+def _public_line_rows(world, order_key):
+    """Order lines with the public catalog descriptor attached.
+
+    A Service can only match the customer's words ("damaged USB C device") to a
+    line if the order details carry the SKU family and attributes. The nested
+    descriptor keeps the raw line record intact for existing consumers.
+    """
+    rows = []
+    for line in sorted(world.lines.values(), key=lambda x: x.id):
+        if line.order_id != order_key:
+            continue
+        row = line.model_dump(mode="json")
+        sku = world.skus.get(line.sku_id)
+        row["sku"] = sku.model_dump(mode="json") if sku is not None else None
+        rows.append(row)
+    return rows
+
+
 def query_data(world, actor, op):
     key, p = op.resource_id, op.params
     if op.name == "list_customer_orders":
@@ -11,8 +29,7 @@ def query_data(world, actor, op):
                            if row.customer_id == actor and row.merchant_id == op.scope_id]}
     if op.name == "get_order_details":
         return {"order": world.orders[key].model_dump(mode="json"),
-                "lines": [row.model_dump(mode="json") for row in sorted(world.lines.values(), key=lambda x: x.id)
-                          if row.order_id == key]}
+                "lines": _public_line_rows(world, key)}
     if op.name == "search_catalog":
         return {"skus": [row.model_dump(mode="json") for row in sorted(world.skus.values(), key=lambda x: x.id)
                          if row.merchant_id == op.scope_id

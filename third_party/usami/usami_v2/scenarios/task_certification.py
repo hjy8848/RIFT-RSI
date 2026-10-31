@@ -327,11 +327,22 @@ def _run_candidate(world, task, scenario, candidates, attempt_id, max_steps):
         steps.append(step)
         return error
 
-    for candidate in candidates:
+    for position, candidate in enumerate(candidates):
         goal = goals[candidate.goal_id]
         if candidate.remedy != "refund":
             reason = "replacement_path_not_migrated_in_phase_1"
             break
+        # Public discovery: the Service prompt requires listing the customer's
+        # orders and reading one order before a refund. The certified cost must
+        # cover those queries, otherwise a task could be registered with a
+        # budget that no real Service can follow.
+        if position == 0:
+            error = act("list_customer_orders", next(iter(state.merchants)), {})
+            if not error:
+                error = act("get_order_details", world.lines[goal.line_id].order_id, {})
+            if error:
+                reason = error
+                break
         # Phase 1: the single atomic refund validates delivery, window, quantity,
         # duplicate refunds, approval limit and payment method inside the Engine,
         # and the Reference recomputes the same state transition independently.

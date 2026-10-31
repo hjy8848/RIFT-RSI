@@ -21,9 +21,16 @@ def _expected_query(world, actor, op):
                            if world.orders[k].customer_id == actor
                            and world.orders[k].merchant_id == op.scope_id]}
     if op.name == "get_order_details":
-        return {"order": world.orders[key].model_dump(mode="json"),
-                "lines": [world.lines[k].model_dump(mode="json") for k in sorted(world.lines)
-                          if world.lines[k].order_id == key]}
+        rows = []
+        for line_id_value in sorted(world.lines):
+            line = world.lines[line_id_value]
+            if line.order_id != key:
+                continue
+            row = line.model_dump(mode="json")
+            sku = world.skus.get(line.sku_id)
+            row["sku"] = sku.model_dump(mode="json") if sku is not None else None
+            rows.append(row)
+        return {"order": world.orders[key].model_dump(mode="json"), "lines": rows}
     if op.name == "search_catalog":
         selected = []
         for sku_id in sorted(world.skus):

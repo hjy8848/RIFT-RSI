@@ -33,7 +33,7 @@ def test_designer_diagnostic_removal_preserves_frozen_usami_results():
         minimum_witnesses=2)
     assert world.state_hash == '136651c71bc21af5ffb39fce47eba0a6d438078faaf9338087296a8f3c50a21c'
     assert task.record_hash == 'a265fdaa9318b247b15cf916a386146fcba7f39610182c2734092f09c9d7a70c'
-    assert certificate.record_hash == '3ad0e030db560baa5629e30b1b64731b789fa90deb42ec7a2ff3f7ca04c1f3da'
+    assert certificate.record_hash == '623283f88d162f978f05254331ba88b4a57a3446ff00253f6c1666fe505118a3'
     assert certificate.status == 'CERTIFIED'
     assert verify_task_certificate(world, task, scenario, certificate)['verified']
 

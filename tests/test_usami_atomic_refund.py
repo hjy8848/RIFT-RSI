@@ -45,7 +45,7 @@ def _run_operation(world, actor, line_id, params):
 
 
 class AtomicRefundService:
-    """Scripted Service using the public tool surface only (no private aliases)."""
+    """Scripted Service for rule-level tests; the line id comes from the fixture alias."""
 
     uses_model = False
     last_call = None
@@ -66,6 +66,54 @@ class AtomicRefundService:
         action = actions[self.index]
         self.index += 1
         return action
+
+
+class PublicToolRefundService:
+    """Scripted Service that only ever sees public tool results.
+
+    It receives no line id, world or private alias: the refunded line is selected
+    from get_order_details by the catalog descriptor the customer named.
+    """
+
+    uses_model = False
+    last_call = None
+
+    def __init__(self):
+        self.index = 0
+        self.scope = None
+
+    @staticmethod
+    def _last_result(prompt):
+        for message in reversed(prompt.conversation):
+            if message.role == "tool" and message.content:
+                return json.loads(message.content)["data"]
+        raise AssertionError("public Service observed no tool result")
+
+    def _call(self, name, resource, params=None):
+        return ServiceAction(kind="operation", operation=Operation(
+            name=name, scope_id=self.scope, resource_id=resource, params=params or {}))
+
+    def decide(self, prompt):
+        self.scope = self.scope or prompt.available_merchant_scope_ids[0]
+        if self.index == 0:
+            self.index = 1
+            return self._call("list_customer_orders", self.scope)
+        if self.index == 1:
+            order = self._last_result(prompt)["orders"][0]
+            self.index = 2
+            return self._call("get_order_details", order["id"])
+        if self.index == 2:
+            lines = self._last_result(prompt)["lines"]
+            line = next(row for row in lines
+                        if row["sku"]["product_family"] == "device"
+                        and row["sku"]["attributes"].get("interface") == "USB_C")
+            self.index = 3
+            return self._call("return_delivered_order_items", line["id"],
+                              {"quantity": 1, "payment_method": "original"})
+        self.index += 1
+        return ServiceAction(kind="reply",
+                             message="Your return is accepted and the refund is issued to the original card.")
+
 
 
 def test_atomic_refund_episode_changes_state_and_replays():
@@ -90,6 +138,24 @@ def test_atomic_refund_episode_changes_state_and_replays():
     assert ledger[0].amount_cents == 20000
     assert not any(row.line_id == case.line_id and row.customer_id != profile.customer_id
                    for row in episode.final_world.evidence.values())
+
+
+def test_public_tool_path_discovers_the_line_and_refunds():
+    world, aliases = frozen(17)
+    task = refund_task(world, aliases)
+    profile = refund_profile(aliases)
+    episode = run_episode(world, task, profile, ScriptedCustomer(), PublicToolRefundService(),
+                          budget=EpisodeBudget(max_customer_turns=3, max_service_decisions=10,
+                                               max_service_tool_calls=8, max_model_calls=0))
+    assert replay_episode(episode).verified
+    assert episode.status == "customer_finished"
+    assert episode.outcome.business_goal_success is True
+    assert [row.operation["name"] for row in episode.tool_executions] == [
+        "list_customer_orders", "get_order_details", "return_delivered_order_items"]
+    assert invariants(episode.final_world) == []
+    settlements = list(episode.final_world.settlements.values())
+    assert len(settlements) == 1 and settlements[0].line_id == aliases["damaged"]
+    assert settlements[0].remedy == "refund"
 
 
 def test_reference_and_engine_agree_on_atomic_refund():
@@ -236,5 +302,5 @@ def test_certified_witness_cost_fits_episode_budget():
                                                                   max_operation_steps=16,
                                                                   max_witnesses=1))
     cost = certification_cost(certificate)
-    assert cost == {"tool_calls": 1, "service_decisions": 2, "customer_turns": 1, "model_calls": 2}
+    assert cost == {"tool_calls": 3, "service_decisions": 4, "customer_turns": 1, "model_calls": 4}
     assert certificate.full_task_reachability_certified
