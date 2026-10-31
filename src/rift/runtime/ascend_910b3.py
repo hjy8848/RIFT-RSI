@@ -172,8 +172,9 @@ class _UsamiCustomer:
         from usami_v2.runtime.customer import CustomerDecision
         self.turns += 1
         if self.turns == 1:
+            # The Service must ask before refunding; this is the spoken yes.
             return CustomerDecision(
-                message="The device I received is damaged and I want a refund.")
+                message="Yes, please go ahead with the refund to my original card.")
         return CustomerDecision(message="Thanks, that is all.", finish=True)
 
 

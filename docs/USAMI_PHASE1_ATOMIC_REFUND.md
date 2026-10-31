@@ -5,12 +5,13 @@
 ## 1. 结论
 
 Phase 1 的"普通退款"闭环已跑通：Service 侧只有 4 个公开工具，按
-`list_customer_orders → get_order_details → return_delivered_order_items` 的公开路径即可发现订单行并
-一次完成校验与退款记账；Engine 执行、Reference 独立重算、Oracle 复核、Replay 全部一致；
-RIFT `service_reward` 实测 **1.0**。
-本地 venv 全量测试：**60 passed, 1 skipped**（22 个收集错误均为缺少 numpy/verl 等可选依赖，
-与本次改动无关），新增 11 个退款测试全部通过，其中 `test_public_tool_path_discovers_the_line_and_refunds`
-不向 Service 提供任何 line id 或私有 alias。
+`list_customer_orders → get_order_details → 对话确认 → return_delivered_order_items` 的公开路径即可
+发现订单行、取得客户确认并一次完成校验与退款记账；Engine 执行、Reference 独立重算、Oracle 复核、
+Replay 全部一致；RIFT `service_reward` 实测 **1.0**。
+本地 venv 全量测试：**62 passed, 1 skipped**（22 个收集错误均为缺少 numpy/verl 等可选依赖，
+与本次改动无关），新增 13 个退款测试全部通过，其中 `test_public_tool_path_discovers_the_line_and_refunds`
+不向 Service 提供任何 line id 或私有 alias，`test_certification_witness_arguments_come_from_public_results`
+要求认证 witness 的订单 id 与 line id 都必须来自公开查询结果。
 
 ## 2. 架构前后对比
 
@@ -79,7 +80,7 @@ skus        = original(device/USB_C, 20000), alternate(22000), cable(2000)
 order       = purchase, delivered_days_ago=1, qty=1, paid=20000
 warehouse   = fast(delivery 2 天, fee 0), alternate 库存 3
 refund_approval_limit_cents = 50000
-witness     = tool_calls 1, service_decisions 2, customer_turns 1, model_calls 2
+witness     = tool_calls 3, service_decisions 5, customer_turns 2, model_calls 7
 task hash   = 8605f5f042a1…（commerce-task-v3）
 ```
 
@@ -90,15 +91,16 @@ user      | Please help me with the following request(s): Please arrange a refun
 tool_call | {"name":"list_customer_orders","resource_id":"merchant"}
 tool_result | {"data":{"orders":[{"id":"order_…","customer_id":"customer_…",…}]}}
 tool_call | {"name":"get_order_details","resource_id":"order_…"}
-tool_result | {"data":{"order":{…},"lines":[{"line_id":"line_4316957ed71b","sku":{"product_family":"device",
-                       "attributes":{"interface":"USB_C"},"price_cents":20000},…}]}}
+tool_result | {"data":{"order":{…},"lines":[{"line_id":"line_…","sku":{"product_family":"device",
+                       "attributes":{"interface":"USB_C"},"price_cents":20000,"return_days":30},…}]}}
+assistant | I can refund one damaged USB-C device to your original card. Shall I proceed?
+user      | Yes, please go ahead.
 tool_call | {"name":"return_delivered_order_items",
-             "resource_id":"line_4316957ed71b",
+             "resource_id":"line_…",
              "params":{"quantity":1,"payment_method":"original"}}
-tool_result | {"data":{"line_id":"line_4316957ed71b","payment_channel":"original-card",
+tool_result | {"data":{"line_id":"line_…","payment_channel":"original-card",
                        "quantity":1,"refund_cents":20000,"status":"refund_issued","success":true}}
-assistant | Refund issued to your original card.
-user      | The device I received is damaged and I want a refund.
+assistant | Your return is accepted and the refund is issued to the original card.
 user      | Thanks, that is all.
 ```
 
@@ -125,30 +127,35 @@ user      | Thanks, that is all.
 
 - `certification_cost(certificate)` 从 witness 步骤推导
   `{tool_calls, service_decisions, customer_turns, model_calls}`。
-- 认证 witness 现在先执行 `list_customer_orders` 与 `get_order_details`，再执行原子退款，
-  因此成本是 **3/4/1/4**（此前只记 1 次操作，低估了真实路径）。
+- 认证 witness 走真实公开路径：`list_customer_orders` → `get_order_details` → 原子退款，
+  并且包含退款前的确认对话（1 次说明性 reply + 1 次收尾 reply，各触发 1 个 customer turn），
+  因此成本是 **3/5/2/7**（tool_calls / service_decisions / customer_turns / model_calls）。
+  其中 model_calls = 5 个 service 决策 + 2 个 customer turn，与 runner 的计数方式一致。
 - `CommerceHost._budget_covers(cost)` 与 `EpisodeBudget` 逐项比较；超预算时不注册任务，
   attempt 记为 `UNKNOWN`，理由 `certified_witness_cost_exceeds_episode_budget`。
-- 当前 smoke 预算 4/10/8/10，witness 成本 3/4/1/4，仍有余量。
+- 当前 smoke 预算 4/10/8/10，witness 成本 3/5/2/7，仍有余量。
 
 ## 11. 测试结果
 
 ```
 .venv/Scripts/python.exe -m pytest -q --continue-on-collection-errors
-60 passed, 1 skipped, 22 errors   # 22 个错误全部是缺少 numpy/verl 的既有收集错误
+62 passed, 1 skipped, 22 errors   # 22 个错误全部是缺少 numpy/verl 的既有收集错误
 .venv/Scripts/python.exe -m pytest -q tests/test_usami_atomic_refund.py
-11 passed
+13 passed
 ```
 
-覆盖：正常退款、公开工具发现路径（无私有 id）、Engine/Reference 一致、超期、未送达、
-数量超买、重复退款、审批上限、支付方式限制、公开 schema 一致性、witness 成本。
+覆盖：正常退款（含确认对话与公开发现路径）、Engine/Reference 一致、超期、未送达、
+数量超买、重复退款、审批上限、支付方式限制、公开 schema 一致性、witness 成本、
+预算不足时拒绝注册、认证参数必须来自公开查询结果。
 
 ## 12. 对照用户六条要求
 
 1. **方案 A**：只新增一个原子业务工具，Case/Quote/Settlement 保留在内部；Outcome 与
    `evaluate_state_goals` 未迁移。
 2. **Delegation**：Profile 自动创建、Agent 不可见，只校验 line 范围；Customer 协议
-   `{message, finish}`，没有关键词匹配。
+   `{message, finish}`，没有关键词匹配。退款前的客户确认由 Service 在对话里完成：
+   Prompt 要求先说明商品、数量与退款渠道并询问，客户用自然语言回答，Environment 不建模
+   结构化 Consent。认证 witness 与 `witness_cost` 计入这次确认对话（2 个 customer turn）。
 3. **工具接口**：Phase 1 只暴露四个工具；退款工具一次完成校验 + 记账；归属/商品/数量/
    期限/重复退款/支付方式检查全部保留。
 4. **预算可行性**：认证 witness 记录成本，注册前比对预算，不可达任务不进入训练。
@@ -168,10 +175,31 @@ user      | Thanks, that is all.
    （Engine 的 `observations.query_data` 与 Reference 的 `_expected_query` 同步修改）。
 2. **Witness Cost 低估**：认证 witness 原来直接用 `goal.line_id` 一步退款，成本记 1/2/1/2。
    现在 witness 先执行 `list_customer_orders` 与 `get_order_details`，再退款，成本变为
-   3/4/1/4，与真实公开路径一致；证书哈希重新冻结为
-   `623283f88d162f978f05254331ba88b4a57a3446ff00253f6c1666fe505118a3`。
+   3/4/1/4，与真实公开路径一致；当时代码的证书哈希为
+   `623283f88d162f978f05254331ba88b4a57a3446ff00253f6c1666fe505118a3`（已被下一轮的
+   `cc1c284d…` 取代）。
 
-## 14. 未解决问题
+## 14. 第二轮评审修正
+
+1. **认证参数必须来自公开查询结果**：`_run_candidate` 不再把
+   `world.lines[goal.line_id].order_id` 与 `goal.line_id` 直接塞进工具参数。
+   它先调 `list_customer_orders`，从返回的 `orders` 里按隐藏目标对应的订单 id 找到公开订单
+   （找不到 → `certified_target_order_not_publicly_visible`），再调 `get_order_details`，
+   从公开 `lines` 里找到与隐藏目标一致的公开行（找不到 →
+   `certified_target_line_not_publicly_visible`），最后用该公开行的 id 执行退款。
+   隐藏 goal 只用于选择要验证哪条公开行，不充当工具参数。
+2. **τ-bench 风格客户确认**：Service SYSTEM 要求退款前先用 `respond_to_customer` 说明商品、
+   数量与退款渠道并请求确认，客户用自然语言回答 yes/no 后才可退款；Customer 提示词同步要求
+   用自己的话确认。没有结构化 Consent、没有关键词匹配、没有新状态机；Environment 仍只校验
+   业务规则。
+3. **公开 SKU 字段**：`commerce/models.py` 新增 `public_sku()`，只暴露
+   `{product_family, attributes, price_cents, return_days}`；`observations.py` 与
+   `reference.py` 的 line 描述符、`search_catalog`、`get_sku_details` 全部改用它。
+4. **成本随确认对话更新**：`_CONFIRMATION_TURNS = 2`，退款路径 witness 成本变为
+   **3/5/2/7**，证书哈希重新冻结为
+   `a9d581d3f85eb2e1d56866380a19b41b8453b6bc06036fbcf25f1b1017ee81ad`。
+
+## 15. 未解决问题
 
 - 远端 `npu30001` 的 checkout 仍落后 21 个提交且有未提交改动，尚未同步本次改动；
   NPU smoke 未运行。

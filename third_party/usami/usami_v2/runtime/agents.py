@@ -227,7 +227,7 @@ class OpenAICustomerAgent:
             "Simulate the authenticated customer in a support conversation. Write short, natural replies "
             "consistent with your private profile. Disclose only what the conversation actually requires, "
             "and never invent order, item or payment details. Never claim that an operation was already "
-            "completed. Set finish=true when your request is settled or you no longer want to continue.\n"
+            "completed. When the service asks you to confirm a refund, answer yes or no in your own words. Set finish=true when your request is settled or you no longer want to continue.\n"
             "PRIVATE CUSTOMER PROFILE: " + json.dumps(profile.model_dump(mode="json"), ensure_ascii=False)
         )
         messages = [{"role": "system", "content": system},
@@ -270,7 +270,7 @@ class OpenAIServiceAgent:
         "Typical flow: call list_customer_orders to find the authenticated customer's orders, "
         "get_order_details to read one order and its line items, then return_delivered_order_items with "
         "the line ID and the quantity of units to refund. That single call records the returned items and "
-        "credits the original payment channel; physical return logistics happen outside this dialogue. \n"
+        "credits the original payment channel; physical return logistics happen outside this dialogue. Before you refund, send one respond_to_customer message that names the item, the quantity and the refund channel and asks the customer to confirm; refund only after the customer agrees, and never refund when the customer declines. \n"
         "The environment enforces ownership, delivery status, the return window, quantities, duplicate "
         "refunds and the refund method, and answers with an explicit error_code when a request is invalid. "
         "Do not ask the customer to upload evidence or to read internal case, quote, settlement or consent "

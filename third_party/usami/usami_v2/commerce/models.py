@@ -317,3 +317,13 @@ def case_id(line_id, indices):
 
 def quote_id(case_key, revision):
     return "quote_" + digest([case_key, revision])[:20]
+
+
+def public_sku(sku):
+    """The catalog fields a Service may see; ownership and policy flags stay hidden."""
+    return {
+        "product_family": sku.product_family,
+        "attributes": dict(sku.attributes),
+        "price_cents": sku.price_cents,
+        "return_days": sku.return_days,
+    }

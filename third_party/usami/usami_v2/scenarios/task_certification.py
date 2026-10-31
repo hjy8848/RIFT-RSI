@@ -320,34 +320,46 @@ def _run_candidate(world, task, scenario, candidates, attempt_id, max_steps):
     def act(name, resource, params):
         nonlocal state, attempts_step_no
         if attempts_step_no >= max_steps:
-            return "proof_operation_budget_exhausted"
+            return "proof_operation_budget_exhausted", {}
         attempts_step_no += 1
         state, step, error = _execute(state, scenario.customer_id, name, resource, params,
                                       attempt_id, attempts_step_no)
         steps.append(step)
-        return error
+        return error, ((step.evidence.get("result") if step is not None else None) or {})
 
-    for position, candidate in enumerate(candidates):
+    for candidate in candidates:
         goal = goals[candidate.goal_id]
         if candidate.remedy != "refund":
             reason = "replacement_path_not_migrated_in_phase_1"
             break
-        # Public discovery: the Service prompt requires listing the customer's
-        # orders and reading one order before a refund. The certified cost must
-        # cover those queries, otherwise a task could be registered with a
-        # budget that no real Service can follow.
-        if position == 0:
-            error = act("list_customer_orders", next(iter(state.merchants)), {})
-            if not error:
-                error = act("get_order_details", world.lines[goal.line_id].order_id, {})
-            if error:
-                reason = error
-                break
+        # The witness must find its tool arguments in the actual public results,
+        # exactly like a Service would. The hidden goal only selects which public
+        # order line the witness is about; it is never passed as a query or a
+        # refund argument.
+        error, orders_result = act("list_customer_orders", next(iter(state.merchants)), {})
+        if error:
+            reason = error
+            break
+        orders = (orders_result.get("data") or {}).get("orders") or ()
+        target_order_id = world.lines[goal.line_id].order_id
+        order = next((row for row in orders if row.get("id") == target_order_id), None)
+        if order is None:
+            reason = "certified_target_order_not_publicly_visible"
+            break
+        error, details_result = act("get_order_details", order["id"], {})
+        if error:
+            reason = error
+            break
+        public_lines = (details_result.get("data") or {}).get("lines") or ()
+        public_line = next((row for row in public_lines if row.get("id") == goal.line_id), None)
+        if public_line is None:
+            reason = "certified_target_line_not_publicly_visible"
+            break
         # Phase 1: the single atomic refund validates delivery, window, quantity,
         # duplicate refunds, approval limit and payment method inside the Engine,
         # and the Reference recomputes the same state transition independently.
-        error = act("return_delivered_order_items", goal.line_id,
-                    {"quantity": goal.quantity, "payment_method": "original"})
+        error, _ = act("return_delivered_order_items", public_line["id"],
+                       {"quantity": goal.quantity, "payment_method": "original"})
         if error:
             reason = error
             break
@@ -443,6 +455,13 @@ def certify_task(world: World, task: TaskSpec, customer_scenario: CustomerScenar
 
 
 
+# A refund is only issued after the customer agrees in the conversation, so the
+# witness path always contains one reply that asks for confirmation and one final
+# reply. Each reply is one service decision, one model call, and one customer turn
+# in the runtime; the certified cost would be dishonest if it ignored them.
+_CONFIRMATION_TURNS = 2
+
+
 def _witness_cost(attempts) -> Dict[str, int]:
     """Minimum episode cost implied by the first certified witness path."""
     witnesses = [row for row in attempts if row.status == "WITNESS"]
@@ -451,10 +470,12 @@ def _witness_cost(attempts) -> Dict[str, int]:
     steps = witnesses[0].steps
     operations = sum(1 for row in steps if row.kind == "operation")
     consents = sum(1 for row in steps if row.kind == "customer_consent")
+    customer_turns = _CONFIRMATION_TURNS + consents
     return {"tool_calls": operations,
-            "service_decisions": operations + 1,
-            "customer_turns": consents + 1,
-            "model_calls": operations + consents + 1}
+            "service_decisions": operations + _CONFIRMATION_TURNS + consents,
+            "customer_turns": customer_turns,
+            # Every service decision and every customer turn is one model call.
+            "model_calls": operations + _CONFIRMATION_TURNS + consents + customer_turns}
 
 
 def certification_cost(certification: TaskCertification) -> Dict[str, int]:

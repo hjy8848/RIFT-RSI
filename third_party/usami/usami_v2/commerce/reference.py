@@ -7,6 +7,7 @@ from datetime import timedelta
 
 from usami_harness.models import Decision
 from .invariants import invariants
+from .models import public_sku
 from .models import (
     Fulfillment, LedgerEntry, PREPARATIONS, Quote, RemedyCase, Return, Settlement,
     case_id, quote_id, unit_credit,
@@ -28,7 +29,7 @@ def _expected_query(world, actor, op):
                 continue
             row = line.model_dump(mode="json")
             sku = world.skus.get(line.sku_id)
-            row["sku"] = sku.model_dump(mode="json") if sku is not None else None
+            row["sku"] = public_sku(sku) if sku is not None else None
             rows.append(row)
         return {"order": world.orders[key].model_dump(mode="json"), "lines": rows}
     if op.name == "search_catalog":
@@ -41,10 +42,10 @@ def _expected_query(world, actor, op):
                 continue
             if any(sku.attributes.get(key) != val for key, val in params["attributes"].items()):
                 continue
-            selected.append(sku.model_dump(mode="json"))
+            selected.append(public_sku(sku))
         return {"skus": selected}
     if op.name == "get_sku_details":
-        return {"sku": world.skus[key].model_dump(mode="json")}
+        return {"sku": public_sku(world.skus[key])}
     if op.name == "get_inventory":
         return {"inventory": [world.inventory[k].model_dump(mode="json") for k in sorted(world.inventory)
                               if world.inventory[k].sku_id == key]}

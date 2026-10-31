@@ -15,7 +15,7 @@ from usami_v2.commerce.invariants import invariants
 from usami_v2.commerce.models import Operation
 from usami_v2.commerce.reference import decide
 from usami_v2.runtime.agents import ServiceAction, service_tools
-from usami_v2.runtime.customer import CustomerRuntime
+from usami_v2.runtime.customer import CustomerDecision, CustomerRuntime
 from usami_v2.runtime.runner import EpisodeBudget, replay_episode, run_episode
 from usami_harness.engine import Engine
 from usami_harness.models import Request
@@ -55,6 +55,9 @@ class AtomicRefundService:
 
     def decide(self, prompt):
         actions = [
+            ServiceAction(kind="reply",
+                          message="I can refund one damaged USB-C device to the original card. "
+                                  "Shall I proceed?"),
             ServiceAction(kind="operation", operation=Operation(
                 name="return_delivered_order_items",
                 scope_id=next(iter(prompt.available_merchant_scope_ids)),
@@ -72,7 +75,8 @@ class PublicToolRefundService:
     """Scripted Service that only ever sees public tool results.
 
     It receives no line id, world or private alias: the refunded line is selected
-    from get_order_details by the catalog descriptor the customer named.
+    from get_order_details by the catalog descriptor the customer named, and the
+    refund is only issued after the customer agrees to the confirmation reply.
     """
 
     uses_model = False
@@ -81,6 +85,7 @@ class PublicToolRefundService:
     def __init__(self):
         self.index = 0
         self.scope = None
+        self.line_id = None
 
     @staticmethod
     def _last_result(prompt):
@@ -107,12 +112,33 @@ class PublicToolRefundService:
             line = next(row for row in lines
                         if row["sku"]["product_family"] == "device"
                         and row["sku"]["attributes"].get("interface") == "USB_C")
-            self.index = 3
-            return self._call("return_delivered_order_items", line["id"],
+            self.line_id, self.index = line["id"], 3
+            return ServiceAction(kind="reply",
+                                 message="I can refund one damaged USB-C device to the original card. "
+                                         "Shall I proceed?")
+        if self.index == 3:
+            self.index = 4
+            return self._call("return_delivered_order_items", self.line_id,
                               {"quantity": 1, "payment_method": "original"})
         self.index += 1
         return ServiceAction(kind="reply",
                              message="Your return is accepted and the refund is issued to the original card.")
+
+
+class ConfirmingCustomer:
+    """Natural-language customer: agrees once, then finishes after the refund."""
+
+    uses_model = False
+    last_call = None
+
+    def __init__(self):
+        self.turns = 0
+
+    def decide(self, prompt, profile):
+        self.turns += 1
+        if self.turns == 1:
+            return CustomerDecision(message="Yes, please go ahead.")
+        return CustomerDecision(message="Thanks, that is all.", finish=True)
 
 
 
@@ -120,7 +146,7 @@ def test_atomic_refund_episode_changes_state_and_replays():
     world, aliases = frozen(17)
     task = refund_task(world, aliases)
     profile = refund_profile(aliases)
-    episode = run_episode(world, task, profile, ScriptedCustomer(),
+    episode = run_episode(world, task, profile, ConfirmingCustomer(),
                           AtomicRefundService(aliases["damaged"]),
                           budget=EpisodeBudget(max_customer_turns=3, max_service_decisions=10,
                                                max_service_tool_calls=8, max_model_calls=0))
@@ -144,7 +170,7 @@ def test_public_tool_path_discovers_the_line_and_refunds():
     world, aliases = frozen(17)
     task = refund_task(world, aliases)
     profile = refund_profile(aliases)
-    episode = run_episode(world, task, profile, ScriptedCustomer(), PublicToolRefundService(),
+    episode = run_episode(world, task, profile, ConfirmingCustomer(), PublicToolRefundService(),
                           budget=EpisodeBudget(max_customer_turns=3, max_service_decisions=10,
                                                max_service_tool_calls=8, max_model_calls=0))
     assert replay_episode(episode).verified
@@ -302,5 +328,39 @@ def test_certified_witness_cost_fits_episode_budget():
                                                                   max_operation_steps=16,
                                                                   max_witnesses=1))
     cost = certification_cost(certificate)
-    assert cost == {"tool_calls": 3, "service_decisions": 4, "customer_turns": 1, "model_calls": 4}
+    assert cost == {"tool_calls": 3, "service_decisions": 5, "customer_turns": 2, "model_calls": 7}
     assert certificate.full_task_reachability_certified
+
+def test_certification_witness_arguments_come_from_public_results():
+    world, aliases = frozen_world(13)
+    task = make_task(world, aliases, remedy=("refund",))
+    scenario = customer_scenario(aliases)
+    from usami_v2.scenarios.task_certification import ProofBudget, certify_task
+    certificate = certify_task(world, task, scenario,
+                               ProofBudget(max_plan_candidates=16, max_operation_steps=16,
+                                           max_witnesses=1))
+    witness = next(row for row in certificate.attempts if row.status == "WITNESS")
+    operations = [step for step in witness.steps if step.kind == "operation"]
+    listed = operations[0].evidence["result"]["data"]["orders"]
+    details = operations[1]
+    assert details.evidence["request"]["operation"]["resource_id"] == listed[0]["id"]
+    public_lines = details.evidence["result"]["data"]["lines"]
+    refund = operations[2]
+    refunded = refund.evidence["request"]["operation"]["resource_id"]
+    assert refunded == aliases["damaged"]
+    assert any(row["id"] == refunded for row in public_lines)
+    assert refund.evidence["result"]["data"]["status"] == "refund_issued"
+
+def test_certified_cost_rejects_an_episode_budget_that_cannot_run_it():
+    from types import SimpleNamespace
+    from rift.benchmark.usami import CommerceHost
+    cost = {"tool_calls": 3, "service_decisions": 5, "customer_turns": 2, "model_calls": 7}
+    tight = SimpleNamespace(episode_budget=EpisodeBudget(
+        max_customer_turns=1, max_service_decisions=10,
+        max_service_tool_calls=8, max_model_calls=10))
+    roomy = SimpleNamespace(episode_budget=EpisodeBudget(
+        max_customer_turns=4, max_service_decisions=10,
+        max_service_tool_calls=8, max_model_calls=10))
+    assert CommerceHost._budget_covers(tight, cost) is False
+    assert CommerceHost._budget_covers(roomy, cost) is True
+

@@ -1,7 +1,7 @@
 """Actual public tool results; no private task, witness or preference labels."""
 from datetime import timedelta
 
-from .models import unit_credit
+from .models import public_sku, unit_credit
 
 
 def _public_line_rows(world, order_key):
@@ -17,7 +17,7 @@ def _public_line_rows(world, order_key):
             continue
         row = line.model_dump(mode="json")
         sku = world.skus.get(line.sku_id)
-        row["sku"] = sku.model_dump(mode="json") if sku is not None else None
+        row["sku"] = public_sku(sku) if sku is not None else None
         rows.append(row)
     return rows
 
@@ -31,12 +31,12 @@ def query_data(world, actor, op):
         return {"order": world.orders[key].model_dump(mode="json"),
                 "lines": _public_line_rows(world, key)}
     if op.name == "search_catalog":
-        return {"skus": [row.model_dump(mode="json") for row in sorted(world.skus.values(), key=lambda x: x.id)
+        return {"skus": [public_sku(row) for row in sorted(world.skus.values(), key=lambda x: x.id)
                          if row.merchant_id == op.scope_id
                          and (p["product_family"] is None or row.product_family == p["product_family"])
                          and all(row.attributes.get(k) == v for k, v in p["attributes"].items())]}
     if op.name == "get_sku_details":
-        return {"sku": world.skus[key].model_dump(mode="json")}
+        return {"sku": public_sku(world.skus[key])}
     if op.name == "get_inventory":
         return {"inventory": [row.model_dump(mode="json") for row in sorted(world.inventory.values(), key=lambda x: x.id)
                               if row.sku_id == key]}
