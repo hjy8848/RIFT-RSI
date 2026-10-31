@@ -1,7 +1,7 @@
 # Phase 2：部分退款、多商品与多订单，多目标 Certification / Reward / Replay
 
 日期：2026-10-31
-分支：`master`，本地提交 `7e01024`（`origin/master` 仍是 `7ee0ace`，推送受阻，见 F 节）
+分支：`master`，最终提交 `e7e912c`（已推送到 `origin/master`）
 
 ## 结论摘要
 
@@ -153,17 +153,16 @@ xfail 说明：`test_customer_refusal_prevents_atomic_refund` 断言的是“客
   （3 个文件，+901/−15）。
 - 提交内容：`tests/test_usami_phase2.py`（新增）、`tests/test_usami_atomic_refund.py`、
   `third_party/usami/usami_v2/scenarios/task_certification.py`。
-- **推送状态：未推送。** `origin/master` 仍为 `7ee0ace`。本机到 `github.com:443` 的 TLS 握手被中断
-  （`git push`/`curl`/Python `urllib` 均报 `unexpected eof while reading`），HTTP/SOCKS5 实验室代理
-  需要认证（407 / SOCKS5 auth rejected），SSH 身份是 `hongxingli319` 且对 `hjy8848/RIFT-RSI` 无推送权限。
-  网络恢复后执行：`git -c credential.helper=helper-selector push origin master`。
+- **推送状态：已推送。** `7ee0ace..e7e912c master -> master`，`origin/master = e7e912c`。
+  推送前曾出现一段时间到 `github.com:443` 的 TLS 握手被中断（`git push`/`curl`/Python `urllib`
+  均报 `unexpected eof while reading`），实验室代理需要认证，SSH 身份为 `hongxingli319` 且对
+  `hjy8848/RIFT-RSI` 无推送权限；网络恢复后用已配置的 HTTPS 凭据推送成功。
 - 未提交项：无源码改动；工作区仅剩历史遗留的未跟踪目录（`.pytest-*`、`.test-codex-*`、
   `third_party/usami/build/`），本次未清理、未纳入提交。
 
 ## 未解决问题
 
-1. 推送受阻（F 节），需要网络恢复或用户本机推送。
-2. 真实模型 smoke 未跑（需要远端 NPU 环境与模型服务）。
-3. 未安装 `verl`/`numpy` 的 6 个测试文件未能在本机验证。
-4. v3 协议不承载 grounding 字段：若未来需要 v3 任务“公开定位可审计”，需要单独评审
+1. 真实模型 smoke 未跑（需要远端 NPU 环境与模型服务）。
+2. 未安装 `verl`/`numpy` 的 6 个测试文件未能在本机验证。
+3. v3 协议不承载 grounding 字段：若未来需要 v3 任务“公开定位可审计”，需要单独评审
    `TaskSpecV3.remedy_goals` 的类型（本次未改，以保持协议兼容）。
