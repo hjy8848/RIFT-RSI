@@ -124,7 +124,12 @@ assert "rsi_core" not in sys.modules
 assert "usami_v2" not in sys.modules
 assert "ray" not in sys.modules and "verl" not in sys.modules
 '''
-    subprocess.run([sys.executable, '-c', program], check=True)
+    import os
+    # pytest's `pythonpath` setting only affects this process; hand the same
+    # import roots to the clean interpreter so the check works from any checkout.
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+        [p for p in sys.path if p] + [os.environ.get('PYTHONPATH', '')]))
+    subprocess.run([sys.executable, '-c', program], check=True, env=env)
 
 def test_split_registry_and_checkpoint_groups(tmp_path):
     from rift.replay.splits import SplitRegistry

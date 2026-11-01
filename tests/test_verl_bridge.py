@@ -322,24 +322,18 @@ def test_mock_coordinator_recovers_without_repeating_service_update():
 
 def test_native_usami_session_steps_through_real_runner_without_model():
     import json
-    from rift_usami_fixtures import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
+    from rift_usami_fixtures import (frozen, refund_task, refund_profile, ConfirmingCustomer,
+        PublicPathRefundService, flat_tool_call)
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.benchmark.usami import public_episode
     from rift.verl.usami_session import NativeUsamiSession
     world, aliases = frozen()
-    script = ScriptedRefundService(world, aliases)
+    script = PublicPathRefundService(world, aliases)
     class FakeParser:
         async def extract_tool_calls(self, token_ids, schemas):
-            action = script.decide(None)
-            if action.kind == 'operation':
-                op = action.operation
-                return '', [SimpleNamespace(name=op.name, arguments=json.dumps({'scope_id':op.scope_id,
-                    'resource_id':op.resource_id, 'params':op.params}), tool_call_id=None)]
-            return '', [SimpleNamespace(name='respond_to_customer', arguments=json.dumps({'message':action.message,
-                'present_quote_id':action.present_quote_id, 'present_for':action.present_for,
-                'subject_ids':list(action.subject_ids)}), tool_call_id=None)]
+            return flat_tool_call(script.decide(None))
     async def exercise():
-        session = NativeUsamiSession(world, refund_task(world, aliases), refund_profile(aliases), ScriptedCustomer(),
+        session = NativeUsamiSession(world, refund_task(world, aliases), refund_profile(aliases), ConfirmingCustomer(),
             FakeParser(), budget=EpisodeBudget(max_customer_turns=3,max_service_decisions=10,max_service_tool_calls=8,max_model_calls=10))
         try:
             messages, tools = await session.start()
@@ -359,20 +353,19 @@ def test_native_usami_session_steps_through_real_runner_without_model():
 
 def test_native_budget_cancellation_is_unknown_and_replayable():
     import json
-    from rift_usami_fixtures import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
+    from rift_usami_fixtures import (frozen, refund_task, refund_profile, ConfirmingCustomer,
+        PublicPathRefundService, flat_tool_call)
     from usami_v2.runtime.runner import EpisodeBudget, replay_episode
     from rift.benchmark.usami import public_episode
     from rift.verl.usami_session import NativeUsamiSession
     world, aliases = frozen()
-    script = ScriptedRefundService(world, aliases)
+    script = PublicPathRefundService(world, aliases)
     class Parser:
         async def extract_tool_calls(self, tokens, schemas):
-            op = script.decide(None).operation
-            return '', [SimpleNamespace(name=op.name, arguments=json.dumps({
-                'scope_id': op.scope_id, 'resource_id': op.resource_id, 'params': op.params}), tool_call_id=None)]
+            return flat_tool_call(script.decide(None))
     async def exercise():
         session = NativeUsamiSession(world, refund_task(world, aliases), refund_profile(aliases),
-            ScriptedCustomer(), Parser(), budget=EpisodeBudget(max_customer_turns=3,
+            ConfirmingCustomer(), Parser(), budget=EpisodeBudget(max_customer_turns=3,
             max_service_decisions=10, max_service_tool_calls=8, max_model_calls=10))
         try:
             await session.start()
@@ -391,7 +384,8 @@ def test_native_budget_cancellation_is_unknown_and_replayable():
 def test_native_capture_builds_two_distinct_grouped_trajectories(tmp_path, monkeypatch):
     """Fake parser/attestor only; native Engine and Replay are real CPU code."""
     import json
-    from rift_usami_fixtures import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
+    from rift_usami_fixtures import (frozen, refund_task, refund_profile, ConfirmingCustomer,
+        PublicPathRefundService, flat_tool_call)
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.verl.usami_session import NativeUsamiSession
     from rift.verl.capture_store import NativeCaptureStore
@@ -401,18 +395,11 @@ def test_native_capture_builds_two_distinct_grouped_trajectories(tmp_path, monke
         def verify_capture(self, trace, request, response): return True
     store = NativeCaptureStore(tmp_path / 'captures', serialization='fixture', attestor=FakeAttestor())
     async def one(seed):
-        script = ScriptedRefundService(world, aliases)
+        script = PublicPathRefundService(world, aliases)
         class FakeParser:
             async def extract_tool_calls(self, tokens, schemas):
-                action = script.decide(None)
-                if action.kind == 'operation':
-                    op = action.operation
-                    return '', [SimpleNamespace(name=op.name, arguments=json.dumps({'scope_id':op.scope_id,
-                        'resource_id':op.resource_id, 'params':op.params}), tool_call_id=None)]
-                return '', [SimpleNamespace(name='respond_to_customer', arguments=json.dumps({'message':action.message,
-                    'present_quote_id':action.present_quote_id,'present_for':action.present_for,
-                    'subject_ids':list(action.subject_ids)}), tool_call_id=None)]
-        session = NativeUsamiSession(world, task, refund_profile(aliases), ScriptedCustomer(), FakeParser(),
+                return flat_tool_call(script.decide(None))
+        session = NativeUsamiSession(world, task, refund_profile(aliases), ConfirmingCustomer(), FakeParser(),
             group_id='same-task-group', budget=EpisodeBudget(max_customer_turns=3,max_service_decisions=10,
                 max_service_tool_calls=8,max_model_calls=10), group_size=2)
         cap = ContinuousCapture([1], cp)
@@ -468,18 +455,15 @@ def test_native_capture_builds_two_distinct_grouped_trajectories(tmp_path, monke
 def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkeypatch):
     """The native business runner is real; token generation and templates are test doubles."""
     import json
-    from rift_usami_fixtures import frozen, refund_task, refund_profile, ScriptedCustomer, ScriptedRefundService
+    from rift_usami_fixtures import (frozen, refund_task, refund_profile, ConfirmingCustomer,
+        PublicPathRefundService, flat_tool_call)
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.verl.usami_session import NativeUsamiSession
     from rift.verl.capture_store import NativeCaptureStore
-    world, aliases = frozen(); script = ScriptedRefundService(world, aliases)
+    world, aliases = frozen(); script = PublicPathRefundService(world, aliases)
     class FakeParser:
         async def extract_tool_calls(self, tokens, schemas):
-            action = script.decide(None)
-            if action.kind == 'operation':
-                op = action.operation
-                return '', [SimpleNamespace(name=op.name, arguments=json.dumps({'scope_id':op.scope_id,'resource_id':op.resource_id,'params':op.params}), tool_call_id=None)]
-            return '', [SimpleNamespace(name='respond_to_customer', arguments=json.dumps({'message':action.message,'present_quote_id':action.present_quote_id,'present_for':action.present_for,'subject_ids':list(action.subject_ids)}), tool_call_id=None)]
+            return flat_tool_call(script.decide(None))
     class Base:
         def __init__(self): self.rollout_config = SimpleNamespace(response_length=100, n=4); self.tokenizer = None
         async def ct_build_initial_tokens(self, messages, tools=None): return [1]
@@ -515,7 +499,7 @@ def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkey
     from rift.verl.generation_ledger import GenerationLedger
     ledger = GenerationLedger(tmp_path / 'generation-ledger', verifier)
     sink = NativeCaptureStore(tmp_path / 'captures', serialization='fake-template', attestor=ledger)
-    session = NativeUsamiSession(world, refund_task(world,aliases), refund_profile(aliases), ScriptedCustomer(), FakeParser(),
+    session = NativeUsamiSession(world, refund_task(world,aliases), refund_profile(aliases), ConfirmingCustomer(), FakeParser(),
         group_id='group', sampling_seed=23, sampling_scope='paired-probe-scope',
         rollout_id='native-rollout', group_size=4, task_ref='opaque', rift_mode='train', customer_seed=91,
         budget=EpisodeBudget(max_customer_turns=3,max_service_decisions=10,max_service_tool_calls=8,max_model_calls=10))
@@ -536,8 +520,8 @@ def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkey
     from rift.verl.sampling import rollout_seed
     assert [row['seed'] for row in loop.server_manager.sampling] == [
         rollout_seed(23, 'paired-probe-scope', turn) for turn in range(loop.server_manager.i)]
-    script = ScriptedRefundService(world, aliases)
-    session = NativeUsamiSession(world, refund_task(world,aliases), refund_profile(aliases), ScriptedCustomer(), FakeParser(),
+    script.index = 0
+    session = NativeUsamiSession(world, refund_task(world,aliases), refund_profile(aliases), ConfirmingCustomer(), FakeParser(),
         group_id='group', sampling_seed=23, sampling_scope='paired-probe-scope',
         rollout_id='native-over-budget', group_size=4, task_ref='opaque', rift_mode='train', customer_seed=91,
         budget=EpisodeBudget(max_customer_turns=3,max_service_decisions=10,max_service_tool_calls=8,max_model_calls=10))

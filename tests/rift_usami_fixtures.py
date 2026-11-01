@@ -272,3 +272,67 @@ class NoConsentSandboxService:
         action = actions[self.index]
         self.index += 1
         return action
+
+
+def flat_tool_call(action):
+    """What a model's parsed output looks like on the public, flat tool surface."""
+    import json
+    from types import SimpleNamespace
+    if action.kind == "operation":
+        op = action.operation
+        arguments = {
+            "list_customer_orders": lambda: {},
+            "get_order_details": lambda: {"order_id": op.resource_id},
+            "return_delivered_order_items": lambda: {"line_id": op.resource_id, **op.params},
+        }[op.name]()
+        return "", [SimpleNamespace(name=op.name, arguments=json.dumps(arguments), tool_call_id=None)]
+    return "", [SimpleNamespace(name="respond_to_customer",
+                                arguments=json.dumps({"message": action.message}), tool_call_id=None)]
+
+
+class PublicPathRefundService:
+    """Scripted model on the current public surface: discover, ask, refund, report.
+
+    Used only where the test exercises plumbing (VERL bridge, capture, replay)
+    and the parser double needs one action per generation; discovery from public
+    results is covered by the Phase 1/2 tests.
+    """
+    last_call = None
+    uses_model = False
+
+    def __init__(self, world, aliases):
+        self.world, self.aliases, self.index = world, aliases, 0
+
+    def decide(self, prompt):
+        merchant = next(iter(self.world.merchants))
+        line = self.aliases["damaged"]
+        order = self.world.lines[line].order_id
+        actions = [
+            ServiceAction(kind="operation", operation=Operation(
+                name="list_customer_orders", scope_id=merchant, resource_id=merchant, params={})),
+            ServiceAction(kind="operation", operation=Operation(
+                name="get_order_details", scope_id=merchant, resource_id=order, params={})),
+            ServiceAction(kind="reply", message="I can refund one damaged device to your original card. Proceed?"),
+            ServiceAction(kind="operation", operation=Operation(
+                name="return_delivered_order_items", scope_id=merchant, resource_id=line,
+                params={"quantity": 1, "payment_method": "original"})),
+            ServiceAction(kind="reply", message="The refund was issued to your original card."),
+        ]
+        action = actions[min(self.index, len(actions) - 1)]
+        self.index += 1
+        return action
+
+
+class ConfirmingCustomer:
+    """Agrees to the first proposal in plain words, then finishes."""
+    last_call = None
+    uses_model = False
+
+    def __init__(self):
+        self.turns = 0
+
+    def decide(self, prompt, profile):
+        self.turns += 1
+        if self.turns == 1:
+            return CustomerDecision(message="Yes, please go ahead.")
+        return CustomerDecision(message="Thanks, that is all.", finish=True)
