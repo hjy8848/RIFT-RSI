@@ -3,7 +3,7 @@ from datetime import datetime
 import re
 from typing import Literal, Optional, Tuple
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_serializer, model_validator
 
 from vast_coevo.schema import digest
 from usami_v2.contracts import (
@@ -11,7 +11,7 @@ from usami_v2.contracts import (
     ServiceMessage, SourceRef, aware,
 )
 from usami_v2.commerce.invariants import invariants
-from usami_v2.commerce.models import unit_credit
+from usami_v2.commerce.models import omit_default_fields, unit_credit
 from usami_v2.evaluation.outcomes import GoalResult
 from usami_v2.evaluation.communication import evaluate_communication
 from .schema import Attribute
@@ -310,6 +310,20 @@ class GroundedRemedyGoal(RemedyGoal):
         return value
 
 
+class OrderCancellationGoal(Sealed):
+    """Cancel one whole unshipped order; ``line_ids`` lists every line of that order."""
+
+    goal_id: str
+    order_id: str
+    line_ids: Tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def unique_lines(self):
+        if len(set(self.line_ids)) != len(self.line_ids) or tuple(sorted(self.line_ids)) != self.line_ids:
+            raise ValueError("cancellation goal lines must be unique and sorted")
+        return self
+
+
 class InformationObjective(Sealed):
     goal_id: str
     subject_id: str
@@ -337,6 +351,13 @@ class TaskSpec(Sealed):
     partition: Literal["train", "validation", "heldout"]
     source_distribution_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     parent_training_evidence_hashes: Tuple[str, ...] = ()
+    # Phase 3. Omitted from the serialized record while empty, so every
+    # earlier task keeps its exact record hash and protocol version.
+    cancellation_goals: Tuple[OrderCancellationGoal, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ("cancellation_goals",))
 
     @field_validator("parent_training_evidence_hashes")
     @classmethod
@@ -348,9 +369,14 @@ class TaskSpec(Sealed):
 
     @model_validator(mode="after")
     def actual_goals(self):
-        rows = self.remedy_goals + self.information_goals
+        rows = self.remedy_goals + self.information_goals + self.cancellation_goals
         if not rows or len({row.goal_id for row in rows}) != len(rows):
             raise ValueError("task needs unique business/information objectives")
+        if self.cancellation_goals and self.protocol != "commerce-task-v3":
+            raise ValueError("order cancellation goals require the structured v3 task protocol")
+        lines = delegated_line_ids(self)
+        if len(set(lines)) != len(lines):
+            raise ValueError("one order line cannot carry several business objectives")
         normalized_request = " ".join(self.customer_request.casefold().split())
         if self.protocol == "commerce-task-v1":
             for goal in self.information_goals:
@@ -417,6 +443,12 @@ class CustomerRequestBundle(Sealed):
         return self
 
 
+def delegated_line_ids(task):
+    """Lines the Customer authorizes: remedy lines, then every line of a cancelled order."""
+    return tuple(goal.line_id for goal in task.remedy_goals) + tuple(
+        line_id for goal in task.cancellation_goals for line_id in goal.line_ids)
+
+
 def _display_name(value):
     return " ".join(str(value).replace("_", " ").split()) or "item"
 
@@ -433,9 +465,10 @@ def _line_description(world, line_id):
     return " ".join(dict.fromkeys(parts))
 
 
-def render_customer_request(world, customer_id, remedy_goals, information_goals):
+def render_customer_request(world, customer_id, remedy_goals, information_goals, cancellation_goals=()):
     """Render a public request from the exact structured goals; never infer goals from prose."""
     remedy_goals, information_goals = tuple(remedy_goals), tuple(information_goals)
+    cancellation_goals = tuple(cancellation_goals)
     clauses = []
     for index, goal in enumerate(remedy_goals, 1):
         if goal.line_id not in world.lines:
@@ -471,6 +504,12 @@ def render_customer_request(world, customer_id, remedy_goals, information_goals)
             amount = goal.maximum_extra_charge_cents / 100
             sentence += " with no more than CNY {:.2f} in extra charges".format(amount)
         clauses.append(sentence + ".")
+    for index, goal in enumerate(cancellation_goals, len(clauses) + 1):
+        order = world.orders.get(goal.order_id)
+        if order is None or order.customer_id != customer_id:
+            raise ValueError("request renderer cannot cancel another Customer's order")
+        items = " and ".join(_line_description(world, line_id) for line_id in goal.line_ids)
+        clauses.append("{}. Please cancel my order with the {} before it ships.".format(index, items))
     fact_labels = {
         "refund_amount": "refund amount", "extra_charge": "additional charge",
         "arrival_date": "arrival date", "refund_status": "refund status",
@@ -496,12 +535,22 @@ def render_customer_request(world, customer_id, remedy_goals, information_goals)
     return "Please help me with the following request(s):\n" + "\n".join(clauses)
 
 
-def request_intent_hash(customer_id, remedy_goals, information_goals):
-    return digest({"customer_id": customer_id,
-                   "remedy_goals": [row.model_dump(mode="json", exclude={"record_hash"})
-                                    for row in remedy_goals],
-                   "information_goals": [row.model_dump(mode="json", exclude={"record_hash"})
-                                         for row in information_goals]})
+def request_intent_hash(customer_id, remedy_goals, information_goals, cancellation_goals=()):
+    intent = {"customer_id": customer_id,
+              "remedy_goals": [row.model_dump(mode="json", exclude={"record_hash"})
+                               for row in remedy_goals],
+              "information_goals": [row.model_dump(mode="json", exclude={"record_hash"})
+                                    for row in information_goals]}
+    if cancellation_goals:
+        # Only Phase 3 intents carry this key; earlier intent hashes are unchanged.
+        intent["cancellation_goals"] = [row.model_dump(mode="json", exclude={"record_hash"})
+                                        for row in cancellation_goals]
+    return digest(intent)
+
+
+def task_goal_ids(task):
+    """Request-bundle goal order: remedies, cancellations, then information goals."""
+    return tuple(row.goal_id for row in task.remedy_goals + task.cancellation_goals + task.information_goals)
 
 
 class TaskSpecV3(TaskSpec):
@@ -515,11 +564,11 @@ class TaskSpecV3(TaskSpec):
     @model_validator(mode="after")
     def request_bundle_matches_intent(self):
         bundle = self.request_bundle
-        goals = self.remedy_goals + self.information_goals
         if (bundle.customer_id != self.customer_id
-                or bundle.goal_ids != tuple(row.goal_id for row in goals)
+                or bundle.goal_ids != task_goal_ids(self)
                 or bundle.intent_hash != request_intent_hash(self.customer_id, self.remedy_goals,
-                                                             self.information_goals)
+                                                             self.information_goals,
+                                                             self.cancellation_goals)
                 or bundle.request_hash != digest(self.customer_request)):
             raise ValueError("Customer request provenance differs from structured task intent")
         return self
@@ -553,7 +602,7 @@ def check_task_scope(world, task: TaskSpec):
         if not isinstance(task, TaskSpecV3):
             raise ValueError("commerce-task-v3 requires its structured task contract")
         expected_request = render_customer_request(
-            world, task.customer_id, task.remedy_goals, task.information_goals)
+            world, task.customer_id, task.remedy_goals, task.information_goals, task.cancellation_goals)
         if task.customer_request != expected_request:
             raise ValueError("public Customer request was not rendered from its registered structured intent")
         if task.request_bundle.request_hash != digest(expected_request):
@@ -575,6 +624,13 @@ def check_task_scope(world, task: TaskSpec):
                    for unit in row.unit_indices}
         if goal.quantity > line.quantity - len(occupied | settled):
             raise ValueError("task exceeds the uncommitted purchased quantity")
+
+    for goal in task.cancellation_goals:
+        order = world.orders.get(goal.order_id)
+        if not order or order.customer_id != task.customer_id:
+            raise ValueError("cancellation goal crosses the frozen Customer identity")
+        if goal.line_ids != tuple(sorted(row.id for row in world.lines.values() if row.order_id == order.id)):
+            raise ValueError("cancellation goal must name exactly every line of its order")
 
     for goal in task.information_goals:
         if goal.subject_id not in owned_orders | owned_lines:
@@ -674,13 +730,35 @@ def evaluate_state_goals(initial, final, task: TaskSpec):
             ok = False
         rows.append(GoalResult(goal_id=goal.goal_id, status="PASS" if ok else "FAIL", evidence_refs=tuple(refs)))
 
+    for goal in task.cancellation_goals:
+        # Independent success check: every line fully cancelled and every paid
+        # cent back on the order's original payment channel, nothing shipped.
+        order = initial.orders[goal.order_id]
+        ok, refs = True, []
+        for line_id in goal.line_ids:
+            line = initial.lines[line_id]
+            settlements = [row for key, row in final.settlements.items()
+                           if row.line_id == line_id and key not in initial.settlements]
+            units = sorted(unit for row in settlements for unit in row.unit_indices)
+            if units != list(range(line.quantity)) or any(row.remedy != "cancel" for row in settlements):
+                ok = False
+            ledger = [entry for row in settlements for entry in final.ledger.values()
+                      if entry.quote_id == row.quote_id]
+            if (sum(entry.amount_cents for entry in ledger if entry.kind == "refund") != line.allocated_paid_cents
+                    or any(entry.kind != "refund" or entry.channel != order.payment_channel for entry in ledger)
+                    or any(row.quote_id == settlement.quote_id for settlement in settlements
+                           for row in final.fulfillments.values())):
+                ok = False
+            refs.extend(digest(row) for row in settlements)
+        rows.append(GoalResult(goal_id=goal.goal_id, status="PASS" if ok else "FAIL", evidence_refs=tuple(refs)))
+
     return tuple(rows)
 
 
 def evaluate_task_compliance(initial, final, task: TaskSpec):
     """Report unrequested settlements as a compliance result, not goal progress."""
     task = _validate_run_states(initial, final, task)
-    allowed_lines = {row.line_id for row in task.remedy_goals}
+    allowed_lines = set(delegated_line_ids(task))
     unexpected = [row for key, row in final.settlements.items()
                   if key not in initial.settlements and row.line_id not in allowed_lines]
     return (GoalResult(goal_id="unrequested_settlements", status="FAIL" if unexpected else "PASS",

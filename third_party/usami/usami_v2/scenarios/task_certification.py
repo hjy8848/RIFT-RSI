@@ -18,9 +18,10 @@ from usami_v2.contracts import Sealed, aware
 from usami_v2.commerce import adapter
 from usami_v2.commerce.external import apply_event, reference_event
 from usami_v2.commerce.models import (
-    Consent, Delegation, ExternalEvent, Operation, PREPARATIONS, World, unit_credit,
+    BUSINESS_ACTIONS, Consent, Delegation, ExternalEvent, Operation, PREPARATIONS, World, case_id,
+    unit_credit,
 )
-from .tasks import RemedyGoal, TaskSpec, check_task_scope, evaluate_state_goals
+from .tasks import RemedyGoal, TaskSpec, check_task_scope, delegated_line_ids, evaluate_state_goals
 
 
 class ReviewPlan(Sealed):
@@ -128,7 +129,7 @@ class ProofStep(Sealed):
 
 class PlanCandidate(Sealed):
     goal_id: str
-    remedy: Literal["refund", "exchange", "reship"]
+    remedy: Literal["refund", "exchange", "reship", "cancel"]
     target_sku_id: Optional[str] = None
     warehouse_id: Optional[str] = None
 
@@ -175,7 +176,7 @@ def _bind_scenario(world: World, task: TaskSpec, scenario: CustomerScenario):
     scenario = scenario.checked()
     if scenario.customer_id != task.customer_id:
         raise ValueError("CustomerScenario identity differs from task")
-    goal_lines = {row.line_id for row in task.remedy_goals}
+    goal_lines = set(delegated_line_ids(task))
     if not goal_lines.issubset(set(scenario.delegated_line_ids)):
         raise ValueError("CustomerScenario does not delegate every requested remedy line")
     if any(row.line_id not in goal_lines for row in scenario.reviews):
@@ -187,41 +188,85 @@ def _bind_scenario(world: World, task: TaskSpec, scenario: CustomerScenario):
     return task, scenario
 
 
-def _base_candidate_options(world: World, goal: RemedyGoal, scenario: CustomerScenario, blockers):
-    """Phase 1 candidate grammar: the atomic delivered-items refund only."""
-    line = world.lines[goal.line_id]
-    original = world.skus[line.sku_id]
+def _free_goal_units(world, line):
     occupied = {unit for row in world.settlements.values() if row.line_id == line.id
                 for unit in row.unit_indices}
     occupied.update(unit for row in world.cases.values()
                     if row.line_id == line.id and row.status not in ("cancelled", "resolved")
                     for unit in row.unit_indices)
-    available = tuple(unit for unit in range(line.quantity) if unit not in occupied)
+    return tuple(unit for unit in range(line.quantity) if unit not in occupied)
+
+
+def _base_candidate_options(world: World, goal: RemedyGoal, scenario: CustomerScenario, blockers):
+    """Candidate grammar over the public atomic business tools.
+
+    A candidate only names the remedy (and, for an exchange, a compatible
+    target SKU). Stock, price difference, delivery time and every business
+    rule are decided by the Engine/Reference when the witness executes it.
+    """
+    line = world.lines[goal.line_id]
+    original = world.skus[line.sku_id]
+    available = _free_goal_units(world, line)
     if len(available) < goal.quantity:
         return ()
     credit = unit_credit(line, available[:goal.quantity])
+    limit = world.merchants[world.orders[line.order_id].merchant_id].refund_approval_limit_cents
+    if goal.target_stage == "delivered":
+        blockers.append("delivery_confirmation_event_not_registered_in_commerce_v1")
+        return ()
+
+    def satisfies(sku):
+        return all(sku.attributes.get(row.name) == row.value for row in goal.required_attributes)
+
     options = []
     for remedy in goal.allowed_remedies:
         if remedy not in scenario.accepted_remedies:
             continue
-        if remedy != "refund":
-            blockers.append("replacement_path_not_migrated_in_phase_1")
-            continue
-        if goal.required_attributes or goal.latest_arrival is not None:
-            continue
-        if goal.target_stage == "delivered":
-            blockers.append("delivery_confirmation_event_not_registered_in_commerce_v1")
-            continue
-        if original.return_required:
-            blockers.append("physical_return_path_not_migrated_in_phase_1")
-            continue
-        if goal.quantity > line.quantity:
-            continue
-        if credit > world.merchants[world.orders[line.order_id].merchant_id].refund_approval_limit_cents:
-            blockers.append("refund_exceeds_approval_limit_without_review_path_in_phase_1")
-            continue
-        options.append(PlanCandidate(goal_id=goal.goal_id, remedy=remedy))
+        if remedy == "refund":
+            if goal.required_attributes or goal.latest_arrival is not None:
+                continue
+            if credit > limit:
+                blockers.append("refund_exceeds_approval_limit_without_review_path_in_phase_1")
+                continue
+            if original.return_required and scenario.return_received_after_days is None:
+                # Receipt is an external fact; without a frozen receipt event
+                # the bounded proof cannot show the refund is reachable.
+                blockers.append("return_receipt_event_not_configured")
+                continue
+            options.append(PlanCandidate(goal_id=goal.goal_id, remedy="refund"))
+        elif remedy == "reship":
+            if satisfies(original):
+                options.append(PlanCandidate(goal_id=goal.goal_id, remedy="reship", target_sku_id=original.id))
+        else:
+            for sku_id in sorted(world.skus):
+                sku = world.skus[sku_id]
+                if (sku_id != original.id and sku.merchant_id == original.merchant_id
+                        and sku.product_family == original.product_family and satisfies(sku)):
+                    options.append(PlanCandidate(goal_id=goal.goal_id, remedy="exchange", target_sku_id=sku_id))
     return tuple(options)
+
+
+def return_receipt_event(world: World, task: TaskSpec, scenario: CustomerScenario, goal: RemedyGoal):
+    """The frozen carrier-receipt event for a physical-return refund goal, if configured.
+
+    Its target is the return the atomic request creates for the goal's first
+    free units, so it fires only after that exact return is accepted.
+    """
+    line = world.lines[goal.line_id]
+    if (not world.skus[line.sku_id].return_required or "refund" not in goal.allowed_remedies
+            or scenario.return_received_after_days is None):
+        return None
+    units = _free_goal_units(world, line)[:goal.quantity]
+    return ExternalEvent(
+        id="return-receipt-" + digest([task.record_hash, scenario.record_hash, goal.goal_id])[:20],
+        kind="return_received", target_id=case_id(line.id, units),
+        at=world.clock + timedelta(days=scenario.return_received_after_days))
+
+
+def return_receipt_events(world: World, task: TaskSpec, scenario: CustomerScenario):
+    """Events the runtime must schedule so the certified return path stays reachable."""
+    events = (return_receipt_event(world, task, scenario, goal) for goal in task.remedy_goals)
+    return tuple(event for event in events if event is not None)
 
 def _step(kind, before, after, **evidence):
     return ProofStep(kind=kind, before_state_hash=before.state_hash,
@@ -229,7 +274,7 @@ def _step(kind, before, after, **evidence):
 
 
 def _customer_delegation(world, task, scenario):
-    if not task.remedy_goals:
+    if not delegated_line_ids(task):
         return world, None
     before = world
     new = world.clone()
@@ -315,14 +360,14 @@ def _apply_event(world, event):
 def _run_candidate(world, task, scenario, candidates, attempt_id, max_steps):
     state = world.clone()
     steps = []
-    if not task.remedy_goals:
+    if not task.remedy_goals and not task.cancellation_goals:
         return ProofAttempt(candidate_hash=digest([row.model_dump(mode="json") for row in candidates]),
                             candidates=candidates, status="REJECTED",
                             reason="no_business_state_goal_for_reference_search", steps=())
     state, delegation_step = _customer_delegation(state, task, scenario)
     if delegation_step:
         steps.append(delegation_step)
-    goals = {row.goal_id: row for row in task.remedy_goals}
+    goals = {row.goal_id: row for row in task.remedy_goals + task.cancellation_goals}
     attempts_step_no = 0
 
     def act(name, resource, params):
@@ -335,41 +380,73 @@ def _run_candidate(world, task, scenario, candidates, attempt_id, max_steps):
         steps.append(step)
         return error, ((step.evidence.get("result") if step is not None else None) or {})
 
-    for candidate in candidates:
+    def receive_return(goal):
+        nonlocal state
+        event = return_receipt_event(world, task, scenario, goal)
+        state, event_steps = _apply_event(state, event)
+        steps.extend(event_steps)
+
+    def witness(candidate):
+        """Drive one goal through public tools only; return a rejection reason or None."""
         goal = goals[candidate.goal_id]
-        if candidate.remedy != "refund":
-            reason = "replacement_path_not_migrated_in_phase_1"
-            break
         # The witness must find its tool arguments in the actual public results,
         # exactly like a Service would. The hidden goal only selects which public
-        # order line the witness is about; it is never passed as a query or a
-        # refund argument.
+        # order/line the witness is about; it is never passed as a tool argument.
         error, orders_result = act("list_customer_orders", next(iter(state.merchants)), {})
         if error:
-            reason = error
-            break
+            return error
         orders = (orders_result.get("data") or {}).get("orders") or ()
-        target_order_id = world.lines[goal.line_id].order_id
+        target_order_id = goal.order_id if candidate.remedy == "cancel" else world.lines[goal.line_id].order_id
         order = next((row for row in orders if row.get("id") == target_order_id), None)
         if order is None:
-            reason = "certified_target_order_not_publicly_visible"
-            break
+            return "certified_target_order_not_publicly_visible"
+        if candidate.remedy == "cancel":
+            error, _ = act("cancel_order", order["id"], {})
+            return error
         error, details_result = act("get_order_details", order["id"], {})
         if error:
-            reason = error
-            break
+            return error
         public_lines = (details_result.get("data") or {}).get("lines") or ()
         public_line = next((row for row in public_lines if row.get("id") == goal.line_id), None)
         if public_line is None:
-            reason = "certified_target_line_not_publicly_visible"
-            break
-        # Phase 1: the single atomic refund validates delivery, window, quantity,
-        # duplicate refunds, approval limit and payment method inside the Engine,
-        # and the Reference recomputes the same state transition independently.
-        error, _ = act("return_delivered_order_items", public_line["id"],
-                       {"quantity": goal.quantity, "payment_method": "original"})
+            return "certified_target_line_not_publicly_visible"
+        line_id, quantity = public_line["id"], goal.quantity
+        if candidate.remedy == "refund":
+            if world.skus[world.lines[goal.line_id].sku_id].return_required:
+                # Accepted -> received (frozen external event) -> refunded.
+                error, _ = act("request_item_return", line_id, {"quantity": quantity})
+                if error:
+                    return error
+                receive_return(goal)
+            error, _ = act("return_delivered_order_items", line_id,
+                           {"quantity": quantity, "payment_method": "original"})
+            return error
+        if candidate.remedy == "reship":
+            error, result = act("reship_order_items", line_id, {"quantity": quantity})
+        else:
+            error, options_result = act("list_exchange_options", line_id, {})
+            if error:
+                return error
+            options = (options_result.get("data") or {}).get("options") or ()
+            option = next((row for row in options if row.get("sku_id") == candidate.target_sku_id), None)
+            if option is None:
+                return "certified_exchange_target_not_publicly_listed"
+            error, result = act("exchange_delivered_order_items", line_id,
+                                {"quantity": quantity, "target_sku_id": option["sku_id"]})
         if error:
-            reason = error
+            return error
+        data = result.get("data") or {}
+        # The Customer agrees in dialogue only to terms inside its private limits.
+        if data.get("extra_charge_cents", 0) > scenario.maximum_extra_charge_cents:
+            return "customer_extra_charge_limit"
+        if (scenario.latest_arrival is not None and data.get("promised_arrival")
+                and datetime.fromisoformat(data["promised_arrival"]) > scenario.latest_arrival):
+            return "customer_delivery_deadline"
+        return None
+
+    for candidate in candidates:
+        reason = witness(candidate)
+        if reason:
             break
     else:
         score = evaluate_state_goals(world, state, task)
@@ -397,7 +474,7 @@ def certify_task(world: World, task: TaskSpec, customer_scenario: CustomerScenar
     blockers = []
     if task.information_goals:
         blockers.append("communication_objectives_require_natural_runtime_p4")
-    if not task.remedy_goals:
+    if not task.remedy_goals and not task.cancellation_goals:
         return TaskCertification(
             status="UNKNOWN", world_hash=world.state_hash, task_hash=task.record_hash,
             customer_scenario_hash=customer_scenario.record_hash, proof_budget=budget,
@@ -408,6 +485,9 @@ def certify_task(world: World, task: TaskSpec, customer_scenario: CustomerScenar
     option_sets = []
     for goal in task.remedy_goals:
         option_sets.append(_base_candidate_options(world, goal, customer_scenario, blockers))
+    for goal in task.cancellation_goals:
+        # Cancellation has one public path; the Engine decides whether it is allowed.
+        option_sets.append((PlanCandidate(goal_id=goal.goal_id, remedy="cancel"),))
     if any(not rows for rows in option_sets):
         # The enumerator's candidate grammar is complete for the registered no-return,
         # settled/committed task subset. Explicit unsupported features remain UNKNOWN.
@@ -475,11 +555,19 @@ def _witness_cost(attempts) -> Dict[str, int]:
         return {}
     steps = witnesses[0].steps
     operations = [row for row in steps if row.kind == "operation"]
-    refunds = sum(1 for row in operations
-                  if row.evidence.get("request", {}).get("operation", {}).get("name")
-                  == "return_delivered_order_items")
+    # Every business action needs one confirmation exchange first. A refund for
+    # goods already accepted for return and received was confirmed with the
+    # return request, so it costs no second confirmation.
+    actions, returned_lines = 0, set()
+    for row in operations:
+        operation = row.evidence.get("request", {}).get("operation", {})
+        name, line = operation.get("name"), operation.get("resource_id")
+        if name == "request_item_return":
+            returned_lines.add(line)
+        if name in BUSINESS_ACTIONS and not (name == "return_delivered_order_items" and line in returned_lines):
+            actions += 1
     consents = sum(1 for row in steps if row.kind == "customer_consent")
-    confirmations = refunds + consents + 1
+    confirmations = actions + consents + 1
     return {"tool_calls": len(operations),
             "service_decisions": len(operations) + confirmations,
             "customer_turns": confirmations,

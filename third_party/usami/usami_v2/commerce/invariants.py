@@ -47,6 +47,11 @@ def invariants(world):
         order, sku = world.orders.get(line.order_id), world.skus.get(line.sku_id)
         if not order or not sku or sku.merchant_id != order.merchant_id:
             bad("LINE_SCOPE_INVALID", line.id)
+        if line.reserved_inventory_id is not None:
+            # Only an unshipped order still holds reserved stock for its line.
+            reserved = world.inventory.get(line.reserved_inventory_id)
+            if not reserved or reserved.sku_id != line.sku_id or not order or order.fulfillment_status != "unshipped":
+                bad("LINE_RESERVATION_INVALID", line.id)
     for evidence in world.evidence.values():
         line = world.lines.get(evidence.line_id)
         order = world.orders.get(line.order_id) if line else None
@@ -104,9 +109,11 @@ def invariants(world):
             bad("QUOTE_TERMS_HASH_INVALID", quote.id)
         if quote.refund_cents and quote.extra_charge_cents:
             bad("QUOTE_CONTRADICTORY_CASHFLOW", quote.id)
-        if quote.remedy == "refund" and any((quote.target_sku_id, quote.inventory_id, quote.route_id, quote.promised_arrival)):
+        if quote.remedy in ("refund", "cancel") and any((quote.target_sku_id, quote.inventory_id, quote.route_id, quote.promised_arrival)):
             bad("REFUND_HAS_REPLACEMENT_TERMS", quote.id)
-        if quote.remedy != "refund":
+        if quote.remedy == "cancel" and (quote.extra_charge_cents or quote.return_required):
+            bad("CANCELLATION_TERMS_INVALID", quote.id)
+        if quote.remedy in ("exchange", "reship"):
             inv = world.inventory.get(quote.inventory_id)
             route = world.routes.get(quote.route_id)
             if (not inv or not route or inv.sku_id != quote.target_sku_id
@@ -185,6 +192,11 @@ def invariants(world):
             expected_shipped[quote.inventory_id] += quote.quantity
         else:
             expected_reserved[quote.inventory_id] += quote.quantity
+    cancelled_lines = {row.line_id for row in world.settlements.values() if row.remedy == "cancel"}
+    for line in world.lines.values():
+        # A cancellation releases the unshipped line's reservation back to stock.
+        if line.reserved_inventory_id is not None and line.id not in cancelled_lines:
+            expected_reserved[line.reserved_inventory_id] += line.quantity
     for inv in world.inventory.values():
         if (inv.reserved, inv.shipped) != (expected_reserved[inv.id], expected_shipped[inv.id]):
             bad("INVENTORY_COMMITMENT_MISMATCH", inv.id)
@@ -198,9 +210,24 @@ def invariants(world):
         bad("DUPLICATE_FULFILLMENT", "fulfillments")
     for settlement in world.settlements.values():
         quote = world.quotes.get(settlement.quote_id)
-        if quote and (quote.remedy != "refund") != any(
+        if quote and (quote.remedy in ("exchange", "reship")) != any(
                 row.quote_id == quote.id for row in world.fulfillments.values()):
             bad("SETTLEMENT_FULFILLMENT_MISSING", settlement.id)
+    for order in world.orders.values():
+        order_lines = [row for row in world.lines.values() if row.order_id == order.id]
+        cancelled = [row for row in order_lines if row.id in cancelled_lines]
+        if not cancelled:
+            continue
+        # Cancellation is one order-level fact: every line, every unit, unshipped only.
+        if order.fulfillment_status != "unshipped":
+            bad("CANCELLED_ORDER_NOT_CANCELLABLE", order.id)
+        if len(cancelled) != len(order_lines):
+            bad("ORDER_CANCELLATION_PARTIAL", order.id)
+        for line in cancelled:
+            units = {i for row in world.settlements.values()
+                     if row.line_id == line.id and row.remedy == "cancel" for i in row.unit_indices}
+            if units != set(range(line.quantity)):
+                bad("ORDER_CANCELLATION_PARTIAL", line.id)
     for ret in world.returns.values():
         case = world.cases.get(ret.case_id)
         if not case or not case.committed_quote_id:

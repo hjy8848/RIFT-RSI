@@ -7,7 +7,7 @@ The legacy benchmark Grounder remains the implementation for legacy Worlds.
 from itertools import product
 from typing import Literal, Optional, Tuple
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from usami_harness.models import Model, digest
 from usami_v2.contracts import Sealed
@@ -39,6 +39,14 @@ class LineSelector(Sealed):
     minimum_age_days: int = Field(default=0, ge=0, strict=True)
     maximum_age_days: Optional[int] = Field(default=None, ge=0, strict=True)
     return_required: Optional[bool] = None
+    fulfillment_status: Optional[Literal["unshipped", "shipped", "delivered"]] = None
+
+    @model_serializer(mode="wrap")
+    def _compatible_dump(self, handler):
+        data = handler(self)
+        if self.fulfillment_status is None:
+            data.pop("fulfillment_status", None)
+        return data
 
     @model_validator(mode="after")
     def ordered(self):
@@ -73,6 +81,7 @@ class AbstractChallenge(TaskDraft):
             raise ValueError("challenge repeats a line variable")
         targets = {row.line_alias for row in self.remedy_goals}
         targets.update(row.subject_alias for row in self.information_goals)
+        targets.update(row.line_alias for row in self.cancellation_goals)
         if targets != names:
             raise ValueError("every goal must target a declared selector and every selector needs a goal")
         if any(row.left not in names or row.right not in names or row.left == row.right
@@ -104,6 +113,8 @@ def _matches(selector, spec, build, order, line):
     ids = dict(build.private_aliases)
     native_line = build.world.lines[ids[line.alias]]
     age = (build.world.clock - build.world.orders[ids[order.alias]].delivered_at).days
+    if order.fulfillment_status != "delivered":
+        age = 0  # not delivered yet: age bounds describe delivered goods only
     return ((selector.family is None or sku.family == selector.family)
             and (selector.issue is None or line.issue == selector.issue)
             and all({r.name: r.value for r in sku.attributes}.get(r.name) == r.value for r in selector.attributes)
@@ -111,7 +122,8 @@ def _matches(selector, spec, build, order, line):
             and (selector.maximum_quantity is None or native_line.quantity <= selector.maximum_quantity)
             and age >= selector.minimum_age_days
             and (selector.maximum_age_days is None or age <= selector.maximum_age_days)
-            and (selector.return_required is None or sku.return_required == selector.return_required))
+            and (selector.return_required is None or sku.return_required == selector.return_required)
+            and (selector.fulfillment_status is None or order.fulfillment_status == selector.fulfillment_status))
 
 
 def ground_challenge(challenge, worlds, budget=None):
@@ -154,6 +166,9 @@ def ground_challenge(challenge, worlds, budget=None):
                 for goal in data["information_goals"]:
                     goal.pop("record_hash", None)
                     goal["subject_alias"] = binding[goal["subject_alias"]]
+                for goal in data.get("cancellation_goals", ()):
+                    goal.pop("record_hash", None)
+                    goal["line_alias"] = binding[goal["line_alias"]]
                 draft = TaskDraft.model_validate(data)
                 candidates.append(GroundedCandidate(world_ref=world_ref, world_hash=build.world_hash,
                     customer_alias=customer, line_binding=tuple(sorted(binding.items())), draft=draft))

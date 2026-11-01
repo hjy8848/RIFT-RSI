@@ -17,7 +17,7 @@ from usami_harness.models import Request, digest
 from usami_harness.oracle import evaluate
 from usami_v2.commerce import adapter
 from usami_v2.commerce.external import apply_event, reference_event
-from usami_v2.commerce.models import ExternalEvent, Operation, World
+from usami_v2.commerce.models import RETURN_LABEL_SLOT, ExternalEvent, Operation, World
 from usami_v2.contracts import FactEvidence, Sealed, ServiceMessage, SourceRef
 from usami_v2.evaluation.outcomes import (
     Outcome, OutcomeV2, evaluate_execution_compliance, evaluate_outcome, evaluate_outcome_v2,
@@ -31,8 +31,8 @@ from usami_v2.runtime.customer import (
     CustomerRuntime, OfferPresentation, render_offer,
 )
 from usami_v2.scenarios.tasks import (
-    TaskSpec, TaskSpecV2, TaskSpecV3, check_task_scope, evaluate_state_goals, evaluate_task_compliance,
-    evaluate_task_communication,
+    TaskSpec, TaskSpecV2, TaskSpecV3, check_task_scope, delegated_line_ids, evaluate_state_goals,
+    evaluate_task_compliance, evaluate_task_communication,
 )
 
 
@@ -458,7 +458,7 @@ def run_episode(initial_world: World, task: Union[TaskSpecV3, TaskSpecV2, TaskSp
     elif task.protocol == "commerce-task-v3":
         if profile.protocol != "commerce-customer-profile-v3":
             raise ValueError("TaskSpecV3 requires a structured CustomerProfileV3 binding")
-        expected_delegations = tuple(goal.line_id for goal in task.remedy_goals)
+        expected_delegations = delegated_line_ids(task)
         if profile.delegated_line_ids != expected_delegations:
             raise ValueError("CustomerProfileV3 scope differs from structured remedy goals")
         if profile.intent_bundle_hash != task.request_bundle.record_hash:
@@ -631,17 +631,25 @@ def run_episode(initial_world: World, task: Union[TaskSpecV3, TaskSpecV2, TaskSp
                     world = applied
                     events = _append(events, "external_event", {"event_id": ext.id,
                                         "reference_state_hash": expected.state_hash}, event_before, world)
+                    label_return = False
                     if ext.kind == "return_received":
                         returned_case = world.cases[ext.target_id]
                         returned_quote = world.quotes[returned_case.committed_quote_id]
-                        if returned_quote.remedy == "refund":
+                        # An atomic return was already agreed in dialogue; it never
+                        # reopens the legacy structured refund-release consent.
+                        label_return = returned_quote.pickup_slot == RETURN_LABEL_SLOT
+                        if returned_quote.remedy == "refund" and not label_return:
                             pending_customer_offers.append((returned_quote.id, "release_accepted_refund"))
                 except Exception as exc:
                     status, terminal_reason = "runner_error", type(exc).__name__ + ": " + str(exc)
                     break
+                notice = {"external_event": ext.kind, "status": "applied", "target_id": ext.target_id}
+                if label_return:
+                    # Internal case IDs stay hidden; the Service knows the public line.
+                    notice = {"external_event": ext.kind, "status": "applied",
+                              "line_id": returned_case.line_id, "quantity": returned_quote.quantity}
                 conversation.append(AgentMessage(role="tool", tool_call_id="external-" + ext.id,
-                    content=json.dumps({"external_event": ext.kind, "status": "applied",
-                                        "target_id": ext.target_id}, ensure_ascii=False)))
+                    content=json.dumps(notice, ensure_ascii=False)))
             if status == "runner_error":
                 break
             continue

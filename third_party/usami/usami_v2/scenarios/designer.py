@@ -2,10 +2,10 @@
 from datetime import timedelta
 from typing import Literal, Optional, Tuple
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from usami_harness.models import digest
-from usami_v2.commerce.models import unit_credit
+from usami_v2.commerce.models import omit_default_fields, unit_credit
 from usami_v2.contracts import Sealed
 from usami_v2.scenarios.builder import BuildResult
 from usami_v2.scenarios.distribution import DistributionSpec
@@ -15,7 +15,7 @@ from usami_v2.scenarios.schema import (
 )
 from usami_v2.scenarios.task_certification import CustomerTaskScope, TaskDesignCapabilities
 from usami_v2.scenarios.tasks import (
-    CustomerRequestBundle, RemedyGoal, StructuredInformationObjective, TaskSpecV3,
+    CustomerRequestBundle, OrderCancellationGoal, RemedyGoal, StructuredInformationObjective, TaskSpecV3,
     check_task_scope, render_customer_request, request_intent_hash,
 )
 class ScenarioDraft(Sealed):
@@ -66,6 +66,14 @@ class RemedyDraft(Sealed):
 
 
 
+class CancellationDraft(Sealed):
+    goal_id: str
+    line_alias: str = Field(
+        description=("Alias of any line of the order to cancel. The whole order is cancelled; it must still be "
+                     "unshipped for the task to be certifiable."),
+    )
+
+
 class InformationDraft(Sealed):
     goal_id: str
     subject_alias: str = Field(
@@ -89,10 +97,16 @@ class TaskDraft(Sealed):
                      "the bounded native Reference proof certifies remedy goals, not communication goals."),
     )
     parent_training_evidence_hashes: Tuple[str, ...] = ()
+    cancellation_goals: Tuple[CancellationDraft, ...] = Field(
+        default=(), description="Whole-order cancellations of unshipped orders, one goal per order.")
+
+    @model_serializer(mode="wrap")
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ("cancellation_goals",))
 
     @model_validator(mode="after")
     def unique_goal_ids(self):
-        rows = self.remedy_goals + self.information_goals
+        rows = self.remedy_goals + self.information_goals + self.cancellation_goals
         if not rows or len({row.goal_id for row in rows}) != len(rows):
             raise ValueError("TaskDraft needs unique business or information goals")
         if any(len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value)
@@ -242,17 +256,26 @@ def compile_task(draft: TaskDraft, spec: ScenarioSpec, build: BuildResult,
     if any(len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value)
            for value in draft.parent_training_evidence_hashes):
         raise ValueError("invalid training evidence hash")
+    cancellations = []
+    for row in draft.cancellation_goals:
+        if row.line_alias not in customer_scope.line_aliases:
+            raise ValueError("cancellation goal references an unknown order-line alias")
+        order_id = build.world.lines[aliases[row.line_alias]].order_id
+        cancellations.append(OrderCancellationGoal(
+            goal_id=row.goal_id, order_id=order_id,
+            line_ids=tuple(sorted(line.id for line in build.world.lines.values() if line.order_id == order_id))))
     customer_id = aliases[draft.customer_alias]
-    customer_request = render_customer_request(build.world, customer_id, tuple(remedies), tuple(information))
+    remedies, information, cancellations = tuple(remedies), tuple(information), tuple(cancellations)
+    customer_request = render_customer_request(build.world, customer_id, remedies, information, cancellations)
     request_bundle = CustomerRequestBundle(
         customer_id=customer_id,
-        goal_ids=tuple(row.goal_id for row in tuple(remedies) + tuple(information)),
-        intent_hash=request_intent_hash(customer_id, tuple(remedies), tuple(information)),
+        goal_ids=tuple(row.goal_id for row in remedies + cancellations + information),
+        intent_hash=request_intent_hash(customer_id, remedies, information, cancellations),
         request_hash=digest(customer_request))
     task = TaskSpecV3(
         task_id=draft.task_id, world_hash=build.world_hash, customer_id=aliases[draft.customer_alias],
-        customer_request=customer_request, remedy_goals=tuple(remedies),
-        information_goals=tuple(information), partition=distribution.split,
+        customer_request=customer_request, remedy_goals=remedies,
+        information_goals=information, cancellation_goals=cancellations, partition=distribution.split,
         source_distribution_hash=distribution.record_hash,
         parent_training_evidence_hashes=draft.parent_training_evidence_hashes,
         request_bundle=request_bundle)

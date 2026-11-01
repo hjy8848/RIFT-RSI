@@ -483,7 +483,9 @@ def test_multigoal_certification_fails_when_one_goal_is_unreachable():
 
     assert certificate.status == "UNKNOWN"
     assert not certificate.full_task_reachability_certified
-    assert "physical_return_path_not_migrated_in_phase_1" in certificate.blockers
+    # Phase 3 implements the physical return path; without a frozen receipt
+    # event the refund is still not provable, so the task stays UNKNOWN.
+    assert "return_receipt_event_not_configured" in certificate.blockers
 
 
 def test_exhausted_proof_budget_is_unknown_not_unsat():

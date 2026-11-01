@@ -80,18 +80,25 @@ class ServiceAction(Sealed):
         scope = _single_merchant_scope(merchant_scope_ids)
         if name == "list_customer_orders":
             resource, params = scope, {}
-        elif name == "get_order_details":
+        elif name in ("get_order_details", "cancel_order"):
             order_id = args.get("order_id")
             if not isinstance(order_id, str) or not order_id:
-                raise ServiceError("MODEL_OUTPUT_INVALID", "get_order_details requires an order_id")
+                raise ServiceError("MODEL_OUTPUT_INVALID", name + " requires an order_id")
             resource, params = order_id, {}
         else:
             line_id = args.get("line_id")
             if not isinstance(line_id, str) or not line_id:
-                raise ServiceError("MODEL_OUTPUT_INVALID", "return_delivered_order_items requires a line_id")
+                raise ServiceError("MODEL_OUTPUT_INVALID", name + " requires a line_id")
             resource = line_id
-            params = {"quantity": args.get("quantity"),
-                      "payment_method": args.get("payment_method") or "original"}
+            if name == "return_delivered_order_items":
+                params = {"quantity": args.get("quantity"),
+                          "payment_method": args.get("payment_method") or "original"}
+            elif name == "exchange_delivered_order_items":
+                params = {"quantity": args.get("quantity"), "target_sku_id": args.get("target_sku_id")}
+            elif name == "list_exchange_options":
+                params = {}
+            else:
+                params = {"quantity": args.get("quantity")}
         try:
             operation = Operation(name=name, scope_id=scope, resource_id=resource, params=params)
         except (KeyError, TypeError, ValueError):
@@ -164,7 +171,9 @@ def _schema_with_defs(model):
     return schema, definitions
 
 
-PUBLIC_TOOLS = ("list_customer_orders", "get_order_details", "return_delivered_order_items")
+PUBLIC_TOOLS = ("list_customer_orders", "get_order_details", "return_delivered_order_items",
+                "cancel_order", "list_exchange_options", "exchange_delivered_order_items",
+                "reship_order_items", "request_item_return")
 PUBLIC_PARAMETERS = frozenset(PUBLIC_TOOLS)
 
 
@@ -177,9 +186,13 @@ def _public_tool(name, description, properties, required):
 
 def service_tools():
     """The small Agent-facing surface; internal case/quote/consent steps stay hidden."""
+    line = {"type": "string", "description": "Order line ID from get_order_details."}
+    quantity = {"type": "integer", "minimum": 1, "description": "Number of purchased units."}
     return [
         _public_tool("list_customer_orders",
-                     "List the orders belonging to the authenticated customer.", {}, []),
+                     "List the orders belonging to the authenticated customer. An order that has not been "
+                     "delivered shows fulfillment_status 'unshipped' or 'shipped'; an order without that "
+                     "field was delivered.", {}, []),
         _public_tool("get_order_details",
                      "Read one order and its purchased line items.",
                      {"order_id": {"type": "string",
@@ -196,6 +209,32 @@ def service_tools():
                       "payment_method": {"type": "string", "enum": ["original"],
                                          "description": "Refund target; Phase 1 supports only 'original'."}},
                      ["line_id", "quantity"]),
+        _public_tool("cancel_order",
+                     "Cancel a whole order that has not shipped yet and refund it to the original payment "
+                     "channel. Shipped or delivered orders cannot be cancelled.",
+                     {"order_id": {"type": "string",
+                                   "description": "Order ID returned by list_customer_orders."}},
+                     ["order_id"]),
+        _public_tool("list_exchange_options",
+                     "List the variants a delivered order line can be exchanged for, with price and stock.",
+                     {"line_id": line}, ["line_id"]),
+        _public_tool("exchange_delivered_order_items",
+                     "Exchange delivered units of one line for a different variant in a single step. Ships "
+                     "the variant from stock and charges or refunds any price difference on the original "
+                     "payment channel.",
+                     {"line_id": line, "quantity": quantity,
+                      "target_sku_id": {"type": "string",
+                                        "description": "sku_id returned by list_exchange_options."}},
+                     ["line_id", "quantity", "target_sku_id"]),
+        _public_tool("reship_order_items",
+                     "Send a free replacement of the same item for delivered units with a verified "
+                     "delivery problem.",
+                     {"line_id": line, "quantity": quantity}, ["line_id", "quantity"]),
+        _public_tool("request_item_return",
+                     "Accept a physical return for items that must be sent back before a refund. The refund "
+                     "is issued with return_delivered_order_items only after the environment reports that "
+                     "the goods were received.",
+                     {"line_id": line, "quantity": quantity}, ["line_id", "quantity"]),
         _public_tool("respond_to_customer",
                      "Send the next customer-facing message.",
                      {"message": {"type": "string"}}, ["message"]),
@@ -227,7 +266,9 @@ class OpenAICustomerAgent:
             "Simulate the authenticated customer in a support conversation. Write short, natural replies "
             "consistent with your private profile. Disclose only what the conversation actually requires, "
             "and never invent order, item or payment details. Never claim that an operation was already "
-            "completed. When the service asks you to confirm a refund, answer yes or no in your own words. Set finish=true when your request is settled or you no longer want to continue.\n"
+            "completed. When the service asks you to confirm a refund, cancellation, exchange, replacement or "
+            "return, answer yes or no in your own words. Set finish=true when your request is settled or you "
+            "no longer want to continue.\n"
             "PRIVATE CUSTOMER PROFILE: " + json.dumps(profile.model_dump(mode="json"), ensure_ascii=False)
         )
         messages = [{"role": "system", "content": system},
@@ -268,19 +309,21 @@ class OpenAIServiceAgent:
         "You only see the public customer request and public tool results; never assume hidden task goals, "
         "private customer preferences, proof witnesses or oracle decisions. \n"
         "Follow these steps in order. 1. List the customer's orders with list_customer_orders. "
-        "2. Read the relevant order details with get_order_details. "
-        "3. Explain the exact refund item, quantity and payment channel in a respond_to_customer message. "
-        "4. Ask the customer for confirmation and wait for their reply. "
-        "5. Only if the customer agrees, execute the refund with return_delivered_order_items; never "
-        "refund when the customer declines. 6. Report the actual result. That call records the returned "
-        "items and credits the original payment channel; physical return logistics happen outside this "
-        "dialogue. \n"
-        "The environment enforces ownership, delivery status, the return window, quantities, duplicate "
-        "refunds and the refund method, and answers with an explicit error_code when a request is invalid. "
-        "Do not ask the customer to upload evidence or to read internal case, quote, settlement or consent "
-        "identifiers; those objects are environment internals and are never shown to you. \n"
-        "Never claim that a refund or return happened without a successful tool result. Use "
-        "respond_to_customer for every customer-facing reply. Never make multiple function calls in one response."
+        "2. Read the relevant order details with get_order_details (and list_exchange_options before an "
+        "exchange). 3. Explain the exact action, item, quantity, any price difference and the payment "
+        "channel in a respond_to_customer message. 4. Ask the customer for confirmation and wait for their "
+        "reply. 5. Only if the customer agrees, perform that one business action: return_delivered_order_items "
+        "(refund), cancel_order (unshipped order), exchange_delivered_order_items (different variant), "
+        "reship_order_items (same item again) or request_item_return (items that must be sent back first); "
+        "never act when the customer declines. 6. Report the actual result. For items that must be returned, "
+        "only refund with return_delivered_order_items after the environment reports the goods were received. \n"
+        "The environment enforces ownership, fulfillment and delivery status, return windows, quantities, stock, "
+        "duplicate actions and the payment method, and answers with an explicit error_code when a request is "
+        "invalid. Do not ask the customer to upload evidence or to read internal case, quote, settlement or "
+        "consent identifiers; those objects are environment internals and are never shown to you. \n"
+        "Never claim that a refund, cancellation, shipment, receipt or return happened without a successful tool "
+        "result or environment report. Use respond_to_customer for every customer-facing reply. Never make "
+        "multiple function calls in one response."
     )
 
     def __init__(self, client: CompletionClient, *, skill_snapshot=None,

@@ -40,7 +40,14 @@ def project_events(record, replay_verified):
         elif event.kind == "external_event":
             ext = scheduled.get(p["event_id"])
             if ext is None: raise ValueError("external event absent from schedule")
-            result.append(PublicEvent("tool_result", _json({"external_event": ext.kind, "status": "applied", "target_id": ext.target_id})))
+            notice = {"external_event": ext.kind, "status": "applied", "target_id": ext.target_id}
+            case = record.final_world.cases.get(ext.target_id)
+            quote = record.final_world.quotes.get(case.committed_quote_id or "") if case else None
+            if ext.kind == "return_received" and quote is not None and quote.pickup_slot == "prepaid-return-label":
+                # Same notice the Service saw: the public line, never an internal case id.
+                notice = {"external_event": ext.kind, "status": "applied",
+                          "line_id": case.line_id, "quantity": quote.quantity}
+            result.append(PublicEvent("tool_result", _json(notice)))
         elif event.kind == "offer_presented":
             pending_terms = p["rendered_terms"]
         elif event.kind == "service_reply":

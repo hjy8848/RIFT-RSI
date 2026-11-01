@@ -181,7 +181,8 @@ class CertifiedTaskRegistry:
                 or cert.world_hash != world.state_hash or cert.status != 'CERTIFIED'
                 or not cert.full_task_reachability_certified): return False
         if task.protocol != 'commerce-task-v3' or profile.protocol != 'commerce-customer-profile-v3': return False
-        lines = tuple(goal.line_id for goal in task.remedy_goals)
+        from usami_v2.scenarios.tasks import delegated_line_ids
+        lines = delegated_line_ids(task)
         if (profile.delegated_line_ids != lines or scenario.delegated_line_ids != lines
                 or profile.intent_bundle_hash != task.request_bundle.record_hash
                 or set(profile.allowed_preparations) != set(scenario.allowed_preparations)

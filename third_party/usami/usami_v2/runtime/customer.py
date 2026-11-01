@@ -13,7 +13,7 @@ from usami_harness.models import digest
 from usami_v2.contracts import FactEvidence, FactKind, Scalar, Sealed, SourceRef
 from usami_v2.commerce.invariants import invariants
 from usami_v2.commerce.models import Consent, Delegation, PREPARATIONS, World
-from usami_v2.scenarios.tasks import TaskSpecV3
+from usami_v2.scenarios.tasks import TaskSpecV3, delegated_line_ids
 
 
 class CustomerProfile(Sealed):
@@ -85,7 +85,7 @@ def bind_customer_profile(profile: CustomerProfile, task: TaskSpecV3):
     profile, task = profile.checked(), task.checked()
     if profile.customer_id != task.customer_id:
         raise ValueError("Customer policy identity differs from structured task intent")
-    expected_lines = tuple(goal.line_id for goal in task.remedy_goals)
+    expected_lines = delegated_line_ids(task)
     if profile.delegated_line_ids and profile.delegated_line_ids != expected_lines:
         raise ValueError("Customer policy line scope differs from structured task intent")
     return CustomerProfileV3(
@@ -262,7 +262,7 @@ class CustomerRuntime:
                 raise ValueError("CustomerProfileV3 requires its structured TaskSpecV3")
             if self.profile.intent_bundle_hash != self.task.request_bundle.record_hash:
                 raise ValueError("Customer profile is not bound to this task's structured request bundle")
-            expected_lines = tuple(goal.line_id for goal in self.task.remedy_goals)
+            expected_lines = delegated_line_ids(self.task)
             if self.profile.customer_id != self.task.customer_id or self.profile.delegated_line_ids != expected_lines:
                 raise ValueError("Customer profile scope differs from structured task intent")
 

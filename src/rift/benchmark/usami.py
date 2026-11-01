@@ -46,9 +46,9 @@ def ground(proposal, worlds, budget=None):
         raise ValueError("proposal hypothesis differs from native challenge")
     return ground_challenge(challenge, worlds, budget)
 
-def compile_candidate(candidate, spec, build, distribution, allowed_training_hashes=()):
+def compile_candidate(candidate, spec, build, distribution, allowed_training_hashes=(), **options):
     from usami_v2.scenarios.grounding import compile_grounded
-    return compile_grounded(candidate, spec, build, distribution, allowed_training_hashes)
+    return compile_grounded(candidate, spec, build, distribution, allowed_training_hashes, **options)
 
 def _customer_limits(task, build):
     """Build Customer bounds from structured remedy goals, if any."""
@@ -69,29 +69,53 @@ def _customer_limits(task, build):
         raise ValueError('Customer arrival deadline has already passed')
     return tuple(sorted(allowed)), maximum, latest, days
 
-def default_customer_scenario(task, spec, build):
+def default_customer_scenario(task, spec, build, *, return_received_after_days=None):
     from usami_v2.scenarios.task_certification import CustomerScenario
+    from usami_v2.scenarios.tasks import delegated_line_ids
     allowed, maximum, latest, _ = _customer_limits(task, build)
+    returns = any(build.world.skus[build.world.lines[g.line_id].sku_id].return_required
+                  for g in task.remedy_goals)
     return CustomerScenario(customer_id=task.customer_id,
-        delegated_line_ids=tuple(g.line_id for g in task.remedy_goals),
-        accepted_remedies=allowed, maximum_extra_charge_cents=maximum, latest_arrival=latest)
+        delegated_line_ids=delegated_line_ids(task),
+        accepted_remedies=allowed, maximum_extra_charge_cents=maximum, latest_arrival=latest,
+        return_received_after_days=return_received_after_days if returns else None)
 
-def default_customer_profile(task, spec, build):
+def default_customer_profile(task, spec, build, *, delegation_lifetime_hours=24):
     from usami_v2.runtime.customer import CustomerProfile, bind_customer_profile
     allowed, maximum, _, days = _customer_limits(task, build)
     profile = CustomerProfile(customer_id=task.customer_id,
-        accepted_remedies=allowed, maximum_extra_charge_cents=maximum, latest_arrival_days=days)
+        accepted_remedies=allowed, maximum_extra_charge_cents=maximum, latest_arrival_days=days,
+        delegation_lifetime_hours=delegation_lifetime_hours)
     return bind_customer_profile(profile, task)
+
+def _receipt_events(world, task, scenario):
+    """Frozen receipt events the certified witness relied on; the rollout must schedule them."""
+    from usami_v2.scenarios.task_certification import return_receipt_events
+    return return_receipt_events(world, task, scenario)
 
 class CommerceHost:
     """Trusted native host with bounded grounding and certified task storage."""
-    def __init__(self, worlds, distribution, scenario_factory, profile_factory, customer_agent, *, registry, identity_factory, proof_budget, episode_budget, grounding_budget=None, task_registry=None):
+    def __init__(self, worlds, distribution, scenario_factory, profile_factory, customer_agent, *, registry, identity_factory, proof_budget, episode_budget, grounding_budget=None, task_registry=None, return_receipt_after_days=None):
         self.worlds = tuple(worlds)
         if distribution.split != "train" or any(spec.distribution_hash != distribution.record_hash for _, spec, _ in self.worlds):
             raise ValueError("Host requires a registered training distribution")
         self.distribution = distribution
-        self.scenario_factory = scenario_factory or default_customer_scenario
-        self.profile_factory = profile_factory or default_customer_profile
+        # Physical returns need a trusted receipt event. Only an explicitly
+        # configured delay enables them; otherwise such tasks stay UNKNOWN.
+        if return_receipt_after_days is not None and (type(return_receipt_after_days) is not int
+                                                      or not 0 <= return_receipt_after_days <= 28):
+            raise ValueError('return receipt delay must be between 0 and 28 days')
+        self.return_receipt_after_days = return_receipt_after_days
+        # The Customer's authority must still be valid when the receipt arrives.
+        lifetime = 24 * ((return_receipt_after_days or 0) + 1)
+        self.capability_options = ({'return_receipt_event_configured': True}
+                                   if return_receipt_after_days is not None else None)
+        self.scenario_factory = scenario_factory or (
+            lambda task, spec, build: default_customer_scenario(
+                task, spec, build, return_received_after_days=return_receipt_after_days))
+        self.profile_factory = profile_factory or (
+            lambda task, spec, build: default_customer_profile(
+                task, spec, build, delegation_lifetime_hours=lifetime))
         self.customer_agent = customer_agent
         self.registry = registry
         self.identity_factory = identity_factory
@@ -102,6 +126,13 @@ class CommerceHost:
         self.task_registry = task_registry or CertifiedTaskRegistry(registry)
         if self.task_registry.split_registry is not registry:
             raise ValueError('certified task registry must use the Host split registry')
+    def _compile(self, candidate, spec, build, allowed_training_hashes=None):
+        args = (candidate, spec, build, self.distribution)
+        if allowed_training_hashes is not None:
+            args += (allowed_training_hashes,)
+        if self.capability_options is None:
+            return compile_candidate(*args)
+        return compile_candidate(*args, capability_options=self.capability_options)
     def certify_proposal(self, proposal):
         from rift.tasks import Certification, CertificationStatus
         from usami_v2.scenarios.designer import TaskCapabilityUnsupported
@@ -118,7 +149,7 @@ class CommerceHost:
                 raise ValueError('grounded world binding is ambiguous')
             spec, build = matches[0]
             try:
-                task = compile_candidate(candidate, spec, build, self.distribution)
+                task = self._compile(candidate, spec, build)
             except TaskCapabilityUnsupported:
                 unresolved = Certification(proposal.proposal_id, CertificationStatus.UNKNOWN)
                 continue
@@ -146,7 +177,8 @@ class CommerceHost:
             profile = self.profile_factory(task, spec, build)
             from rift.verl.task_registry import CertifiedNativeTask
             self.task_registry.register(CertifiedNativeTask(
-                build.world, task, profile, scenario, native_certificate, identity))
+                build.world, task, profile, scenario, native_certificate, identity,
+                _receipt_events(build.world, task, scenario)))
             certification = public_certification(
                 proposal.proposal_id, native_certificate, verified=True)
             return certification, task
@@ -192,8 +224,7 @@ class CommerceHost:
             if grounding.candidates:
                 for index, candidate in enumerate(grounding.candidates):
                     try:
-                        task = compile_candidate(candidate, spec, build, self.distribution,
-                                                 allowed_training_hashes)
+                        task = self._compile(candidate, spec, build, allowed_training_hashes)
                     except TaskCapabilityUnsupported as exc:
                         attempts.append({'candidate_index':index, 'task_ref':None,
                             'status':'UNKNOWN', 'native_status':'UNSUPPORTED',
@@ -234,7 +265,8 @@ class CommerceHost:
                     profile = self.profile_factory(task, spec, build)
                     from rift.verl.task_registry import CertifiedNativeTask
                     self.task_registry.register(CertifiedNativeTask(
-                        build.world, task, profile, scenario, native_certificate, identity))
+                        build.world, task, profile, scenario, native_certificate, identity,
+                        _receipt_events(build.world, task, scenario)))
                     public_result = public_certification(
                         proposal.proposal_id, native_certificate, verified=True)
                     attempts.append({'candidate_index':index, 'task_ref':task.record_hash,

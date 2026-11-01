@@ -350,8 +350,15 @@ def test_payment_method_is_restricted_to_original_channel():
 
 def test_public_tool_surface_matches_engine_and_reference():
     tools = {row["function"]["name"]: row["function"] for row in service_tools()}
-    assert set(tools) == {"list_customer_orders", "get_order_details",
-                          "return_delivered_order_items", "respond_to_customer"}
+    # Phase 1 tools are unchanged; Phase 3 adds only flat single-call business tools.
+    assert {"list_customer_orders", "get_order_details", "return_delivered_order_items",
+            "respond_to_customer"} <= set(tools)
+    assert set(tools) == {"list_customer_orders", "get_order_details", "return_delivered_order_items",
+                          "respond_to_customer", "cancel_order", "list_exchange_options",
+                          "exchange_delivered_order_items", "reship_order_items", "request_item_return"}
+    for name, spec in tools.items():
+        assert "params" not in spec["parameters"]["properties"]
+        assert "scope_id" not in spec["parameters"]["properties"]
     refund = tools["return_delivered_order_items"]["parameters"]
     assert refund["required"] == ["line_id", "quantity"]
     assert set(refund["properties"]) == {"line_id", "quantity", "payment_method"}

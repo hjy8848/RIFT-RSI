@@ -64,4 +64,21 @@ def query_data(world, actor, op):
                            if row.case_id == key],
                 "returns": [row.model_dump(mode="json") for row in sorted(world.returns.values(), key=lambda x: x.id)
                             if row.case_id == key]}
+    if op.name == "list_exchange_options":
+        line = world.lines[key]
+        original = world.skus[line.sku_id]
+        options = []
+        for sku in sorted(world.skus.values(), key=lambda x: x.id):
+            if (sku.id == original.id or sku.merchant_id != original.merchant_id
+                    or sku.product_family != original.product_family):
+                continue
+            stocked = []
+            for inv in world.inventory.values():
+                route = next((r for r in world.routes.values() if r.warehouse_id == inv.warehouse_id), None)
+                if inv.sku_id == sku.id and inv.available > 0 and route is not None:
+                    stocked.append((inv.available, route.days))
+            options.append({"sku_id": sku.id, **public_sku(sku),
+                            "available_quantity": sum(row[0] for row in stocked),
+                            "fastest_delivery_days": min((row[1] for row in stocked), default=None)})
+        return {"line_id": key, "options": options}
     raise ValueError("unknown public query")

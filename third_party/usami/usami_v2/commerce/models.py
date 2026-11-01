@@ -2,11 +2,20 @@
 from datetime import datetime
 from typing import Dict, Literal, Optional, Tuple
 
-from pydantic import Field, StrictInt, model_validator
+from pydantic import Field, StrictInt, model_serializer, model_validator
 
 from usami_harness.models import Empty, Model, OperationBase, WorldBase, digest
 from usami_v2.contracts import aware
 from . import VERSION
+
+
+def omit_default_fields(data, model, names):
+    """Drop Phase 3 fields still at their default so historical hashes are unchanged."""
+    for name in names:
+        if name in data and getattr(model, name) == type(model).model_fields[name].get_default(
+                call_default_factory=True):
+            data.pop(name)
+    return data
 
 
 class Customer(Model):
@@ -61,12 +70,21 @@ class Order(Model):
     customer_id: str
     paid_cents: int = Field(ge=0, strict=True)
     payment_channel: str
+    # For a "delivered" order this is the actual delivery time (legacy meaning);
+    # for "unshipped"/"shipped" orders it is the expected delivery time.
     delivered_at: datetime
+    # Phase 3: only an unshipped order can still be cancelled. The default keeps
+    # every pre-Phase-3 order (and its hash) a delivered order.
+    fulfillment_status: Literal["unshipped", "shipped", "delivered"] = "delivered"
 
     @model_validator(mode="after")
     def timezone(self):
         aware(self.delivered_at)
         return self
+
+    @model_serializer(mode="wrap")
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ("fulfillment_status",))
 
 
 class OrderLine(Model):
@@ -75,6 +93,13 @@ class OrderLine(Model):
     sku_id: str
     quantity: int = Field(gt=0, strict=True)
     allocated_paid_cents: int = Field(ge=0, strict=True)
+    # Phase 3: the inventory balance actually holding stock for an unshipped
+    # line. Cancellation releases stock only when this reservation exists.
+    reserved_inventory_id: Optional[str] = None
+
+    @model_serializer(mode="wrap")
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ("reserved_inventory_id",))
 
 
 class Evidence(Model):
@@ -102,7 +127,7 @@ class Quote(Model):
     id: str
     case_id: str
     customer_id: str
-    remedy: Literal["refund", "exchange", "reship"]
+    remedy: Literal["refund", "exchange", "reship", "cancel"]
     quantity: int = Field(gt=0, strict=True)
     target_sku_id: Optional[str] = None
     inventory_id: Optional[str] = None
@@ -191,7 +216,7 @@ class Settlement(Model):
     line_id: str
     quote_id: str
     unit_indices: Tuple[StrictInt, ...] = Field(min_length=1)
-    remedy: Literal["refund", "exchange", "reship"]
+    remedy: Literal["refund", "exchange", "reship", "cancel"]
 
 
 class Fulfillment(Model):
@@ -281,6 +306,25 @@ class ReturnItemsInput(Model):
     payment_method: Literal["original"] = "original"
 
 
+class ExchangeItemsInput(Model):
+    quantity: int = Field(gt=0, strict=True)
+    target_sku_id: str = Field(min_length=1)
+
+
+class LineQuantityInput(Model):
+    quantity: int = Field(gt=0, strict=True)
+
+
+# Pickup slot recorded on returns accepted by the atomic request_item_return
+# tool. It distinguishes them from legacy quote-driven returns.
+RETURN_LABEL_SLOT = "prepaid-return-label"
+
+# The Phase 3 business actions an Agent can perform in one call.
+BUSINESS_ACTIONS = frozenset({
+    "return_delivered_order_items", "cancel_order", "exchange_delivered_order_items",
+    "reship_order_items", "request_item_return",
+})
+
 PARAMETERS = {
     "list_customer_orders": Empty, "get_order_details": Empty,
     "search_catalog": CatalogInput, "get_sku_details": Empty,
@@ -292,6 +336,11 @@ PARAMETERS = {
     "release_accepted_refund": Empty, "ship_accepted_replacement": Empty,
     "cancel_pending_commitment": Empty,
     "return_delivered_order_items": ReturnItemsInput,
+    "cancel_order": Empty,
+    "list_exchange_options": Empty,
+    "exchange_delivered_order_items": ExchangeItemsInput,
+    "reship_order_items": LineQuantityInput,
+    "request_item_return": LineQuantityInput,
 }
 QUERIES = frozenset(name for name in PARAMETERS if name.startswith(("get_", "list_", "search_", "estimate_")))
 PREPARATIONS = frozenset({"open_remedy_case", "verify_submitted_evidence",

@@ -3,7 +3,7 @@ from datetime import timedelta
 
 from usami_harness.models import Result
 from .models import (
-    Fulfillment, LedgerEntry, Quote, RemedyCase, Return, Settlement,
+    RETURN_LABEL_SLOT, Fulfillment, LedgerEntry, Quote, RemedyCase, Return, Settlement,
     case_id, quote_id, unit_credit,
 )
 
@@ -22,9 +22,11 @@ def _hard_scope(world, actor, op):
         if target and target.merchant_id != op.scope_id or warehouse and warehouse.merchant_id != op.scope_id:
             return False
     key = op.resource_id
-    if op.name in ("get_order_details",):
+    if op.name in ("get_order_details", "cancel_order"):
         order = world.orders.get(key)
-    elif op.name in ("open_remedy_case", "get_refundable_balance", "return_delivered_order_items"):
+    elif op.name in ("open_remedy_case", "get_refundable_balance", "return_delivered_order_items",
+                     "list_exchange_options", "exchange_delivered_order_items",
+                     "reship_order_items", "request_item_return"):
         line = world.lines.get(key)
         order = world.orders.get(line.order_id) if line else None
     else:
@@ -80,6 +82,38 @@ def _settle(world, quote, *, inventory_pre_reserved):
     case.status = "resolved"
 
 
+def _free_units(world, line):
+    """Purchased units of a line that are neither settled nor held by an open case."""
+    held = {i for row in world.settlements.values() if row.line_id == line.id for i in row.unit_indices}
+    held.update(i for row in world.cases.values() if row.line_id == line.id
+                and row.status not in ("cancelled", "resolved") for i in row.unit_indices)
+    return [i for i in range(line.quantity) if i not in held]
+
+
+def _label_return_cases(world, line_id):
+    """Open returns accepted by request_item_return for this line, oldest units first."""
+    rows = []
+    for case in world.cases.values():
+        quote = world.quotes.get(case.committed_quote_id or "")
+        if (case.line_id == line_id and case.status in ("awaiting_return", "ready") and quote is not None
+                and quote.remedy == "refund" and quote.pickup_slot == RETURN_LABEL_SLOT):
+            rows.append(case)
+    return sorted(rows, key=lambda row: row.unit_indices)
+
+
+def _replacement_source(world, sku_id, quantity):
+    """Fastest stocked warehouse with a delivery route for a replacement shipment."""
+    rows = []
+    for inv in world.inventory.values():
+        route = next((row for row in world.routes.values() if row.warehouse_id == inv.warehouse_id), None)
+        if inv.sku_id == sku_id and inv.available >= quantity and route is not None:
+            rows.append(((route.days, route.fee_cents, inv.warehouse_id), inv, route))
+    if not rows:
+        return None, None
+    _, inv, route = min(rows, key=lambda row: row[0])
+    return inv, route
+
+
 def apply(world, actor, op, event_index):
     if not _hard_scope(world, actor, op):
         return world.clone(), Result(success=False, error_code="OBJECT_ACCESS_DENIED")
@@ -101,12 +135,27 @@ def apply(world, actor, op, event_index):
             sku = new.skus[line.sku_id]
             if p["payment_method"] != "original":
                 return world.clone(), Result(success=False, error_code="PAYMENT_METHOD_UNSUPPORTED")
-            if order.delivered_at > new.clock:
+            if order.fulfillment_status != "delivered" or order.delivered_at > new.clock:
                 return world.clone(), Result(success=False, error_code="ORDER_NOT_DELIVERED")
-            if new.clock > order.delivered_at + timedelta(days=sku.return_days):
+            label_cases = _label_return_cases(new, key)
+            received = [row for row in label_cases if row.status == "ready"]
+            # A return accepted inside the window may be refunded after the
+            # trusted receipt event, even if that event lands after the window.
+            if not (sku.return_required and received) and \
+                    new.clock > order.delivered_at + timedelta(days=sku.return_days):
                 return world.clone(), Result(success=False, error_code="RETURN_WINDOW_EXPIRED")
             if sku.return_required:
-                return world.clone(), Result(success=False, error_code="RETURN_REQUIRED")
+                matching = [row for row in received if len(row.unit_indices) == p["quantity"]]
+                if not matching:
+                    code = ("RETURNED_QUANTITY_MISMATCH" if received
+                            else "RETURN_NOT_RECEIVED" if label_cases else "RETURN_REQUIRED")
+                    return world.clone(), Result(success=False, error_code=code)
+                case = matching[0]
+                accepted = new.quotes[case.committed_quote_id]
+                _settle(new, accepted, inventory_pre_reserved=True)
+                data = {"status": "refund_issued", "line_id": key, "quantity": accepted.quantity,
+                        "refund_cents": accepted.refund_cents, "payment_channel": accepted.payment_channel}
+                return new, Result(success=True, data=data)
             refunded = {i for row in new.settlements.values()
                         if row.line_id == key for i in row.unit_indices}
             in_progress = {i for row in new.cases.values() if row.line_id == key
@@ -132,6 +181,134 @@ def apply(world, actor, op, event_index):
             _settle(new, refund, inventory_pre_reserved=False)
             data = {"status": "refund_issued", "line_id": key, "quantity": len(indices),
                     "refund_cents": amount, "payment_channel": order.payment_channel}
+        elif op.name == "cancel_order":
+            # One business action: an order that has not shipped is cancelled as a
+            # whole, every line's payment returns to the original channel and only
+            # stock that was actually reserved for a line goes back to inventory.
+            order = new.orders[key]
+            lines = sorted((row for row in new.lines.values() if row.order_id == key), key=lambda x: x.id)
+            line_ids = {row.id for row in lines}
+            if any(row.line_id in line_ids and row.remedy == "cancel" for row in new.settlements.values()):
+                return world.clone(), Result(success=False, error_code="ORDER_ALREADY_CANCELLED")
+            if order.fulfillment_status != "unshipped":
+                return world.clone(), Result(success=False, error_code="ORDER_NOT_CANCELLABLE")
+            if (any(row.line_id in line_ids for row in new.settlements.values())
+                    or any(row.line_id in line_ids and row.status != "cancelled" for row in new.cases.values())):
+                return world.clone(), Result(success=False, error_code="CANCELLATION_CONFLICT")
+            for line in lines:
+                indices = tuple(range(line.quantity))
+                cid = case_id(line.id, indices)
+                qid = quote_id(cid, 1)
+                new.cases[cid] = RemedyCase(id=cid, line_id=line.id, unit_indices=indices,
+                                            committed_quote_id=qid)
+                cancellation = Quote(id=qid, case_id=cid, customer_id=actor, remedy="cancel",
+                                     quantity=line.quantity, refund_cents=line.allocated_paid_cents,
+                                     extra_charge_cents=0, payment_channel=order.payment_channel,
+                                     return_required=False, status="committed", revision=1,
+                                     valid_until=new.clock + timedelta(hours=1))
+                new.quotes[qid] = cancellation
+                _settle(new, cancellation, inventory_pre_reserved=False)
+                if line.reserved_inventory_id is not None:
+                    inv = new.inventory[line.reserved_inventory_id]
+                    inv.reserved -= line.quantity
+                    inv.available += line.quantity
+                    inv.revision += 1
+            data = {"status": "order_cancelled", "order_id": key, "refund_cents": order.paid_cents,
+                    "payment_channel": order.payment_channel}
+        elif op.name == "request_item_return":
+            # Accept a physical return. Receipt is a later trusted external
+            # event; no refund is posted and nothing is marked received here.
+            line = new.lines[key]
+            order = new.orders[line.order_id]
+            sku = new.skus[line.sku_id]
+            if order.fulfillment_status != "delivered" or order.delivered_at > new.clock:
+                return world.clone(), Result(success=False, error_code="ORDER_NOT_DELIVERED")
+            if new.clock > order.delivered_at + timedelta(days=sku.return_days):
+                return world.clone(), Result(success=False, error_code="RETURN_WINDOW_EXPIRED")
+            if not sku.return_required:
+                return world.clone(), Result(success=False, error_code="RETURN_NOT_REQUIRED")
+            available = _free_units(new, line)
+            if not available:
+                code = "RETURN_ALREADY_REQUESTED" if _label_return_cases(new, key) else "ALREADY_REFUNDED"
+                return world.clone(), Result(success=False, error_code=code)
+            if len(available) < p["quantity"]:
+                return world.clone(), Result(success=False, error_code="PURCHASED_QUANTITY_UNAVAILABLE")
+            indices = tuple(available[:p["quantity"]])
+            amount = unit_credit(line, indices)
+            if amount > new.merchants[order.merchant_id].refund_approval_limit_cents:
+                return world.clone(), Result(success=False, error_code="APPROVAL_REQUIRED")
+            cid = case_id(key, indices)
+            qid = quote_id(cid, 1)
+            new.cases[cid] = RemedyCase(id=cid, line_id=key, unit_indices=indices,
+                                        status="awaiting_return", committed_quote_id=qid)
+            new.quotes[qid] = Quote(id=qid, case_id=cid, customer_id=actor, remedy="refund",
+                                    quantity=len(indices), refund_cents=amount, extra_charge_cents=0,
+                                    payment_channel=order.payment_channel, return_required=True,
+                                    pickup_slot=RETURN_LABEL_SLOT, status="committed", revision=1,
+                                    valid_until=new.clock + timedelta(hours=1))
+            rid = "return_" + cid
+            new.returns[rid] = Return(id=rid, case_id=cid, pickup_slot=RETURN_LABEL_SLOT)
+            data = {"status": "return_requested", "line_id": key, "quantity": len(indices),
+                    "refund_cents": amount, "payment_channel": order.payment_channel,
+                    "refund_status": "awaiting_return_receipt"}
+        elif op.name in ("exchange_delivered_order_items", "reship_order_items"):
+            # One business action ships the replacement from real stock and posts
+            # any price difference; internal case/quote/settlement stay hidden.
+            exchange = op.name == "exchange_delivered_order_items"
+            line = new.lines[key]
+            order = new.orders[line.order_id]
+            sku = new.skus[line.sku_id]
+            if order.fulfillment_status != "delivered" or order.delivered_at > new.clock:
+                return world.clone(), Result(success=False, error_code="ORDER_NOT_DELIVERED")
+            if new.clock > order.delivered_at + timedelta(days=sku.return_days):
+                return world.clone(), Result(success=False, error_code="RETURN_WINDOW_EXPIRED")
+            if sku.return_required:
+                return world.clone(), Result(success=False, error_code="RETURN_REQUIRED")
+            if exchange:
+                target = new.skus.get(p["target_sku_id"])
+                if target is None or target.merchant_id != order.merchant_id:
+                    return world.clone(), Result(success=False, error_code="EXCHANGE_TARGET_NOT_FOUND")
+                if target.product_family != sku.product_family:
+                    return world.clone(), Result(success=False, error_code="REPLACEMENT_FAMILY_MISMATCH")
+                if target.id == sku.id:
+                    return world.clone(), Result(success=False, error_code="EXCHANGE_TARGET_SAME_AS_ORIGINAL")
+            else:
+                target = sku
+                if not any(row.line_id == key and row.customer_id == actor and row.valid
+                           for row in new.evidence.values()):
+                    return world.clone(), Result(success=False, error_code="RESHIP_NOT_ELIGIBLE")
+            available = _free_units(new, line)
+            if not available:
+                return world.clone(), Result(success=False, error_code="ALREADY_SETTLED")
+            if len(available) < p["quantity"]:
+                return world.clone(), Result(success=False, error_code="PURCHASED_QUANTITY_UNAVAILABLE")
+            indices = tuple(available[:p["quantity"]])
+            inv, route = _replacement_source(new, target.id, len(indices))
+            if inv is None:
+                return world.clone(), Result(success=False, error_code="INSUFFICIENT_STOCK")
+            delta = (target.price_cents * len(indices) + route.fee_cents - unit_credit(line, indices)
+                     if exchange else 0)
+            refund, extra = max(-delta, 0), max(delta, 0)
+            if refund > new.merchants[order.merchant_id].refund_approval_limit_cents:
+                return world.clone(), Result(success=False, error_code="APPROVAL_REQUIRED")
+            cid = case_id(key, indices)
+            qid = quote_id(cid, 1)
+            new.cases[cid] = RemedyCase(id=cid, line_id=key, unit_indices=indices, committed_quote_id=qid)
+            replacement = Quote(
+                id=qid, case_id=cid, customer_id=actor, remedy="exchange" if exchange else "reship",
+                quantity=len(indices), target_sku_id=target.id, inventory_id=inv.id, route_id=route.id,
+                refund_cents=refund, extra_charge_cents=extra, payment_channel=order.payment_channel,
+                promised_arrival=new.clock + timedelta(days=route.days), return_required=False,
+                revision=1, inventory_revision=inv.revision, sku_revision=target.revision,
+                route_revision=route.revision, status="committed",
+                valid_until=new.clock + timedelta(hours=1))
+            new.quotes[qid] = replacement
+            _settle(new, replacement, inventory_pre_reserved=False)
+            data = {"status": "exchange_shipped" if exchange else "replacement_shipped",
+                    "line_id": key, "quantity": len(indices), "target_sku_id": target.id,
+                    "refund_cents": refund, "extra_charge_cents": extra,
+                    "payment_channel": order.payment_channel,
+                    "promised_arrival": replacement.promised_arrival.isoformat()}
         elif op.name == "open_remedy_case":
             line = new.lines[key]
             occupied = {i for row in new.cases.values() if row.line_id == key and row.status != "cancelled"

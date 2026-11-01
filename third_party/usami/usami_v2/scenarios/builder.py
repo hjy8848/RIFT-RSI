@@ -96,18 +96,30 @@ def _construct(spec, seed, values):
         order_id, customer = aliases[order.alias], aliases[order.customer_alias]
         for row in order.lines:
             key = aliases[row.alias]
+            reserved_id = None
+            quantity = values[(row.alias, "quantity", "")]
+            if order.fulfillment_status == "unshipped":
+                # An unshipped line holds real stock: the first warehouse (in
+                # scenario order) carrying the SKU gets a matching reservation.
+                warehouse = spec.warehouses[0].alias
+                reserved_id = _identifier(seed, "stock", row.original_sku + "/" + warehouse)
+                held = inventory[reserved_id]
+                held.reserved += quantity
+                held.opening_quantity += quantity
             lines[key] = OrderLine(
                 id=key, order_id=order_id, sku_id=aliases[row.original_sku],
-                quantity=values[(row.alias, "quantity", "")],
-                allocated_paid_cents=values[(row.alias, "paid_cents", "")])
+                quantity=quantity, allocated_paid_cents=values[(row.alias, "paid_cents", "")],
+                reserved_inventory_id=reserved_id)
             eid = _identifier(seed, "evidence", row.alias)
             evidence[eid] = Evidence(id=eid, customer_id=customer, line_id=key,
                                        issue=row.issue, valid=row.evidence_valid)
+        offset = timedelta(days=values[(order.alias, "delivered_days_ago", "")])
         orders[order_id] = Order(
             id=order_id, merchant_id=merchant, customer_id=customer,
             paid_cents=sum(lines[aliases[row.alias]].allocated_paid_cents for row in order.lines),
-            payment_channel="original-card", delivered_at=clock - timedelta(
-                days=values[(order.alias, "delivered_days_ago", "")]))
+            payment_channel="original-card",
+            delivered_at=clock - offset if order.fulfillment_status == "delivered" else clock + offset,
+            fulfillment_status=order.fulfillment_status)
     return World(
         seed=seed, clock=clock,
         customers={aliases[name]: Customer(id=aliases[name], name="Customer " + str(index + 1))

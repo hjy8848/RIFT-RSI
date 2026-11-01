@@ -71,6 +71,13 @@ def verify_world_constraints(spec, result):
     if len(world.routes) != len(spec.warehouses) or len(world.inventory) != len(spec.skus) * len(spec.warehouses):
         raise ValueError("route/inventory population differs")
     stock_specs = {(row.sku_alias, row.warehouse_alias): row.quantity for row in spec.stock}
+    # An unshipped line holds a reservation of its full quantity in the first warehouse.
+    reservations = {}
+    for order_spec in spec.orders:
+        if order_spec.fulfillment_status == "unshipped":
+            for line_spec in order_spec.lines:
+                key = (line_spec.original_sku, spec.warehouses[0].alias)
+                reservations[key] = reservations.get(key, 0) + world.lines[aliases[line_spec.alias]].quantity
     for warehouse_spec in spec.warehouses:
         wid = aliases[warehouse_spec.alias]
         if world.warehouses[wid].merchant_id != merchant:
@@ -83,7 +90,9 @@ def verify_world_constraints(spec, result):
         for sku_spec in spec.skus:
             stock = next(row for row in world.inventory.values() if row.sku_id == aliases[sku_spec.alias]
                          and row.warehouse_id == wid)
-            if stock.reserved or stock.shipped or stock.adjustments or stock.revision or stock.opening_quantity != stock.available:
+            reserved = reservations.get((sku_spec.alias, warehouse_spec.alias), 0)
+            if (stock.reserved != reserved or stock.shipped or stock.adjustments or stock.revision
+                    or stock.opening_quantity != stock.available + reserved):
                 raise ValueError("initial inventory contains unregistered changes")
             capture((sku_spec.alias, "stock", warehouse_spec.alias), stock.available,
                     stock_specs.get((sku_spec.alias, warehouse_spec.alias), spec.default_stock))
@@ -93,7 +102,10 @@ def verify_world_constraints(spec, result):
         order = world.orders[aliases[order_spec.alias]]
         if order.customer_id != aliases[order_spec.customer_alias] or order.merchant_id != merchant or order.payment_channel != "original-card":
             raise ValueError("order Customer, merchant or payment binding differs")
-        seconds = (world.clock - order.delivered_at).total_seconds()
+        if order.fulfillment_status != order_spec.fulfillment_status:
+            raise ValueError("order fulfillment status differs from the scene")
+        delivered = order.fulfillment_status == "delivered"
+        seconds = (world.clock - order.delivered_at).total_seconds() * (1 if delivered else -1)
         if seconds % 86400:
             raise ValueError("delivery age does not match the registered day units")
         capture((order_spec.alias, "delivered_days_ago", ""), int(seconds // 86400), order_spec.delivered_days_ago)
@@ -101,6 +113,13 @@ def verify_world_constraints(spec, result):
             line = world.lines[aliases[line_spec.alias]]
             if line.order_id != order.id or line.sku_id != aliases[line_spec.original_sku]:
                 raise ValueError("order-line binding differs")
+            reserved_for = None
+            if order.fulfillment_status == "unshipped":
+                reserved_for = next(row.id for row in world.inventory.values()
+                                    if row.sku_id == line.sku_id
+                                    and row.warehouse_id == aliases[spec.warehouses[0].alias])
+            if line.reserved_inventory_id != reserved_for:
+                raise ValueError("line stock reservation differs from the scene")
             capture((line_spec.alias, "quantity", ""), line.quantity, line_spec.quantity)
             capture((line_spec.alias, "paid_cents", ""), line.allocated_paid_cents, line_spec.paid_cents)
             evidence = [row for row in world.evidence.values() if row.line_id == line.id]

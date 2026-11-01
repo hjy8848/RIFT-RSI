@@ -1,7 +1,7 @@
 """Business-oriented scene constraints; no arbitrary Python or complete World JSON."""
 from typing import Literal, Optional, Tuple
 
-from pydantic import Field, StrictInt, model_validator
+from pydantic import Field, StrictInt, model_serializer, model_validator
 
 from usami_v2.contracts import Sealed
 
@@ -77,8 +77,20 @@ class LineVariable(Sealed):
 class OrderVariable(Sealed):
     alias: str = Field(min_length=1)
     customer_alias: str
-    delivered_days_ago: IntegerRange
+    delivered_days_ago: IntegerRange = Field(description=(
+        "Days since delivery for a delivered order; for an unshipped or shipped order, "
+        "days until its expected delivery."))
     lines: Tuple[LineVariable, ...] = Field(min_length=1, max_length=32)
+    fulfillment_status: Literal["unshipped", "shipped", "delivered"] = Field(
+        default="delivered",
+        description="Only an unshipped order can be cancelled; its lines reserve stock in the first stocked warehouse.")
+
+    @model_serializer(mode="wrap")
+    def _compatible_dump(self, handler):
+        data = handler(self)
+        if self.fulfillment_status == "delivered":
+            data.pop("fulfillment_status", None)
+        return data
 
     @model_validator(mode="after")
     def nonnegative_age(self):

@@ -9,7 +9,7 @@ from usami_harness.models import Decision
 from .invariants import invariants
 from .models import public_sku
 from .models import (
-    Fulfillment, LedgerEntry, PREPARATIONS, Quote, RemedyCase, Return, Settlement,
+    RETURN_LABEL_SLOT, Fulfillment, LedgerEntry, PREPARATIONS, Quote, RemedyCase, Return, Settlement,
     case_id, quote_id, unit_credit,
 )
 
@@ -77,6 +77,28 @@ def _expected_query(world, actor, op):
                            if world.quotes[k].case_id == key],
                 "returns": [world.returns[k].model_dump(mode="json") for k in sorted(world.returns)
                             if world.returns[k].case_id == key]}
+    if op.name == "list_exchange_options":
+        purchased = world.skus[world.lines[key].sku_id]
+        options = []
+        for sku_id in sorted(world.skus):
+            sku = world.skus[sku_id]
+            if sku_id == purchased.id or sku.merchant_id != purchased.merchant_id:
+                continue
+            if sku.product_family != purchased.product_family:
+                continue
+            quantity, days = 0, []
+            for inv_id in sorted(world.inventory):
+                balance = world.inventory[inv_id]
+                routes = [row for row in world.routes.values() if row.warehouse_id == balance.warehouse_id]
+                if balance.sku_id == sku_id and balance.available > 0 and routes:
+                    quantity += balance.available
+                    days.append(routes[0].days)
+            option = {"sku_id": sku_id}
+            option.update(public_sku(sku))
+            option["available_quantity"] = quantity
+            option["fastest_delivery_days"] = min(days) if days else None
+            options.append(option)
+        return {"line_id": key, "options": options}
     raise ValueError("unregistered query")
 
 
@@ -126,6 +148,204 @@ def _project_settlement(expected, quote, pre_reserved):
     case.status = "resolved"
 
 
+def _delivered(order, clock):
+    """Delivered orders only: legacy orders default to delivered and keep their timestamp rule."""
+    return order.fulfillment_status == "delivered" and order.delivered_at <= clock
+
+
+def _delegated(world, actor, line_ids):
+    return any(row.customer_id == actor and set(line_ids).issubset(row.line_ids)
+               and not row.withdrawn and row.expires_at >= world.clock
+               and row.source_customer_event_hash
+               for row in world.delegations.values())
+
+
+def _decide_cancellation(world, actor, order):
+    """Independent order-cancellation policy and projection."""
+    def deny(code):
+        return Decision(allowed=False, error_code=code)
+
+    order_lines = [world.lines[k] for k in sorted(world.lines) if world.lines[k].order_id == order.id]
+    if not _delegated(world, actor, [row.id for row in order_lines]):
+        return deny("BUSINESS_DELEGATION_REQUIRED")
+    owned = {row.id for row in order_lines}
+    previous = [row for row in world.settlements.values() if row.line_id in owned]
+    if any(row.remedy == "cancel" for row in previous):
+        return deny("ORDER_ALREADY_CANCELLED")
+    if order.fulfillment_status != "unshipped":
+        # Shipped or delivered goods are handled as returns, never as a cancellation.
+        return deny("ORDER_NOT_CANCELLABLE")
+    open_cases = [row for row in world.cases.values() if row.line_id in owned and row.status != "cancelled"]
+    if previous or open_cases:
+        return deny("CANCELLATION_CONFLICT")
+    expected = world.clone()
+    for line in order_lines:
+        units = tuple(index for index in range(line.quantity))
+        cid = case_id(line.id, units)
+        qid = quote_id(cid, 1)
+        terms = Quote(id=qid, case_id=cid, customer_id=actor, remedy="cancel", quantity=len(units),
+                      refund_cents=line.allocated_paid_cents, extra_charge_cents=0,
+                      payment_channel=order.payment_channel, return_required=False,
+                      status="committed", revision=1, valid_until=world.clock + timedelta(hours=1))
+        expected.cases[cid] = RemedyCase(id=cid, line_id=line.id, unit_indices=units, committed_quote_id=qid)
+        expected.quotes[qid] = terms
+        _project_settlement(expected, terms, False)
+        if line.reserved_inventory_id is not None:
+            # Release exactly the reservation the line held; never invent stock.
+            balance = expected.inventory[line.reserved_inventory_id]
+            balance.reserved = world.inventory[balance.id].reserved - line.quantity
+            balance.available = world.inventory[balance.id].available + line.quantity
+            balance.revision = world.inventory[balance.id].revision + 1
+    total = sum(row.allocated_paid_cents for row in order_lines)
+    return Decision(allowed=True, expected_state=expected,
+                    data={"status": "order_cancelled", "order_id": order.id, "refund_cents": total,
+                          "payment_channel": order.payment_channel})
+
+
+def _open_units(world, line):
+    taken = set()
+    for row in world.settlements.values():
+        if row.line_id == line.id:
+            taken.update(row.unit_indices)
+    for row in world.cases.values():
+        if row.line_id == line.id and row.status not in ("cancelled", "resolved"):
+            taken.update(row.unit_indices)
+    return [index for index in range(line.quantity) if index not in taken]
+
+
+def _accepted_returns(world, line_id):
+    """Unrefunded returns this line accepted through the atomic return request."""
+    found = []
+    for key in sorted(world.cases):
+        case = world.cases[key]
+        if case.line_id != line_id or case.status not in ("awaiting_return", "ready"):
+            continue
+        quote = world.quotes.get(case.committed_quote_id) if case.committed_quote_id else None
+        if quote and quote.remedy == "refund" and quote.pickup_slot == RETURN_LABEL_SLOT:
+            found.append(case)
+    found.sort(key=lambda row: tuple(row.unit_indices))
+    return found
+
+
+def _decide_return_request(world, actor, op, line, order):
+    """Independent acceptance of a physical return; no receipt and no refund yet."""
+    def deny(code):
+        return Decision(allowed=False, error_code=code)
+
+    if not _delegated(world, actor, [line.id]):
+        return deny("BUSINESS_DELEGATION_REQUIRED")
+    sku = world.skus[line.sku_id]
+    if not _delivered(order, world.clock):
+        return deny("ORDER_NOT_DELIVERED")
+    if world.clock > order.delivered_at + timedelta(days=sku.return_days):
+        return deny("RETURN_WINDOW_EXPIRED")
+    if not sku.return_required:
+        return deny("RETURN_NOT_REQUIRED")
+    units = _open_units(world, line)
+    if not units:
+        return deny("RETURN_ALREADY_REQUESTED" if _accepted_returns(world, line.id) else "ALREADY_REFUNDED")
+    if op.params["quantity"] > len(units):
+        return deny("PURCHASED_QUANTITY_UNAVAILABLE")
+    indices = tuple(units[:op.params["quantity"]])
+    amount = unit_credit(line, indices)
+    if amount > world.merchants[order.merchant_id].refund_approval_limit_cents:
+        return deny("APPROVAL_REQUIRED")
+    cid = case_id(line.id, indices)
+    qid = quote_id(cid, 1)
+    expected = world.clone()
+    expected.cases[cid] = RemedyCase(id=cid, line_id=line.id, unit_indices=indices,
+                                     status="awaiting_return", committed_quote_id=qid)
+    expected.quotes[qid] = Quote(id=qid, case_id=cid, customer_id=actor, remedy="refund",
+                                 quantity=len(indices), refund_cents=amount, extra_charge_cents=0,
+                                 payment_channel=order.payment_channel, return_required=True,
+                                 pickup_slot=RETURN_LABEL_SLOT, status="committed", revision=1,
+                                 valid_until=world.clock + timedelta(hours=1))
+    expected.returns["return_" + cid] = Return(id="return_" + cid, case_id=cid, pickup_slot=RETURN_LABEL_SLOT)
+    return Decision(allowed=True, expected_state=expected, data={
+        "status": "return_requested", "line_id": line.id, "quantity": len(indices),
+        "refund_cents": amount, "payment_channel": order.payment_channel,
+        "refund_status": "awaiting_return_receipt"})
+
+
+def _decide_replacement(world, actor, op, line, order):
+    """Independent exchange/reship policy: eligibility, real stock, price difference."""
+    def deny(code):
+        return Decision(allowed=False, error_code=code)
+
+    exchange = op.name == "exchange_delivered_order_items"
+    p = op.params
+    if not _delegated(world, actor, [line.id]):
+        return deny("BUSINESS_DELEGATION_REQUIRED")
+    purchased = world.skus[line.sku_id]
+    if not _delivered(order, world.clock):
+        return deny("ORDER_NOT_DELIVERED")
+    if world.clock > order.delivered_at + timedelta(days=purchased.return_days):
+        return deny("RETURN_WINDOW_EXPIRED")
+    if purchased.return_required:
+        return deny("RETURN_REQUIRED")
+    if exchange:
+        target = world.skus.get(p["target_sku_id"])
+        if not target or target.merchant_id != order.merchant_id:
+            return deny("EXCHANGE_TARGET_NOT_FOUND")
+        if target.product_family != purchased.product_family:
+            return deny("REPLACEMENT_FAMILY_MISMATCH")
+        if target.id == purchased.id:
+            return deny("EXCHANGE_TARGET_SAME_AS_ORIGINAL")
+    else:
+        # A free reship needs a verified delivery problem on file for this purchase.
+        target = purchased
+        eligible = [row for row in world.evidence.values()
+                    if row.line_id == line.id and row.customer_id == actor and row.valid]
+        if not eligible:
+            return deny("RESHIP_NOT_ELIGIBLE")
+    units = _open_units(world, line)
+    if not units:
+        return deny("ALREADY_SETTLED")
+    if p["quantity"] > len(units):
+        return deny("PURCHASED_QUANTITY_UNAVAILABLE")
+    indices = tuple(units[:p["quantity"]])
+    choices = []
+    for inv_id in sorted(world.inventory):
+        balance = world.inventory[inv_id]
+        if balance.sku_id != target.id or balance.available < len(indices):
+            continue
+        for route in world.routes.values():
+            if route.warehouse_id == balance.warehouse_id:
+                choices.append((route.days, route.fee_cents, balance.warehouse_id, inv_id, route.id))
+    if not choices:
+        return deny("INSUFFICIENT_STOCK")
+    _, _, _, inv_id, route_id = sorted(choices)[0]
+    balance, route = world.inventory[inv_id], world.routes[route_id]
+    refund, extra = 0, 0
+    if exchange:
+        difference = target.price_cents * len(indices) + route.fee_cents - unit_credit(line, indices)
+        if difference > 0:
+            extra = difference
+        else:
+            refund = -difference
+    if refund > world.merchants[order.merchant_id].refund_approval_limit_cents:
+        return deny("APPROVAL_REQUIRED")
+    cid = case_id(line.id, indices)
+    qid = quote_id(cid, 1)
+    arrival = world.clock + timedelta(days=route.days)
+    terms = Quote(id=qid, case_id=cid, customer_id=actor, remedy="exchange" if exchange else "reship",
+                  quantity=len(indices), target_sku_id=target.id, inventory_id=balance.id,
+                  route_id=route.id, refund_cents=refund, extra_charge_cents=extra,
+                  payment_channel=order.payment_channel, promised_arrival=arrival,
+                  return_required=False, revision=1, inventory_revision=balance.revision,
+                  sku_revision=target.revision, route_revision=route.revision, status="committed",
+                  valid_until=world.clock + timedelta(hours=1))
+    expected = world.clone()
+    expected.cases[cid] = RemedyCase(id=cid, line_id=line.id, unit_indices=indices, committed_quote_id=qid)
+    expected.quotes[qid] = terms
+    _project_settlement(expected, terms, False)
+    data = {"status": "exchange_shipped" if exchange else "replacement_shipped", "line_id": line.id,
+            "quantity": len(indices), "target_sku_id": target.id, "refund_cents": refund,
+            "extra_charge_cents": extra, "payment_channel": order.payment_channel,
+            "promised_arrival": arrival.isoformat()}
+    return Decision(allowed=True, expected_state=expected, data=data)
+
+
 def decide(world, actor, op):
     def deny(code):
         return Decision(allowed=False, error_code=code)
@@ -151,9 +371,11 @@ def decide(world, actor, op):
                     row.warehouse_id == warehouse.id for row in world.routes.values()):
                 return deny("DELIVERY_ROUTE_NOT_FOUND")
     else:
-        if op.name == "get_order_details":
+        if op.name in ("get_order_details", "cancel_order"):
             order = world.orders.get(key)
-        elif op.name in ("open_remedy_case", "get_refundable_balance", "return_delivered_order_items"):
+        elif op.name in ("open_remedy_case", "get_refundable_balance", "return_delivered_order_items",
+                         "list_exchange_options", "exchange_delivered_order_items",
+                         "reship_order_items", "request_item_return"):
             line = world.lines.get(key)
         elif op.name in ("commit_accepted_quote", "cancel_pending_commitment"):
             quote = world.quotes.get(key)
@@ -191,12 +413,26 @@ def decide(world, actor, op):
         if p["payment_method"] != "original":
             return deny("PAYMENT_METHOD_UNSUPPORTED")
         sku = world.skus[line.sku_id]
-        if order.delivered_at > world.clock:
+        if not _delivered(order, world.clock):
             return deny("ORDER_NOT_DELIVERED")
-        if world.clock > order.delivered_at + timedelta(days=sku.return_days):
+        pending_returns = _accepted_returns(world, line.id)
+        received = [row for row in pending_returns if row.status == "ready"]
+        window_open = world.clock <= order.delivered_at + timedelta(days=sku.return_days)
+        if not window_open and not (sku.return_required and received):
             return deny("RETURN_WINDOW_EXPIRED")
         if sku.return_required:
-            return deny("RETURN_REQUIRED")
+            # Refund only goods the trusted receipt event says are back.
+            if not received:
+                return deny("RETURN_NOT_RECEIVED" if pending_returns else "RETURN_REQUIRED")
+            same_quantity = [row for row in received if len(row.unit_indices) == p["quantity"]]
+            if not same_quantity:
+                return deny("RETURNED_QUANTITY_MISMATCH")
+            case = same_quantity[0]
+            accepted = world.quotes[case.committed_quote_id]
+            _project_settlement(expected, accepted, True)
+            data = {"status": "refund_issued", "line_id": line.id, "quantity": len(case.unit_indices),
+                    "refund_cents": accepted.refund_cents, "payment_channel": order.payment_channel}
+            return Decision(allowed=True, expected_state=expected, data=data)
         settled = set()
         for row in world.settlements.values():
             if row.line_id == line.id:
@@ -227,6 +463,12 @@ def decide(world, actor, op):
         data = {"status": "refund_issued", "line_id": line.id, "quantity": len(indices),
                 "refund_cents": amount, "payment_channel": order.payment_channel}
         return Decision(allowed=True, expected_state=expected, data=data)
+    if op.name == "cancel_order":
+        return _decide_cancellation(world, actor, order)
+    if op.name in ("exchange_delivered_order_items", "reship_order_items"):
+        return _decide_replacement(world, actor, op, line, order)
+    if op.name == "request_item_return":
+        return _decide_return_request(world, actor, op, line, order)
     if op.name == "open_remedy_case":
         sku = world.skus[line.sku_id]
         if order.delivered_at > world.clock:
