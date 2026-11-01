@@ -87,8 +87,10 @@ def test_next_round_reuses_ability_and_seen_failure_is_recovery_candidate():
 
     retention = tuple(task_record(f"S{index}", Outcome.SUCCESS,
         split=Split.VALIDATION) for index in range(2))
-    current = tuple(task_record(row.task_ref, Outcome.SUCCESS, checkpoint=AFTER,
-        split=row.identity.split) for row in (f001, f002, *retention))
+    # Fresh measurements at the current checkpoint: their own trial IDs, not the history's.
+    current = tuple(replace(fresh, trials=tuple(replace(trial, trial_id=trial.trial_id + "-current")
+        for trial in fresh.trials)) for fresh in (task_record(row.task_ref, Outcome.SUCCESS,
+        checkpoint=AFTER, split=row.identity.split) for row in (f001, f002, *retention)))
     split_registry = SplitRegistry((row.identity for row in (*histories, *retention)),
         policy_version=INSTANCE_DISJOINT_WITHIN_FAMILY_V1)
     selector = ProbeSelector(record_verifier=RealEvidence())

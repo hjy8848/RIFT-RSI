@@ -37,6 +37,16 @@ def _digest_id(*parts):
     return sha256(material).hexdigest()[:32]
 
 
+def _baseline_trial_seed(base_seed, round_index, task_ref, index):
+    """Seed for a Probe baseline trial.
+
+    Domain-separated from Bootstrap and earlier Probe seeds, so a baseline never
+    replays the trials that selected its task.
+    """
+    raw = f"rift-probe-baseline-v1:{base_seed}:{round_index}:{task_ref}:{index}".encode("utf-8")
+    return int.from_bytes(sha256(raw).digest()[:4], "big")
+
+
 class _RoleProbeEvaluator:
     def __init__(self, resources, *, seed_base=0, metric_sink=None, round_index=None):
         self.resources, self.seed_base = resources, seed_base
@@ -79,7 +89,7 @@ class ProductionPlanFactory:
                  probe_seed=4100, designer_sampling_params=None,
                  designer_reward_baseline=0.0, lambda_retention=0.5,
                  min_valid_fraction=0.8, allowed_training_hashes=(), metric_sink=None,
-                 checkpoint_root=None):
+                 checkpoint_root=None, baseline_evidence_store=None):
         required = (resources, commerce_host, benchmark_pool, task_registry, split_registry,
             task_evidence_store, probe_selector, probe_evidence_store, capture_store,
             designer_capture_store, checkpoint_store, update_verifier, reward_verifier,
@@ -107,6 +117,16 @@ class ProductionPlanFactory:
             from rift.probes.verification import StoredProbeEvidenceVerifier
             self.probe_verifier = StoredProbeEvidenceVerifier(
                 probe_evidence_store, trial_verifier, freeze_order_verifier)
+        # Probe baselines live apart from the Bootstrap/post-update records that select
+        # tasks: the shared store holds one record per (task, checkpoint), and reading a
+        # selection record back as a baseline is exactly the bias this store avoids.
+        if baseline_evidence_store is None:
+            root = getattr(task_evidence_store, "root", None)
+            if root is None:
+                raise ValueError("a separate Probe baseline evidence store is required")
+            from rift.banks.core import JsonTaskEvidenceStore
+            baseline_evidence_store = JsonTaskEvidenceStore(Path(root) / "probe-baselines")
+        self.baseline_evidence_store = baseline_evidence_store
         self.protocol_ref, self.protocol_digest = protocol_ref, protocol_digest
         self.package_config = package_config
         self.recovery_tasks, self.retention_tasks = recovery_tasks, retention_tasks
@@ -163,6 +183,10 @@ class ProductionPlanFactory:
         return package_id, pending, proposal, target_ability_id
 
     def _current_baselines(self, histories, checkpoint, round_index, batch):
+        """Measure each shortlisted task afresh at ``checkpoint`` with trial seeds of its own.
+
+        The records that selected a task are never read back as its baseline.
+        """
         from rift.banks.records import TaskEvidenceRecord
         candidates = {}
         for history in histories:
@@ -180,7 +204,7 @@ class ProductionPlanFactory:
         missing = []
         for task_ref, history in sorted(candidates.items()):
             try:
-                cached = self.task_evidence_store.load(task_ref, checkpoint)
+                cached = self.baseline_evidence_store.load(task_ref, checkpoint)
             except FileNotFoundError:
                 cached = None
             if (cached is not None and cached.identity == history.identity
@@ -198,7 +222,7 @@ class ProductionPlanFactory:
             requests = []
             for task_ref, _identity in missing:
                 for trial_index in range(self.trials_per_probe):
-                    seed = _trial_seed(self.probe_seed + round_index, task_ref, trial_index)
+                    seed = _baseline_trial_seed(self.probe_seed, round_index, task_ref, trial_index)
                     requests.append((task_ref, checkpoint, seed, self.protocol_ref, self.protocol_digest))
             started = time.perf_counter()
             trials = tuple(batch.evaluate_many(tuple(requests)))
@@ -219,7 +243,7 @@ class ProductionPlanFactory:
                         raise ValueError("new current-checkpoint Probe baseline evidence failed verification")
                 record = TaskEvidenceRecord(task_ref, identity, checkpoint, self.protocol_digest,
                                             tuple(task_trials), observed_at)
-                self.task_evidence_store.save(record)
+                self.baseline_evidence_store.save(record)
                 verified[task_ref] = record
         return tuple(verified.values())
 
@@ -227,15 +251,23 @@ class ProductionPlanFactory:
                           proposal, failure_records, recovery_histories,
                           retention_histories, training_package, batch,
                           ability_task_refs):
-        baselines = self._current_baselines(
-            tuple(recovery_histories) + tuple(retention_histories),
-            service_checkpoint, round_index, batch)
         diagnosis_refs = set(proposal.diagnosis_task_refs)
         linked_refs = set(ability_task_refs) | diagnosis_refs
         identities = tuple(source.identity for source in training_package.task_sources)
-        recovery, retention = self.probe_selector.freeze(
+        # Stage 1 selects from history alone; stage 2 measures fresh baselines only for
+        # that shortlist; the final freeze samples from tasks whose baselines are valid.
+        shortlist_recovery, shortlist_retention = self.probe_selector.preselect(
             recovery_candidates=tuple(recovery_histories),
             retention_candidates=tuple(retention_histories),
+            train_package_identities=identities, split_registry=self.split_registry,
+            recovery_tasks=self.recovery_tasks, retention_tasks=self.retention_tasks,
+            seed=self.probe_seed + round_index,
+            target_ability_id=target_ability_id, ability_task_refs=tuple(linked_refs))
+        baselines = self._current_baselines(
+            shortlist_recovery + shortlist_retention, service_checkpoint, round_index, batch)
+        recovery, retention = self.probe_selector.freeze(
+            recovery_candidates=shortlist_recovery,
+            retention_candidates=shortlist_retention,
             train_package_identities=identities,
             split_registry=self.split_registry,
             before_checkpoint=service_checkpoint,

@@ -94,44 +94,105 @@ class ProbeSelector:
         self._validate_pair(recovery_snapshot, retention_snapshot, split_registry.policy_version)
         return recovery_snapshot, retention_snapshot
 
+    def _history_rejection(self, history, probe_purpose, registry, excluded_identities):
+        """Why a historical record may not select a task, or None. Looks at history only."""
+        if not isinstance(history, TaskEvidenceRecord):
+            return "not_task_evidence"
+        if history.purpose is not DataPurpose.BANK_CANDIDATE:
+            return "wrong_purpose"
+        if history.identity.split is Split.TEST:
+            return "final_test_candidate"
+        state = history.state(success_threshold=self.success_threshold,
+                          failure_threshold=self.failure_threshold)
+        target = (CapabilityState.ACTIVE_WEAKNESS
+                  if probe_purpose is DataPurpose.RECOVERY_FEEDBACK
+                  else CapabilityState.MASTERED_CANDIDATE)
+        if state is not target:
+            return "outside_capability_threshold"
+        if not registry.contains(history.identity):
+            return "identity_not_registered"
+        if self.record_verifier.verify_record(history) is not True:
+            return "historical_evidence_unverified"
+        if any(trial.valid and trial.evidence_level is not EvidenceLevel.REAL_SERVICE
+               for trial in history.trials):
+            if not self.allow_nonreal:
+                return "historical_evidence_not_real"
+        total = len(history.trials)
+        if total == 0 or history.valid_trials / total < self.min_valid_fraction:
+            return "historical_valid_fraction"
+        if any(history.identity.overlaps_under(other, registry.policy_version)
+               for other in excluded_identities):
+            return "training_overlap"
+        return None
+
+    @staticmethod
+    def _shares_measurement(history, baseline):
+        """True when the baseline contains a trial that also helped select the task.
+
+        A task is chosen because a few trials happened to fail (Recovery) or
+        succeed (Retention). Re-using those very trials as the "before" score
+        builds regression to the mean into the reward: a fresh re-measurement
+        looks like improvement (or forgetting) even when nothing changed. Two
+        trials are the same measurement if they share an ID or a (checkpoint, seed).
+        """
+        selecting = {t.trial_id for t in history.trials} | {(t.checkpoint, t.seed) for t in history.trials}
+        return any(t.trial_id in selecting or (t.checkpoint, t.seed) in selecting
+                   for t in baseline.trials)
+
+    def preselect(self, *, recovery_candidates, retention_candidates, train_package_identities,
+                  split_registry, recovery_tasks, retention_tasks, seed, target_ability_id=None,
+                  ability_task_refs=(), oversample=2):
+        """History-only stage: pick the tasks that deserve a fresh baseline measurement.
+
+        Measuring a baseline costs real Service rollouts, so only a bounded shortlist
+        (``oversample`` times the requested count, ability-linked failures first) gets
+        one. ``freeze`` then samples from the shortlist whose fresh baselines are valid.
+        """
+        if type(seed) is not int or seed < 0:
+            raise ValueError("non-negative integer sampling seed required")
+        if (type(recovery_tasks) is not int or recovery_tasks < 1 or type(retention_tasks) is not int
+                or retention_tasks < 1 or type(oversample) is not int or oversample < 1):
+            raise ValueError("positive task counts and oversampling factor required")
+        linked = frozenset(ability_task_refs)
+
+        def latest(candidates, purpose, excluded):
+            best = {}
+            for history in candidates:
+                if self._history_rejection(history, purpose, split_registry, excluded) is None:
+                    old = best.get(history.task_ref)
+                    if old is None or history.observed_at > old.observed_at:
+                        best[history.task_ref] = history
+            return sorted(best.values(), key=lambda row: row.task_ref)
+
+        recovery = latest(recovery_candidates, DataPurpose.RECOVERY_FEEDBACK, train_package_identities)
+        rng = random.Random(seed ^ 0xBA5E11)
+        first = [row for row in recovery if row.task_ref in linked]
+        rest = [row for row in recovery if row.task_ref not in linked]
+        want = recovery_tasks * oversample
+        chosen_recovery = rng.sample(first, min(want, len(first)))
+        chosen_recovery += rng.sample(rest, min(want - len(chosen_recovery), len(rest)))
+        retention = latest(retention_candidates, DataPurpose.RETENTION_FEEDBACK,
+                           tuple(train_package_identities) + tuple(r.identity for r in chosen_recovery))
+        chosen_retention = random.Random(seed ^ 0x5EED5EED).sample(
+            retention, min(retention_tasks * oversample, len(retention)))
+        return tuple(chosen_recovery), tuple(chosen_retention)
+
     def _eligible(self, candidates, probe_purpose, checkpoint, protocol_digest,
                   registry, excluded_identities, current_baselines):
         rows, rejected, history_by_task = [], {}, {}
         def reject(reason): rejected[reason] = rejected.get(reason, 0) + 1
         for history in candidates:
-            if not isinstance(history, TaskEvidenceRecord):
-                reject("not_task_evidence"); continue
-            if history.purpose is not DataPurpose.BANK_CANDIDATE:
-                reject("wrong_purpose"); continue
-            if history.identity.split is Split.TEST:
-                reject("final_test_candidate"); continue
-            state = history.state(success_threshold=self.success_threshold,
-                              failure_threshold=self.failure_threshold)
-            target = (CapabilityState.ACTIVE_WEAKNESS
-                      if probe_purpose is DataPurpose.RECOVERY_FEEDBACK
-                      else CapabilityState.MASTERED_CANDIDATE)
-            if state is not target:
-                reject("outside_capability_threshold"); continue
-            if not registry.contains(history.identity):
-                reject("identity_not_registered"); continue
-            if self.record_verifier.verify_record(history) is not True:
-                reject("historical_evidence_unverified"); continue
-            if any(trial.valid and trial.evidence_level is not EvidenceLevel.REAL_SERVICE
-                   for trial in history.trials):
-                if not self.allow_nonreal:
-                    reject("historical_evidence_not_real"); continue
-            total = len(history.trials)
-            if total == 0 or history.valid_trials / total < self.min_valid_fraction:
-                reject("historical_valid_fraction"); continue
-            if any(history.identity.overlaps_under(other, registry.policy_version)
-                   for other in excluded_identities):
-                reject("training_overlap"); continue
+            reason = self._history_rejection(history, probe_purpose, registry, excluded_identities)
+            if reason is not None:
+                reject(reason); continue
 
+            # The baseline must be measured separately from the trials that selected the
+            # task. There is deliberately no fallback to the historical record itself.
             baseline = current_baselines.get(history.task_ref)
-            if baseline is None and history.checkpoint == checkpoint and history.protocol_digest == protocol_digest:
-                baseline = history
             if baseline is None:
                 reject("current_checkpoint_baseline_missing"); continue
+            if baseline is history or self._shares_measurement(history, baseline):
+                reject("baseline_reuses_selection_sample"); continue
             if (baseline.task_ref != history.task_ref or baseline.identity != history.identity
                     or baseline.purpose is not DataPurpose.BANK_CANDIDATE):
                 reject("current_baseline_task_identity_mismatch"); continue

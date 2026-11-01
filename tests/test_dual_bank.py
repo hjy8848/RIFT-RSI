@@ -90,6 +90,18 @@ class AcceptRecordEvidence:
         return isinstance(record, TaskEvidenceRecord) and bool(record.trials)
 
 
+def baselines_of(rows):
+    """Independently measured baselines: same outcomes, but new trial IDs and seeds.
+
+    A baseline may not be the trials that selected the task (regression to the
+    mean), so fixtures that stand in for a fresh measurement must look like one.
+    """
+    from dataclasses import replace
+    return [replace(row, observed_at='fresh-baseline', trials=tuple(
+        replace(trial, trial_id=trial.trial_id + '-baseline', seed=trial.seed + 5000)
+        for trial in row.trials)) for row in rows.values()]
+
+
 class AcceptProbeEvidence:
     def verify_probe_trial(self, trial, probe, checkpoint):
         return trial.task_ref == probe.task_ref and trial.checkpoint == checkpoint
@@ -176,7 +188,8 @@ def test_random_probe_freeze_is_reproducible_private_and_instance_disjoint(tmp_p
         retention_candidates=[rows['retention-a'], rows['retention-b'], rows['retention-c']],
         train_package_identities=(training,),
         split_registry=registry, before_checkpoint=BEFORE, recovery_tasks=1,
-        retention_tasks=1, seed=0, protocol_ref='protocol-v1', protocol_digest=bootstrap.protocol_digest)
+        retention_tasks=1, seed=0, protocol_ref='protocol-v1', protocol_digest=bootstrap.protocol_digest,
+        current_baseline_candidates=baselines_of(rows))
     recovery1, retention1 = selector.freeze(**args, frozen_at_ns=1)
     recovery2, retention2 = selector.freeze(**args, frozen_at_ns=99)
     assert recovery1.content_digest == recovery2.content_digest
@@ -205,7 +218,8 @@ def test_scripted_probe_runner_persists_trials_but_cannot_claim_learning_reward(
         retention_candidates=[records['retention-a'], records['retention-b']],
         train_package_identities=(training,),
         split_registry=registry, before_checkpoint=BEFORE, recovery_tasks=1,
-        retention_tasks=1, seed=3, protocol_ref='protocol-v1', protocol_digest=bootstrap.protocol_digest)
+        retention_tasks=1, seed=3, protocol_ref='protocol-v1', protocol_digest=bootstrap.protocol_digest,
+        current_baseline_candidates=baselines_of(records))
     evaluator = ScriptedAfterEvaluator()
     runner = ProbeRunner(evaluator, AcceptProbeEvidence())
     recovery_before, retention_before = runner.baseline(recovery), runner.baseline(retention)
@@ -297,7 +311,8 @@ def test_dual_bank_loop_freeze_baseline_and_restore(tmp_path):
         retention_candidates=[rows['retention-a'], rows['retention-b']],
         train_package_identities=(training,),
         split_registry=registry, before_checkpoint=BEFORE, recovery_tasks=1,
-        retention_tasks=1, seed=4, protocol_ref='protocol-v1', protocol_digest=bootstrap.protocol_digest)
+        retention_tasks=1, seed=4, protocol_ref='protocol-v1', protocol_digest=bootstrap.protocol_digest,
+        current_baseline_candidates=baselines_of(rows))
     runner = ProbeRunner(ScriptedAfterEvaluator(), AcceptProbeEvidence())
     recovery_before, retention_before = runner.baseline(recovery), runner.baseline(retention)
     tokens = Tokens((1,), (2,), (True,))
@@ -343,7 +358,8 @@ def test_mock_coordinator_persists_frozen_probes_and_resumes_before_training(tmp
             train_package_identities=(training,), split_registry=registry,
             before_checkpoint=BEFORE, recovery_tasks=1, retention_tasks=1,
             seed=31, protocol_ref='protocol-v1',
-            protocol_digest=bootstrap.protocol_digest)
+            protocol_digest=bootstrap.protocol_digest,
+            current_baseline_candidates=baselines_of(rows))
     runner = ProbeRunner(ScriptedAfterEvaluator(), AcceptProbeEvidence())
     tokens = Tokens((7,), (8,), (True,))
     rollouts = tuple(service_rollout(tokens, BEFORE, training.task, f'ep-{i}',

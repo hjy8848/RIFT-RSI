@@ -45,6 +45,28 @@ Ability Registry 不改变双池 Reward 公式，不添加能力数量、置信�
 8. 把 `R` 绑定 Designer 原始 on-policy Token、结构化能力选择、包 ID、目标 ability、Service update、两个冻结 Probe、Checkpoint 和预算。对应 ability 追加真实更新与 Recovery/Retention 评测历史。默认采用 `sequential_curriculum`：每个包从当前 θ 更新，不伪造同起点 GRPO 组；Designer 使用带显式标量基线、不开 batch whitening 的 `reinforce_baseline`。若要用 GRPO，必须执行 matched-baseline 候选并共享 θ_before、冻结 Probe、协议和预算。
 9. 完成本轮证据持久化后，更新后续候选池；Recovery/Retention 具体题面仍不向 Designer 暴露。最终 TEST 永不产生 Designer Reward。
 
+## 基线必须独立于选择样本（均值回归）
+
+Recovery 任务因"几次试验碰巧失败"入选，Retention 任务因"几次试验碰巧成功"入选。如果把**同一批试验**再当作冻结的"更新前基线"，任何新的重测都会向均值回归：Recovery 看起来在进步，Retention 看起来在遗忘，而策略其实没有变化。旧实现里 Bootstrap 记录和更新后探针记录都会写入证据存储，下一轮的基线查找又把它们读出来当基线，所以偏差每一轮都会出现。
+
+在真实管线上做零更新对照（60 轮，策略不变，更新后的输出完全不同）：
+
+| 做法 | Recovery 平均提升 | Retention 平均变化 |
+| --- | --- | --- |
+| 旧：选择样本当基线 | +0.111 | 约 −0.1（模拟） |
+| 新：独立重测基线 | −0.016（标准误 0.012） | +0.010（标准误 0.013） |
+
+现在的规则（`ProbeSelector` 强制，`ProductionPlanFactory` 执行）：
+
+1. **选择只看历史。** `preselect()` 仅用历史记录挑出略多于所需的候选（`oversample=2`，能力关联的失败任务优先）。
+2. **基线另测。** 只给候选在当前检查点重测基线，种子与 Bootstrap、以往探针的种子域分离（`rift-probe-baseline-v1`），结果存入独立的 `probe-baselines/` 证据存储。
+3. **不再回退。** 没有单独基线就拒绝该任务，不会用历史记录代替；基线与历史共享任何试验（相同试验 ID 或相同检查点与种子）则以 `baseline_reuses_selection_sample` 拒绝。旧检查点上的历史记录配新检查点上的基线是合法的独立样本。
+4. 之后的更新后探针仍沿用基线的种子，配对设计不变。
+
+代价：每轮要为候选多跑基线，生产默认配置约 (16+16)×2×5 = 320 个 Episode；把 `oversample` 调为 1 可减半，但被选中的任务若基线无效就没有备选。
+
+这条修复只消除了**选择偏差**，没有提高统计功效：单轮奖励的噪声仍与可能的真实提升同量级，见 `IMPLEMENTATION_STATUS.md`。
+
 ## 数据分区与策略版本
 
 任务用途为 `TRAIN`、`BANK_CANDIDATE`、`REPLAY_LOGP_FEEDBACK`、`VALIDATION`、`TEST`；Recovery 和 Retention 是 Probe 快照角色，不再分割来源任务。现有 `Split` 语义保持不变，`Identity.purpose` 用于任务来源。`strict_family_disjoint_v1` 按 World、Task、Family 或 Lineage 判定跨 split 冲突；`instance_disjoint_within_family_v1` 允许不同任务实例共享宽泛 family，但仍隔离 World、Task 和 source lineage。
