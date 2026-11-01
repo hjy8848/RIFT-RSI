@@ -153,6 +153,9 @@ Phase 3 覆盖（每个新操作）：成功路径；规则不满足；越权（
 
 ## 9. Git
 
-- 分支 `phase3-business-types`，基于 `master@82b95d9`，已本地提交（提交哈希见 `git log`）。
-- **推送状态：未推送。** 本机没有已登录的 GitHub 凭据，且推送会改动远程仓库，需要你确认后再做。
+- 分支 `phase3-business-types`，基于 `master@82b95d9`，代码提交 `0da444a`（`git log` 可查）。
+- **推送状态：已推送**到 `origin/phase3-business-types`（新分支，`master` 未改动）。
+  GitHub 提示仓库已迁移到 `https://github.com/hjy8848/RIFT-RSI.git`，旧地址目前仍可推送；
+  可在 `https://github.com/hjy8848/RIFT-RSI/pull/new/phase3-business-types` 创建 PR。
+- 本文件在代码提交之后只修改了这一节（推送状态）。
 - 工作区未改动、未清理任何用户文件；测试用 Python / uv 装在 `C:\reallab\.tools`、`.venv`（已被忽略，不在提交里）。
