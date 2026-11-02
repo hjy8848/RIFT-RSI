@@ -87,6 +87,28 @@ class NativeCaptureStore:
             raise ValueError('stored native Episode hash does not match its reference')
         return episode
 
+    def _paths_for_rollout(self, rollout_id):
+        """Files holding ``rollout_id``, found through an index that reads each file once.
+
+        Looking a rollout up used to parse every stored Episode for every request, so a
+        round took time proportional to everything captured before it (quadratic over a
+        run: 20 s of overhead in round 1, 85 s by round 6). Stored files never change, so
+        each is read once and later lookups only read the files that appeared since.
+        """
+        index = self.__dict__.setdefault('_rollout_paths', {})
+        seen = self.__dict__.setdefault('_indexed_files', set())
+        for path in self.root.glob('*.json'):
+            if path.name in seen:
+                continue
+            try:
+                raw = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError) as exc:
+                raise ValueError(f'capture store contains unreadable evidence: {path.name}') from exc
+            seen.add(path.name)
+            if raw.get('rollout_id') is not None:
+                index.setdefault(raw['rollout_id'], []).append(path)
+        return tuple(index.get(rollout_id, ()))
+
     def resolve_rollout(self, rollout_id, checkpoint):
         """Recover one previously captured deterministic rollout after interruption."""
         if not isinstance(rollout_id, str) or not rollout_id:
@@ -94,13 +116,8 @@ class NativeCaptureStore:
         if not self.root.exists():
             return None
         matches = []
-        for path in self.root.glob('*.json'):
-            try:
-                raw = json.loads(path.read_text(encoding='utf-8'))
-            except (OSError, ValueError) as exc:
-                raise ValueError(f'capture store contains unreadable evidence: {path.name}') from exc
-            if raw.get('rollout_id') != rollout_id:
-                continue
+        for path in self._paths_for_rollout(rollout_id):
+            raw = json.loads(path.read_text(encoding='utf-8'))
             episode = self.resolve_episode(raw.get('episode_id'))
             if (Checkpoint(**raw['checkpoint']) != checkpoint
                     or not self.verify_trajectory(episode, checkpoint)):
