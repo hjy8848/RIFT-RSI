@@ -127,7 +127,8 @@ class TrainRehearsal(unittest.TestCase):
                         rows.append(service_rollout(tokens, checkpoint, group.task_ref, episode.record_hash,
                                                     outcome, group.group_id, response_id=episode.record_hash))
                 request = UpdateRequest(checkpoint, package.package_id, tuple(rows), 'grpo')
-                return request, package.record_service_request(request)
+                record = getattr(package, 'record_service_request', None)
+                return request, (record(request) if record is not None else None)
         return Collector
 
     def test_a_run_can_start_from_another_runs_base_checkpoint(self):
@@ -162,6 +163,36 @@ class TrainRehearsal(unittest.TestCase):
             self.assertEqual(sorted(path.name for path in steps.iterdir()), ['global-step-00000003'])
             self.assertEqual({cp.revision for cp in context.checkpoint_store.virtual}, {'1', '2'})
             self.assertEqual(result['final_checkpoint']['revision'], '3')
+
+    def test_pool_training_runs_rounds_from_single_task_worlds_without_a_package(self):
+        from rift.runtime.ascend_910b3 import CHAT_TEMPLATE_KWARGS   # noqa: F401  (import path check)
+        with tempfile.TemporaryDirectory() as root:
+            self._initial(root)
+            FakeRuntime.opened = []
+            context = run.ExperimentContext(root=root, service_model='m', verl_config_dir='.',
+                episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6),
+                runtime_factory=lambda checkpoint: FakeRuntime(context, checkpoint), persist_every=0)
+            context._worker_manifest = lambda checkpoint: None
+            collector = self._collector(context)
+            result = run.train_pool(context,
+                train_specs=[{'family': 'F1', 'knobs': {'distractor_orders': 3}, 'instances': 6, 'seed': 7100},
+                             {'family': 'F2', 'knobs': {'purchased_quantity': 5, 'refund_quantity': 2},
+                              'instances': 6, 'seed': 7200}],
+                rounds=3, tasks_per_round=4, seed=11,
+                collector_factory=lambda loaded, index: collector(loaded, index))
+            self.assertEqual(result['rounds'], 3)
+            self.assertEqual(len(FakeRuntime.opened), 1)
+            self.assertEqual(result['final_checkpoint']['revision'], '3')
+            steps = Path(root) / 'checkpoints' / 'service'
+            self.assertEqual(sorted(path.name for path in steps.iterdir()), ['global-step-00000003'])
+            rows = [json.loads(line) for line in (Path(root) / 'rounds.jsonl').read_text(
+                encoding='utf-8').splitlines()]
+            self.assertEqual([row['round'] for row in rows], [0, 1, 2])
+            self.assertEqual(sorted(rows[0]['train_success']), ['F1:{"distractor_orders":3}',
+                'F2:{"purchased_quantity":5,"refund_quantity":2}'])
+            self.assertEqual(rows[0]['rollouts'], 16)               # 4 tasks x 4 samples
+            with self.assertRaises(FileExistsError):                # a finished run is not overwritten
+                run.train_pool(context, train_specs=[], rounds=1, tasks_per_round=2, seed=1)
 
     def test_a_new_process_cannot_resume_from_an_in_memory_version(self):
         from rift.schemas import Checkpoint

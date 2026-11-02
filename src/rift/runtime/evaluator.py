@@ -221,6 +221,11 @@ class ProductionServiceRolloutCollector:
         self.episode_resolver = episode_resolver or capture_store.resolve_episode
         self.metric_sink, self.round_index = metric_sink, round_index
 
+    def _build_update(self, package, episodes, checkpoint):
+        """Turn the group episodes into a GRPO update request (overridable for plain task pools)."""
+        return prepare_package_service_update(
+            package, self.task_registry, episodes, checkpoint, self.capture_store)
+
     def collect(self, package, checkpoint):
         from rift.verl.sampling import rollout_seed
         requests, request_to_group = [], {}
@@ -330,8 +335,7 @@ class ProductionServiceRolloutCollector:
             self.metric_sink('service_tokens_per_second',
                 generated_tokens / rollout_seconds if rollout_seconds > 0 else 0.0,
                 round_index=self.round_index, source='newly_generated_rollouts')
-        request, recorded_package = prepare_package_service_update(
-            package, self.task_registry, episodes, checkpoint, self.capture_store)
+        request, recorded_package = self._build_update(package, episodes, checkpoint)
         if self.metric_sink is not None:
             grouped = {}
             for row in request.rollouts:

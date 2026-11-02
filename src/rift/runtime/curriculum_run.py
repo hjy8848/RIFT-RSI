@@ -480,6 +480,102 @@ def train(context, *, policy_name, arms, bench_specs, rounds, seed, package_conf
             'observations': [asdict(item) for item in history], 'run_root': str(context.root)}
 
 
+class PoolGroup:
+    def __init__(self, task_ref, group_id, group_size, source):
+        self.task_ref, self.group_id, self.group_size, self.source = task_ref, group_id, group_size, source
+
+
+class PoolBatch:
+    """The tasks of one round, drawn straight from certified single-task worlds.
+
+    It has only what the rollout collector reads (ids, seed, groups); no Designer world,
+    bandit or training package is involved.
+    """
+    def __init__(self, package_id, groups, sampling_seed):
+        self.package_id, self.task_groups, self.sampling_seed = package_id, tuple(groups), sampling_seed
+
+    @property
+    def task_refs(self):
+        return tuple(group.task_ref for group in self.task_groups)
+
+
+def _pool_collector(context, checkpoint, index):
+    from rift.runtime.evaluator import ProductionServiceRolloutCollector
+    from rift.training.service_data import prepare_service_trajectory_update
+
+    class PoolCollector(ProductionServiceRolloutCollector):
+        def _build_update(self, package, episodes, loaded):
+            request = prepare_service_trajectory_update(package.package_id, set(package.task_refs),
+                episodes, loaded, self.capture_store, algorithm='grpo', allow_partial_groups=True)
+            return request, None
+
+    return PoolCollector(LazyBatch(context, checkpoint), task_registry=context.world.task_registry,
+        capture_store=context.capture_store, metric_sink=context.metric_sink, round_index=index)
+
+
+def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from_run=None,
+               collector_factory=None):
+    """Plain GRPO on a fixed pool of certified tasks, a balanced sample of it every round.
+
+    No curriculum, Designer or training package: the experiment this serves (X2) only asks
+    whether the success rate rises. The checkpoint is written after the last round only
+    (see ``--persist-every``); a crashed run starts again.
+    """
+    import random
+    import time
+    rounds_path = context.root / 'rounds.jsonl'
+    if rounds_path.exists():
+        raise FileExistsError('this run directory already trained; use a new one')
+    context.total_rounds = rounds
+    if init_from_run and not (context.root / 'initial-checkpoint.json').exists():
+        checkpoint = context.adopt_initial_from(init_from_run)
+    else:
+        checkpoint = context.initial_checkpoint()
+    by_key = context.world.certify_specs(train_specs)
+    context.world.save()
+    keys = sorted(by_key)
+    if tasks_per_round % len(keys) or any(len(by_key[key]) < tasks_per_round // len(keys) for key in keys):
+        raise ValueError('tasks per round must split evenly over the classes and fit their pools')
+    per_key = tasks_per_round // len(keys)
+    make_collector = collector_factory or (lambda loaded, index: _pool_collector(context, loaded, index))
+    history = []
+    try:
+        for index in range(rounds):
+            started = time.perf_counter()
+            rng = random.Random(seed + index)
+            groups = []
+            for key in keys:
+                for ref in rng.sample(by_key[key], per_key):
+                    groups.append(PoolGroup(ref, sha256(('rift-pool-group-v1:%d:%s' % (index, ref)).encode()
+                                                        ).hexdigest()[:32], context.group_size, key))
+            batch = PoolBatch('pool-%06d-%s' % (index, sha256(
+                '|'.join(group.task_ref for group in groups).encode()).hexdigest()[:12]), groups, seed + index)
+            request, _ = make_collector(checkpoint, index).collect(batch, checkpoint)
+            source = {group.group_id: group.source for group in groups}
+            rewards = {}
+            for row in request.rollouts:
+                rewards.setdefault(source[row.group_id], []).append(row.reward)
+            sampled = time.perf_counter()
+            update = RoundBackend(context, index, checkpoint).train(request)
+            checkpoint = update.policy_after
+            row = {'round': index, 'revision': checkpoint.revision,
+                   'train_success': {key: sum(values) / len(values) for key, values in sorted(rewards.items())},
+                   'train_success_all': sum(sum(v) for v in rewards.values()) / sum(len(v) for v in rewards.values()),
+                   'rollouts': len(request.rollouts), 'sample_seconds': round(sampled - started, 1),
+                   'update_seconds': round(time.perf_counter() - sampled, 1)}
+            history.append(row)
+            with rounds_path.open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(row, sort_keys=True) + '\n')
+    finally:
+        context.close_runtime()
+    manifest = context.latest_manifest()
+    (context.root / 'final.json').write_text(json.dumps({
+        'checkpoint': asdict(checkpoint), 'manifest': str(manifest.resolve()), 'rounds': rounds},
+        sort_keys=True), encoding='utf-8')
+    return {'status': 'pool_training_completed', 'rounds': rounds, 'final_checkpoint': asdict(checkpoint),
+            'history': history, 'run_root': str(context.root)}
+
+
 def build_eval_requests(by_key, checkpoint, *, groups, group_size, seed, label):
     """Train-mode GRPO groups on frozen tasks; the update step is never run."""
     from rift.runtime.evaluator import checkpoint_json
@@ -582,6 +678,19 @@ def main(argv=None):
         help='an earlier run directory whose base checkpoint to start from (skips writing a new one)')
     train_parser.add_argument('--restart-each-round', action='store_true',
         help='tear the NPU runtime down after every update (slow; the default keeps it up)')
+    pool_parser = sub.add_parser('train-pool', help='plain GRPO on a fixed pool of tasks (X2)')
+    _common(pool_parser)
+    pool_parser.add_argument('--train-specs', required=True, help='JSON list of task specs; inline or file')
+    pool_parser.add_argument('--rounds', type=int, required=True)
+    pool_parser.add_argument('--tasks-per-round', type=int, default=16)
+    pool_parser.add_argument('--group-size', type=int, default=4)
+    pool_parser.add_argument('--mini-batch-size', type=int, default=16)
+    pool_parser.add_argument('--epochs', type=int, default=1)
+    pool_parser.add_argument('--learning-rate', type=float, default=1e-6)
+    pool_parser.add_argument('--response-length', type=int, default=12288)
+    pool_parser.add_argument('--persist-every', type=int, default=0)
+    pool_parser.add_argument('--init-from-run')
+    pool_parser.add_argument('--restart-each-round', action='store_true')
     eval_parser = sub.add_parser('eval', help='evaluate a frozen checkpoint without updating it')
     _common(eval_parser)
     eval_parser.add_argument('--specs', help='JSON list of {family, knobs, instances, seed}; inline or file')
@@ -606,6 +715,13 @@ def main(argv=None):
             arms=load_json_argument(args.arms) if args.arms else list(DEFAULT_ARMS),
             bench_specs=load_json_argument(args.bench_specs) if args.bench_specs else list(DEFAULT_BENCH),
             package_config=package_config, window=args.window, fixed_family=args.fixed_family,
+            init_from_run=args.init_from_run)
+    elif args.command == 'train-pool':
+        budget = UpdateBudget(args.mini_batch_size, args.epochs, args.learning_rate)
+        context = _context(args, budget, args.group_size, response_length=args.response_length,
+                           keep_runtime=not args.restart_each_round, persist_every=args.persist_every)
+        result = train_pool(context, train_specs=load_json_argument(args.train_specs),
+            rounds=args.rounds, tasks_per_round=args.tasks_per_round, seed=args.seed,
             init_from_run=args.init_from_run)
     else:
         context = _context(args, UpdateBudget(WORLD_SIZE, 1, 1e-6), args.group_size,
