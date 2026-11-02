@@ -1,0 +1,4 @@
+[
+  {"family_id": "F1", "knobs": {"distractor_orders": 3}},
+  {"family_id": "F2", "knobs": {"purchased_quantity": 5, "refund_quantity": 2}}
+]

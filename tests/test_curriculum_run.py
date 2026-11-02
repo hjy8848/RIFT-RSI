@@ -151,6 +151,18 @@ class X1ConfigTests(unittest.TestCase):
         from usami_v2.runtime.runner import EpisodeBudget
         EpisodeBudget.model_validate(run.load_json_argument('configs/experiments/x1_budget.json'))
 
+    def test_shipped_smoke_arms_and_bench_fit_a_small_round(self):
+        from rift.evolution.curriculum import Selection
+        from rift.training.package import TrainingPackageConfig
+        config = TrainingPackageConfig(tasks_per_round=8, sampling_seed=2000, group_size=4)
+        arms = run.load_json_argument('configs/experiments/smoke_arms.json')
+        bench = run.parse_task_specs(run.load_json_argument('configs/experiments/smoke_bench.json'))
+        selections = [Selection(row['family_id'], row['knobs'], config.designer_task_count) for row in arms]
+        self.assertEqual(len({item.arm_key for item in selections}), len(selections))
+        pool_size = sum(spec['instances'] for spec in bench)
+        self.assertGreaterEqual(pool_size, config.benchmark_task_count)
+        self.assertEqual(config.designer_task_count * config.group_size % 8, 0)   # whole mini-batches
+
     def test_eval_run_offers_its_initial_checkpoint(self):
         from types import SimpleNamespace
         from usami_v2.runtime.runner import EpisodeBudget

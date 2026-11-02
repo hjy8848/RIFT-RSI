@@ -561,6 +561,8 @@ def main(argv=None):
     train_parser.add_argument('--mini-batch-size', type=int, default=WORLD_SIZE)
     train_parser.add_argument('--epochs', type=int, default=1)
     train_parser.add_argument('--learning-rate', type=float, default=1e-6)
+    train_parser.add_argument('--response-length', type=int, default=12288,
+        help='VERL aborts the whole round when one episode outgrows this')
     train_parser.add_argument('--init-from-run',
         help='an earlier run directory whose base checkpoint to start from (skips writing a new one)')
     train_parser.add_argument('--restart-each-round', action='store_true',
@@ -583,7 +585,8 @@ def main(argv=None):
         budget = UpdateBudget(args.mini_batch_size, args.epochs, args.learning_rate)
         package_config = TrainingPackageConfig(tasks_per_round=args.tasks_per_round,
             sampling_seed=args.seed, group_size=args.group_size)
-        context = _context(args, budget, args.group_size, keep_runtime=not args.restart_each_round)
+        context = _context(args, budget, args.group_size, response_length=args.response_length,
+                           keep_runtime=not args.restart_each_round)
         result = train(context, policy_name=args.policy, rounds=args.rounds, seed=args.seed,
             arms=load_json_argument(args.arms) if args.arms else list(DEFAULT_ARMS),
             bench_specs=load_json_argument(args.bench_specs) if args.bench_specs else list(DEFAULT_BENCH),
