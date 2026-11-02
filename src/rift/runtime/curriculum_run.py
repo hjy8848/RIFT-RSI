@@ -15,7 +15,7 @@ import json
 import math
 from pathlib import Path
 
-WORLD_SIZE = 8
+from rift.runtime.ascend_910b3 import CHAT_TEMPLATE_KWARGS, WORLD_SIZE
 DEFAULT_ARMS = ({'family_id': 'F1', 'knobs': {}}, {'family_id': 'F4', 'knobs': {'age_days': 20}})
 DEFAULT_BENCH = ({'family': 'F1', 'knobs': {}, 'instances': 8, 'seed': 1000000},
                  {'family': 'F4', 'knobs': {'age_days': 20}, 'instances': 8, 'seed': 1001000})
@@ -255,6 +255,7 @@ class ExperimentContext:
             'tool_profile': self.tool_profile,
             'service_profile': service_profile_descriptor(self.tool_profile),
             'parser_format': 'hermes', 'usami_mode': 'reference',
+            'chat_template_kwargs': dict(CHAT_TEMPLATE_KWARGS),
         }, sort_keys=True, indent=2), encoding='utf-8')
         return path
 

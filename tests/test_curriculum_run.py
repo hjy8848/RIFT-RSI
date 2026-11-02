@@ -1,4 +1,4 @@
-import json
+﻿import json
 import sys
 import tempfile
 import unittest
@@ -140,6 +140,11 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(update.run_id, run.run_id_for(0))
 
 
+class ChatTemplateTests(unittest.TestCase):
+    def test_runs_use_the_non_thinking_template(self):
+        self.assertEqual(run.CHAT_TEMPLATE_KWARGS, {'enable_thinking': False})
+
+
 class BackendBudgetTests(unittest.TestCase):
     def test_backend_reports_the_shared_budget(self):
         from types import SimpleNamespace
@@ -150,3 +155,4 @@ class BackendBudgetTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

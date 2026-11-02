@@ -134,6 +134,12 @@ def _learning_rate_readback_matches(row, learning_rate, *, version, commit):
     return True
 
 
+# Qwen3 is a hybrid model whose chat template thinks by default. RIFT trains and
+# evaluates the non-thinking mode so replies reaching the customer never carry
+# <think> text; VERL forwards these kwargs to every chat-template render.
+CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
+
+
 def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
                  group_size=4, prompt_length=4096, response_length=8192, learning_rate=1.0e-6):
     """Compose the installed VERL v0.9.1 defaults and apply the RIFT target config."""
@@ -182,6 +188,7 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.rollout.response_length = response_length
     config.data.max_prompt_length = prompt_length
     config.data.max_response_length = response_length
+    config.data.apply_chat_template_kwargs = dict(CHAT_TEMPLATE_KWARGS)
     config.algorithm.adv_estimator = "grpo" if role == "service" else "reinforce_plus_plus"
     config.algorithm.use_kl_in_reward = False
     config.critic.enable = False
