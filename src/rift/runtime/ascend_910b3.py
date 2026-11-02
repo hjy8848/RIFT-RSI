@@ -372,7 +372,7 @@ class Ascend910B3RoleRuntime:
                  checkpoint_store, serving_attestor, agent_loop_config=None,
                  worker_manifest_path=None, open_agent_loop=False,
                  backend_bindings=None, initialize_vllm=True, service_update=None,
-                 tool_profile='full9', evaluation_protocol=None):
+                 tool_profile='full9', evaluation_protocol=None, response_length=8192):
         if role not in ("service", "designer"):
             raise ValueError("Ascend policy role must be Service or Designer")
         if open_agent_loop and (role != "service" or agent_loop_config is None):
@@ -407,7 +407,7 @@ class Ascend910B3RoleRuntime:
         if checkpoint is not None and checkpoint_store.verify(checkpoint) is not True:
             raise ValueError(f"{role} checkpoint failed full shard verification")
         self.config = _verl_config(role, self.model_path, run_root=self.run_root,
-            agent_loop_config=agent_loop_config,
+            agent_loop_config=agent_loop_config, response_length=response_length,
             learning_rate=self.service_update.get("learning_rate", 1.0e-6))
         self._start_time = time.perf_counter()
         _start_ray(self.config, self.run_root,

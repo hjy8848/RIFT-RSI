@@ -143,11 +143,12 @@ class WorldKit:
 class ExperimentContext:
     """Checkpoint/attestation stores shared by every runtime of one run directory."""
     def __init__(self, *, root, service_model, verl_config_dir, episode_budget, update_budget,
-                 tool_profile='full9', runtime_factory=None, group_size=4):
+                 tool_profile='full9', runtime_factory=None, group_size=4, response_length=8192):
         from rift.verl.checkpoints import FSDPCheckpointStore
         self.root, self.service_model = Path(root).resolve(), str(service_model)
         self.verl_config_dir, self.episode_budget = Path(verl_config_dir), episode_budget
         self.update_budget, self.tool_profile, self.group_size = update_budget, tool_profile, group_size
+        self.response_length = response_length
         self.runtime_factory = runtime_factory or self._ascend_runtime
         for name in ('task_registry', 'checkpoints', 'episodes', 'generations', 'serving', 'updates'):
             (self.root / name).mkdir(parents=True, exist_ok=True)
@@ -276,7 +277,7 @@ class ExperimentContext:
             serving_attestor=self.serving_attestor,
             agent_loop_config=self.verl_config_dir / 'agent_loop.yaml',
             worker_manifest_path=self._worker_manifest(checkpoint), open_agent_loop=True,
-            tool_profile=self.tool_profile,
+            tool_profile=self.tool_profile, response_length=self.response_length,
             service_update={'mini_batch_size': self.update_budget.mini_batch_size,
                             'epochs': self.update_budget.epochs,
                             'learning_rate': self.update_budget.learning_rate})
@@ -492,14 +493,15 @@ def _common(parser):
     parser.add_argument('--seed', type=int, default=2000)
 
 
-def _context(args, update_budget, group_size):
+def _context(args, update_budget, group_size, response_length=8192):
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.runtime.ascend_910b3 import _default_smoke_episode_budget
     budget = (EpisodeBudget.model_validate(json.loads(Path(args.episode_budget_config).read_text(encoding='utf-8')))
               if args.episode_budget_config else _default_smoke_episode_budget())
     return ExperimentContext(root=args.run_root, service_model=args.service_model,
         verl_config_dir=args.verl_config_dir, episode_budget=budget,
-        update_budget=update_budget, tool_profile=args.tool_profile, group_size=group_size)
+        update_budget=update_budget, tool_profile=args.tool_profile, group_size=group_size,
+        response_length=response_length)
 
 
 def main(argv=None):
@@ -526,6 +528,8 @@ def main(argv=None):
     eval_parser.add_argument('--group-size', type=int, default=4)
     eval_parser.add_argument('--from-run', help='train run directory whose final.json supplies the checkpoint')
     eval_parser.add_argument('--label', default='x0')
+    eval_parser.add_argument('--response-length', type=int, default=20480,
+        help='VERL aborts the whole batch when one episode outgrows this, so evaluation is generous')
     args = parser.parse_args(argv)
     from rift.evolution.matched_control import UpdateBudget
     from rift.verl.version import require_verl_version
@@ -541,7 +545,8 @@ def main(argv=None):
             bench_specs=load_json_argument(args.bench_specs) if args.bench_specs else list(DEFAULT_BENCH),
             package_config=package_config, window=args.window, fixed_family=args.fixed_family)
     else:
-        context = _context(args, UpdateBudget(WORLD_SIZE, 1, 1e-6), args.group_size)
+        context = _context(args, UpdateBudget(WORLD_SIZE, 1, 1e-6), args.group_size,
+                           response_length=args.response_length)
         result = evaluate(context,
             specs=load_json_argument(args.specs) if args.specs else list(DEFAULT_BENCH),
             groups=args.groups, seed=args.seed, label=args.label, from_run=args.from_run)

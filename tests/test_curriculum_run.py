@@ -170,6 +170,85 @@ class X1ConfigTests(unittest.TestCase):
             self.assertEqual(adopted, [Path(source) / 'checkpoints' / 'initial.json'])
 
 
+class EvaluateRehearsalTests(unittest.TestCase):
+    """Run evaluate() end to end with a fake runtime, as a rehearsal for the NPU host."""
+    def _source_run(self, root):
+        """A finished eval run directory holding a real (tiny) checkpoint and manifest."""
+        from rift.verl.checkpoints import FSDPCheckpointStore
+        directory = Path(root) / 'checkpoints' / 'service-initial'
+        directory.mkdir(parents=True)
+        for kind in ('model', 'optim', 'extra_state'):
+            for rank in range(8):
+                (directory / f'{kind}_world_size_8_rank_{rank}.pt').write_bytes(b'w' * 64 + bytes([rank]))
+        store = FSDPCheckpointStore({}, world_size=8)
+        checkpoint = store.publish('service', '0', 'tok', directory)
+        store.save_manifest(Path(root) / 'checkpoints' / 'initial.json')
+        from dataclasses import asdict
+        (Path(root) / 'initial-checkpoint.json').write_text(json.dumps(asdict(checkpoint)), encoding='utf-8')
+        return checkpoint
+
+    def test_every_request_is_sent_once_and_outcomes_are_counted(self):
+        from usami_v2.runtime.runner import EpisodeBudget
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as root:
+            checkpoint = self._source_run(source)
+            calls = []
+
+            class FakeRuntime:
+                def __init__(self, loaded):
+                    self.checkpoint, self.closed = loaded, False
+                    self.service_batch = self
+
+                def generate(self, requests):
+                    calls.append(len(requests))
+                    return tuple({'rift_request_id': row['rift_request_id'],
+                                  'rift_outcome': 'SUCCESS' if index % 4 else 'FAILURE',
+                                  'rift_replay_verified': True}
+                                 for index, row in enumerate(requests))
+
+                def close(self):
+                    self.closed = True
+
+            context = run.ExperimentContext(root=root, service_model='m', verl_config_dir='.',
+                episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6),
+                runtime_factory=FakeRuntime)
+            result = run.evaluate(context,
+                specs=[{'family': 'F1', 'knobs': {}, 'instances': 3, 'seed': 77},
+                       {'family': 'F4', 'knobs': {'age_days': 20}, 'instances': 3, 'seed': 88}],
+                groups=2, seed=5, label='rehearsal', from_run=source)
+            self.assertEqual(calls, [48])            # one call: 2 specs x 3 tasks x 2 groups x 4
+            self.assertEqual(result['checkpoint']['weights_digest'], checkpoint.weights_digest)
+            for key in ('F1:{}', 'F4:{"age_days":20}'):
+                row = result['families'][key]
+                self.assertEqual((row['tasks'], row['success'] + row['failure'], row['unknown']), (3, 24, 0))
+            self.assertIsNone(context.runtime)       # the runtime was released
+
+    def test_runtime_is_released_when_generation_fails(self):
+        from usami_v2.runtime.runner import EpisodeBudget
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as root:
+            self._source_run(source)
+            runtimes = []
+
+            class Broken:
+                def __init__(self, loaded):
+                    self.checkpoint, self.closed = loaded, False
+                    self.service_batch = self
+                    runtimes.append(self)
+
+                def generate(self, requests):
+                    raise RuntimeError('vLLM went away')
+
+                def close(self):
+                    self.closed = True
+
+            context = run.ExperimentContext(root=root, service_model='m', verl_config_dir='.',
+                episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6),
+                runtime_factory=Broken)
+            with self.assertRaises(RuntimeError):
+                run.evaluate(context, specs=[{'family': 'F1', 'knobs': {}, 'instances': 1, 'seed': 9}],
+                             groups=1, seed=5, label='x', from_run=source)
+            self.assertTrue(runtimes and all(item.closed for item in runtimes))
+
+
 class ChatTemplateTests(unittest.TestCase):
     def test_runs_use_the_non_thinking_template(self):
         self.assertEqual(run.CHAT_TEMPLATE_KWARGS, {'enable_thinking': False})
