@@ -261,7 +261,8 @@ def service_host_provider_from_config(*, config, tokenizer, processor=None):
     import faulthandler
     import signal
     import sys
-    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
+    if hasattr(signal, "SIGUSR1"):   # absent on Windows, where only tests run
+        faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
     manifest_path = os.environ.get("RIFT_ASCEND910B3_RUN_MANIFEST")
     checkpoint_raw = os.environ.get("RIFT_ASCEND910B3_ACTIVE_CHECKPOINT")
     if not manifest_path or not checkpoint_raw:
