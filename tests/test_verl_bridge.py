@@ -486,7 +486,9 @@ def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkey
         async def generate(self, request_id, *, prompt_ids, sampling_params):
             self.i += 1
             self.sampling.append(dict(sampling_params))
-            return SimpleNamespace(token_ids=[self.i+10], log_probs=None,
+            # vLLM can report -inf for a sampled token; the real ledger below rejects it
+            # unless the Agent Loop clamps it (this once aborted a 352-episode batch).
+            return SimpleNamespace(token_ids=[self.i+10], log_probs=[float('-inf')],
                 extra_fields={'global_steps':1,'min_global_steps':1,'max_global_steps':1})
     loop.server_manager = FakeServer()
     class FakeVerifier:

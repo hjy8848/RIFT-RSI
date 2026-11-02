@@ -154,7 +154,8 @@ def __getattr__(name):
                     output = await self.server_manager.generate(request_id=model_request_id, prompt_ids=prefix,
                                                                 sampling_params=turn_sampling_params)
                     token_ids = list(output.token_ids)
-                    token_logprobs = None if output.log_probs is None else list(output.log_probs)
+                    from rift.verl.sampling import finite_logprobs
+                    token_logprobs = finite_logprobs(output.log_probs)
                     serving = dict(getattr(output, 'extra_fields', {}) or {})
                     serving_fields = {key: serving.get(key) for key in
                                       ('global_steps', 'min_global_steps', 'max_global_steps')}
