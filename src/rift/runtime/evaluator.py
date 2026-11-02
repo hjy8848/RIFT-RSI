@@ -300,9 +300,12 @@ class ProductionServiceRolloutCollector:
             from collections import Counter
             from rift.runtime.diagnose_episodes import confirmation_order_compliance, episode_metrics
             categories = Counter()
+            refusal_classes = Counter()
             for episode in episodes:
                 metrics = episode_metrics(episode)
                 categories[metrics["category"]] += 1
+                if metrics['refusal_class'] is not None:
+                    refusal_classes[metrics['refusal_class']] += 1
                 self.metric_sink('service_episode_tool_calls', metrics['tool_calls'],
                     round_index=self.round_index, task_ref=episode.task.record_hash,
                     episode_id=episode.record_hash)
@@ -317,6 +320,9 @@ class ProductionServiceRolloutCollector:
             for category, count in sorted(categories.items()):
                 self.metric_sink('service_episode_category_count', count,
                     round_index=self.round_index, category=category)
+            for refusal_class, count in sorted(refusal_classes.items()):
+                self.metric_sink('service_episode_refusal_class_count', count,
+                    round_index=self.round_index, refusal_class=refusal_class)
             self.metric_sink('service_rollout_seconds', rollout_seconds,
                 round_index=self.round_index, request_count=len(pending))
             self.metric_sink('service_generated_tokens', generated_tokens,

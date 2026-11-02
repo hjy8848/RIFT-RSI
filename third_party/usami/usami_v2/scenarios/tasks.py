@@ -711,7 +711,8 @@ def _validate_run_states(initial, final, task):
     return task
 
 
-def evaluate_state_goals(initial, final, task: TaskSpec, *, tool_executions=(), episode_status=None, events=()):
+def evaluate_state_goals(initial, final, task: TaskSpec, *, tool_executions=(), episode_status=None,
+                         events=(), include_refusal_goals=True):
     """Return only registered business-state objectives.
 
     Communication and out-of-scope settlement checks are separate so a
@@ -800,7 +801,7 @@ def evaluate_state_goals(initial, final, task: TaskSpec, *, tool_executions=(), 
             refs.extend(digest(row) for row in settlements)
         rows.append(GoalResult(goal_id=goal.goal_id, status="PASS" if ok else "FAIL", evidence_refs=tuple(refs)))
 
-    for goal in getattr(task, 'refusal_goals', ()):
+    for goal in (getattr(task, 'refusal_goals', ()) if include_refusal_goals else ()):
         lines = set(goal.line_ids)
         allowed_lines = set(delegated_line_ids(task))
         orders = {initial.lines[line_id].order_id for line_id in lines}

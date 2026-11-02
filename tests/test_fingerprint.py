@@ -24,3 +24,11 @@ def test_fingerprint_of_real_compiled_task_ignores_task_id():
     task = record.task
     changed = task.model_copy(update={'task_id': 'only-the-id-changed'})
     assert task_fingerprint(record.world, task) == task_fingerprint(record.world, changed)
+
+
+def test_fingerprint_ignores_seeded_model_and_instance_labels():
+    from rift.probes.fingerprint import _fingerprint_attributes
+
+    left = {'model': 'target_0_variant_31', 'instance': 'variant_0', 'color': 'blue'}
+    right = {'model': 'different-name_variant_32', 'instance': 'variant_1', 'color': 'blue'}
+    assert _fingerprint_attributes(left) == _fingerprint_attributes(right)

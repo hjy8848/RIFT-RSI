@@ -94,8 +94,9 @@ def _resolve(value):
 
 
 def _set_constant_learning_rate(engine, learning_rate):
-    """Apply an explicit run override after optimizer/scheduler restoration."""
+    """Apply and read back a run override after optimizer/scheduler restore."""
     from math import isfinite
+    from rift.verl.version import VERL_COMMIT, VERL_VERSION
     if isinstance(learning_rate, bool) or not isfinite(learning_rate) or learning_rate <= 0:
         raise ValueError("a positive finite learning rate is required")
     optimizer, scheduler = engine.optimizer, engine.lr_scheduler
@@ -106,7 +107,31 @@ def _set_constant_learning_rate(engine, learning_rate):
         group['initial_lr'] = learning_rate
     scheduler.base_lrs = [learning_rate] * len(optimizer.param_groups)
     scheduler._last_lr = [learning_rate] * len(optimizer.param_groups)
-    return learning_rate
+    get_last_lr = getattr(scheduler, 'get_last_lr', None)
+    readback = {
+        'optimizer_lrs': tuple(group['lr'] for group in optimizer.param_groups),
+        'optimizer_initial_lrs': tuple(group['initial_lr'] for group in optimizer.param_groups),
+        'scheduler_base_lrs': tuple(scheduler.base_lrs),
+        'scheduler_lrs': tuple(get_last_lr() if callable(get_last_lr) else scheduler._last_lr),
+        'verl_version': VERL_VERSION,
+        'verl_commit': VERL_COMMIT,
+    }
+    for name in ('optimizer_lrs', 'optimizer_initial_lrs', 'scheduler_base_lrs', 'scheduler_lrs'):
+        values = readback[name]
+        if len(values) != len(optimizer.param_groups) or any(value != learning_rate for value in values):
+            raise RuntimeError(f'learning-rate readback differs from requested value: {name}={values}')
+    return readback
+
+
+def _learning_rate_readback_matches(row, learning_rate, *, version, commit):
+    if not isinstance(row, dict) or row.get('verl_version') != version or row.get('verl_commit') != commit:
+        return False
+    for name in ('optimizer_lrs', 'optimizer_initial_lrs', 'scheduler_base_lrs', 'scheduler_lrs'):
+        values = row.get(name)
+        if (not isinstance(values, (tuple, list)) or not values
+                or any(value != learning_rate for value in values)):
+            return False
+    return True
 
 
 def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
@@ -435,6 +460,8 @@ class Ascend910B3RoleRuntime:
         class RIFTActorRolloutRefWorker(ActorRolloutRefWorker):
             @register(dispatch_mode=Dispatch.ONE_TO_ALL)
             def set_training_learning_rate(self, learning_rate):
+                from rift.verl.version import require_verl_version
+                require_verl_version()
                 return _set_constant_learning_rate(self.actor.engine, learning_rate)
 
         # Initial checkpoint creation only needs the trainable actor. VERL's
@@ -526,10 +553,13 @@ class Ascend910B3RoleRuntime:
 
     def apply_training_hyperparameters(self, role, worker_group):
         if role == 'service' and 'learning_rate' in self.service_update:
+            from rift.verl.version import VERL_COMMIT, VERL_VERSION
             value = self.service_update['learning_rate']
             results = worker_group.set_training_learning_rate(value)
-            if len(results) != WORLD_SIZE or any(item != value for item in results):
-                raise ValueError('learning-rate override was not applied on every FSDP rank')
+            if (not isinstance(results, (list, tuple)) or len(results) != WORLD_SIZE
+                    or any(not _learning_rate_readback_matches(row, value,
+                        version=VERL_VERSION, commit=VERL_COMMIT) for row in results)):
+                raise ValueError('learning-rate readback or pinned VERL identity differs on an FSDP rank')
         return True
 
     def verify_runtime(self, role, worker_group, checkpoint):
@@ -664,8 +694,7 @@ def _create_smoke_task_registry(root, *, episode_budget=None):
             build.world_hash, task.record_hash, "smoke-refund", "ascend-smoke-v1",
             Split.TRAIN, DataPurpose.TRAIN),
         proof_budget=ProofBudget(),
-        episode_budget=episode_budget or EpisodeBudget(max_customer_turns=4,
-            max_service_decisions=10, max_service_tool_calls=8, max_model_calls=10),
+        episode_budget=episode_budget or _default_smoke_episode_budget(),
         task_registry=task_registry)
     challenge = {
         "task_id": "smoke-refund-task", "customer_alias": "customer",
@@ -688,6 +717,12 @@ def _create_smoke_task_registry(root, *, episode_budget=None):
     return task_registry, split_registry, result.tasks[0]
 
 
+def _default_smoke_episode_budget():
+    from usami_v2.runtime.runner import EpisodeBudget
+    return EpisodeBudget(max_customer_turns=4, max_service_decisions=14,
+        max_service_tool_calls=10, max_model_calls=18)
+
+
 def run_service_smoke(*, service_model, run_root, verl_config_dir, episode_budget=None):
     """Run one real 8-NPU FSDP2 GRPO update on eight native Usami rollouts."""
     from dataclasses import asdict
@@ -705,9 +740,8 @@ def run_service_smoke(*, service_model, run_root, verl_config_dir, episode_budge
     from rift.verl.sampling import rollout_seed
     from usami_v2.runtime.runner import EpisodeBudget
 
-    budget = EpisodeBudget.model_validate(episode_budget or {
-        "max_customer_turns": 4, "max_service_decisions": 10,
-        "max_service_tool_calls": 8, "max_model_calls": 10})
+    budget = (EpisodeBudget.model_validate(episode_budget) if episode_budget is not None
+              else _default_smoke_episode_budget())
 
     root = Path(run_root).resolve()
     if root.exists():

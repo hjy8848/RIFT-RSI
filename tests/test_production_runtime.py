@@ -394,11 +394,29 @@ def test_learning_rate_override_updates_restored_optimizer_and_scheduler():
                                                {'lr': 1e-6, 'initial_lr': 1e-6}])
     scheduler = SimpleNamespace(base_lrs=[1e-6, 1e-6], _last_lr=[1e-6, 1e-6])
     engine = SimpleNamespace(optimizer=optimizer, lr_scheduler=scheduler)
-    assert _set_constant_learning_rate(engine, 2e-6) == 2e-6
+    readback = _set_constant_learning_rate(engine, 2e-6)
     assert all(group['lr'] == group['initial_lr'] == 2e-6 for group in optimizer.param_groups)
     assert scheduler.base_lrs == scheduler._last_lr == [2e-6, 2e-6]
+    assert readback['optimizer_lrs'] == readback['scheduler_lrs'] == (2e-6, 2e-6)
+    assert readback['verl_version'] == '0.9.1'
+    assert readback['verl_commit'] == '1876b06d0a3e4e71e06230be10af14492ca8a75b'
     with pytest.raises(ValueError):
         _set_constant_learning_rate(engine, 0)
+
+
+def test_learning_rate_readback_rejects_a_rank_with_different_scheduler_value(monkeypatch):
+    from rift.runtime import ascend_910b3
+    from rift.verl.version import VERL_COMMIT, VERL_VERSION
+    value = 2e-6
+    def rank(lr):
+        return {'optimizer_lrs': (lr,), 'optimizer_initial_lrs': (lr,),
+            'scheduler_base_lrs': (lr,), 'scheduler_lrs': (lr,),
+            'verl_version': VERL_VERSION, 'verl_commit': VERL_COMMIT}
+    runtime = object.__new__(ascend_910b3.Ascend910B3RoleRuntime)
+    runtime.service_update = {'learning_rate': value}
+    worker = SimpleNamespace(set_training_learning_rate=lambda _: [rank(value)] * 7 + [rank(1e-6)])
+    with pytest.raises(ValueError, match='readback'):
+        runtime.apply_training_hyperparameters('service', worker)
 
 
 def test_restoring_second_matched_arm_reloads_the_shared_start_checkpoint():
@@ -448,6 +466,13 @@ def test_smoke_cli_forwards_configured_episode_budget(tmp_path, monkeypatch, cap
         '--verl-config-dir', 'config', '--episode-budget-config', str(config)])
     assert seen['episode_budget'] == budget
     assert json.loads(capsys.readouterr().out)['status'] == 'fake'
+
+
+def test_smoke_default_budget_covers_mixed_task_minimum():
+    from rift.runtime.ascend_910b3 import _default_smoke_episode_budget
+    budget = _default_smoke_episode_budget()
+    assert (budget.max_customer_turns, budget.max_service_decisions,
+            budget.max_service_tool_calls, budget.max_model_calls) == (4, 14, 10, 18)
 
 
 def test_agent_loop_batch_rejects_incomplete_probe_result():

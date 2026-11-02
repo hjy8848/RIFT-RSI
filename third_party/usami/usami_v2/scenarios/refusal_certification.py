@@ -1,13 +1,16 @@
 """Independent bounded proof that every requested atomic action is refused."""
-from typing import Dict, Literal, Tuple
+from typing import Dict, Literal, Optional, Tuple
+
+from pydantic import model_serializer
 
 from usami_harness.engine import Engine, replay_trace
 from usami_harness.models import Request, digest
 from usami_harness.oracle import evaluate
 from usami_v2.commerce import adapter
-from usami_v2.commerce.models import Operation
+from usami_v2.commerce.models import Operation, omit_default_fields
 from usami_v2.contracts import Sealed
-from .task_certification import ProofBudget, _bind_scenario, _customer_delegation
+from .task_certification import (ProofBudget, TaskCertification, _bind_scenario,
+                                 _customer_delegation, certify_task)
 
 
 class RefusalCertificate(Sealed):
@@ -20,10 +23,23 @@ class RefusalCertificate(Sealed):
     attempts: Tuple[Dict[str, object], ...]
     blockers: Tuple[str, ...] = ()
     candidates_exhausted: bool = False
+    execution_required: bool = False
+    execution_certificate: Optional[TaskCertification] = None
+
+    @model_serializer(mode='wrap')
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ('execution_required', 'execution_certificate'))
 
     @property
     def full_task_reachability_certified(self):
-        return self.status == 'CERTIFIED' and self.candidates_exhausted and not self.blockers
+        execution_complete = (not self.execution_required or (
+            self.execution_certificate is not None
+            and self.execution_certificate.status == 'CERTIFIED'
+            and self.execution_certificate.minimum_witnesses_met
+            and self.execution_certificate.business_reachability_certified
+            and not self.execution_certificate.blockers))
+        return (self.status == 'CERTIFIED' and self.candidates_exhausted
+                and not self.blockers and execution_complete)
 
 
 def _operations(world, goal):
@@ -59,8 +75,18 @@ def certify_refusal(world, task, customer_scenario, budget=None):
     task, scenario = _bind_scenario(world, task, customer_scenario)
     goals = getattr(task, 'refusal_goals', ())
     blockers, attempts = [], []
-    if not goals or task.remedy_goals or task.cancellation_goals or task.information_goals:
-        blockers.append('refusal_certifier_requires_refusal_only_task')
+    if not goals:
+        blockers.append('refusal_certifier_requires_refusal_goal')
+    execution_required = bool(task.remedy_goals or task.cancellation_goals)
+    execution_certificate = None
+    if execution_required:
+        execution_certificate = certify_task(world, task, scenario, budget)
+        if (execution_certificate.status != 'CERTIFIED'
+                or not execution_certificate.business_reachability_certified
+                or execution_certificate.blockers):
+            blockers.append('execution_goals_not_certified')
+    if task.information_goals:
+        blockers.append('interaction_goals_not_certified')
     state, _ = _customer_delegation(world, task, scenario)
     candidates, constructive = [], 0
     for goal in goals:
@@ -110,7 +136,8 @@ def certify_refusal(world, task, customer_scenario, budget=None):
     status = 'CERTIFIED' if (candidates or constructive) and exhausted and not blockers else 'UNKNOWN'
     return RefusalCertificate(world_hash=world.state_hash, task_hash=task.record_hash,
         scenario_hash=scenario.record_hash, budget=budget, status=status,
-        attempts=tuple(attempts), blockers=tuple(blockers), candidates_exhausted=exhausted)
+        attempts=tuple(attempts), blockers=tuple(blockers), candidates_exhausted=exhausted,
+        execution_required=execution_required, execution_certificate=execution_certificate)
 
 
 def verify_refusal_certificate(world, task, customer_scenario, certificate):

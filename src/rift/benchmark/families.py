@@ -261,7 +261,10 @@ def _construct(family, knobs, seed):
         actions = {'F3': 'refund', 'F4': 'refund', 'F5': 'cancel', 'F6': 'exchange', 'F8': 'reship'}
         refusal_goals = [{'goal_id': 'goal_0', 'line_alias': 'item_0',
                           'reason_code': codes[family], 'requested_action': actions[family]}]
-        if family == 'F6': refusal_goals[0]['maximum_extra_charge_cents'] = cap
+        if family == 'F6':
+            # This is evidence that the Customer declined the offer, not a proof
+            # that a commerce rule forbids the exchange.
+            refusal_goals[0]['maximum_extra_charge_cents'] = cap
         goals = []
     data = {'scenario_id': f'{family}-world-{seed}', 'customer_aliases': ['customer'],
         'skus': sku_rows, 'warehouses': [

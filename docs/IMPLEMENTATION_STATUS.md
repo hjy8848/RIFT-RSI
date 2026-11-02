@@ -1,7 +1,7 @@
 Status: implementation tracking
 Owner: RIFT-RSI maintainers
-Last verified: 2026-10-30
-Scope: dual-bank code coverage, production adapter, offline evidence, deployment gaps, and target-hardware validation
+Last verified: 2026-11-02
+Scope: dual-bank and dense-proxy curriculum code, production adapters, offline evidence, deployment gaps, and target-hardware validation
 
 This document records which pieces of the dual-bank RIFT protocol have code and offline tests. The research objective is defined in [RESEARCH_SPEC.md](RESEARCH_SPEC.md); executable contracts are in `src/rift/` and defaults in `configs/dual_bank.yaml`.
 
@@ -68,16 +68,28 @@ The Ascend entry point exercised above runs the Service smoke only. A complete D
 - The runtime submits Service and Probe requests through the pinned VERL `AgentLoopManager` batch API, validates request identity on return, measures stage timings, persists environment/config snapshots, task certificates, split identities, checkpoint manifests, Probe evidence, and round state, and reconstructs unfinished rounds only from the exact persisted Designer action and frozen plan.
 - FSDP2 checkpoint output paths and manifests are unique per role/global step; the scheduler writes a digest-bound finalization marker to avoid repeating a completed round's updates after restart. These recovery boundaries are CPU-tested with doubles; process-crash behavior on a real multi-rank WorkerGroup is unverified.
 
+## Dense proxy curriculum follow-up (2026-11-02)
+
+- Probe fingerprints now omit the family generator's `instance` labels and normalize `model` values, so changing a seeded product name cannot change the categorical fingerprint. The near-duplicate threshold remains disabled pending X6 calibration.
+- `BanditPolicy` uses a configurable sliding window (default 10 observations per arm), so old learnability evidence stops dominating after a family becomes mastered. The window is recorded in the curriculum run manifest.
+- Mixed tasks can carry an execution `TaskCertification` alongside their refusal certificate. Execution search evaluates execution goals separately; the combined certificate is complete only when both parts pass. Default-valued certificate fields remain omitted, preserving pure-refusal record serialization.
+- F6's `CUSTOMER_DECLINED` variant is identified as customer-decline evidence. Episode diagnostics emit separate customer-decline and rule-refusal counts.
+- Differential coverage retains the 2,000-example generated Engine/Reference/Oracle/Replay check and adds multiple orders/lines, constrained-stock exchanges, physical-return receipt events, and amount, inventory-release, and return-window mutations.
+- The Ascend worker reads optimizer and scheduler learning rates back on every FSDP rank and checks the pinned VERL 0.9.1 identity before accepting the override. The smoke EpisodeBudget default now covers the mixed-task minimum (4 customer turns, 14 decisions, 10 tool calls, 18 model calls); it can still be overridden by configuration.
+- These are code and CPU-test changes. X6 calibration and target-NPU learning-rate readback remain unverified.
+
 ## Known evidence limits of the dual-bank reward (2026-11-02)
 
 - **Fixed:** Probe baselines were the same trials that selected the task, so a policy that never changed still earned a positive Recovery gain and a Retention drop (regression to the mean; +0.111 mean Recovery gain on the real pipeline with a null update). Baselines are now measured separately; see `DUAL_BANK_DESIGN.md`. `tests/test_probe_selection_bias.py` guards it.
 - **Not fixed:** a Designer action gets one scalar per round, and the per-round reward noise (SD about 0.05 to 0.07 from the null-update study) is the same order as a plausible true gain, so separating two Designer strategies would take on the order of 100 rounds each. A zero-update control round on the target hardware should measure the real noise floor before any reward is read as learning.
-- **Not fixed:** Recovery probes are drawn from failures the Designer was shown, so the reward can be raised by teaching near-copies of those tasks. Only the isolated TEST set can reveal this.
+- **Partially addressed:** Fingerprints now ignore seeded `model` and `instance` labels, preventing name-only changes from bypassing duplicate comparison. The threshold is still disabled until X6 checks near-copies against sibling instances; Recovery can still favor Designer-visible failures.
 - **Never run:** no real model has earned a non-zero reward in the current environment on target hardware.
 
 ## Offline verification
 
 On 2026-10-30, the complete CPU suite reported **94 passed** in 125.60 seconds with Python 3.12.7. The targeted production-runtime, VERL bridge, actor mock, and package suites reported **47 passed**. `python -m compileall -q src/rift tests/test_production_runtime.py` and `git diff --check` also passed. The suite exercises unlabelled bootstrap, UNKNOWN exclusion, public failure projection, split policies, explicit `NEW` and existing-ID choices, captured proposal/context binding, cross-round failure reuse, training-overlap exclusion, current-checkpoint baselines, reproducible random fill, TEST rejection, Registry persistence, Probe evidence storage, scripted-evidence rejection from real reward, reward arithmetic, ungrouped Designer credit, dual-bank LoopState save/restore, native information-only Customer execution, multi-candidate certification fallback, seeded probe construction, native parse-failure outcomes, batched Recovery/Retention Probe dispatch, measured-budget Dynamic Batch configuration, resident-state restore gating, production config validation, Agent Loop batch identity checks, exclusive role lifecycle, and checkpoint publication. Package tests additionally certify eight Designer challenges and eight Benchmark tasks through native Usami on CPU, assemble the default 16-task 8+8 package, execute and replay native episodes, verify seeded Benchmark selection and split-overlap rejection, and save/restore package state. Exact model-token capture and production WorkerGroup behavior are exercised with test doubles; these tests do not demonstrate real VERL model learning. Pydantic emitted 17 deprecation/protected-namespace warnings from the current Usami models; they did not fail tests.
+
+On 2026-11-02, the changed areas passed the 2,000-example differential suite (**7 passed**), focused fingerprint/curriculum/family/diagnostic/runtime regressions (**23 passed**), mixed-certificate and refusal-metric follow-up tests (**7 passed**), and learning-rate/smoke-budget follow-up tests (**5 passed**). These are local CPU checks; they do not demonstrate target-NPU learning-rate application or real-model learning.
 
 ## Still required for target deployment
 
@@ -87,6 +99,7 @@ On 2026-10-30, the complete CPU suite reported **94 passed** in 125.60 seconds w
 - Successful reward-driven Service learning after the Hermes boundary fix remains unverified. The latest hardware run completed its real update, but all rewards were zero and six Episodes ended with a Service protocol error.
 - Recovery/Retention before-and-after evaluation on independent frozen tasks, current-checkpoint baselines for historical tasks, Replay reward computation, delayed Designer credit, and TEST isolation in a real target-hardware round.
 - Target-run selection and profiling of Dynamic Batch token budget, Agent Loop worker count, vLLM concurrency, and NPU memory/throughput. No NPU-specific values are guessed in the overlay.
+- The new per-rank optimizer/scheduler learning-rate readback has not yet been exercised on the target NPU WorkerGroup.
 - The target CustomerFactory must apply the supplied probe seed to its stochastic behavior, and use the same recorded Service sampling protocol before and after updates.
 - The deployment must persist real Bootstrap and subsequent task/Probe observations with trusted evidence and use the included plan factory's current-Checkpoint baseline records for historical Recovery and Retention candidates.
 - Full-round validation of the exclusive lifecycle for two full-parameter policies sharing the eight NPU devices, including optimizer/RNG restore and safe resource release between Designer and Service phases. Service checkpoint save/restore and serving synchronization are smoke-validated; this does not establish the two-role handoff.

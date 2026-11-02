@@ -33,7 +33,19 @@ def test_episode_metrics_only_reports_recorded_lengths():
     record = episode('customer_finished', calls=(call({'generated_token_ids': [1, 2]}),
         call(completion_tokens=5), call()), tools=(NS(result={'success': True}),), success=True)
     assert episode_metrics(record) == {'category': 'success', 'tool_calls': 1,
+                                       'refusal_class': None,
                                        'response_token_lengths': [2, 5]}
+
+
+@pytest.mark.parametrize(('codes', 'expected'), [
+    (('CUSTOMER_DECLINED',), 'customer_declined'),
+    (('APPROVAL_REQUIRED',), 'rule_refusal'),
+    (('CUSTOMER_DECLINED', 'INSUFFICIENT_STOCK'), 'mixed_refusal'),
+])
+def test_episode_metrics_separate_customer_declines_from_rule_refusals(codes, expected):
+    record = episode('customer_finished', success=False)
+    record.task = NS(refusal_goals=tuple(NS(reason_code=code) for code in codes))
+    assert episode_metrics(record)['refusal_class'] == expected
 
 
 def test_confirmation_order_is_diagnostic_only_and_ignores_read_only_tools():
@@ -83,7 +95,8 @@ def test_collector_emits_group_metrics_and_returns_recorded_package(monkeypatch)
         model_call = NS(role='service', request=request, response={'generated_token_ids': [1, 2]},
                         completion_tokens=None)
         record = episode('customer_finished', calls=(model_call,), success=bool(member))
-        record.task = NS(record_hash='task')
+        reason_code = 'CUSTOMER_DECLINED' if member == 0 else 'APPROVAL_REQUIRED'
+        record.task = NS(record_hash='task', refusal_goals=(NS(reason_code=reason_code),))
         record.record_hash = f'episode-{member}'
         episodes[rollout_id] = record
     store = NS(resolve_rollout=lambda key, cp: episodes[key],
@@ -102,3 +115,6 @@ def test_collector_emits_group_metrics_and_returns_recorded_package(monkeypatch)
     assert group_metric[1] == 1
     assert group_metric[2]['source'] == 'designer' and group_metric[2]['informative'] is True
     assert next(row for row in metrics if row[0] == 'service_uniform_group_fraction')[1] == 0
+    refusal_metrics = [row for row in metrics if row[0] == 'service_episode_refusal_class_count']
+    assert {(row[1], row[2]['refusal_class']) for row in refusal_metrics} == {
+        (1, 'customer_declined'), (1, 'rule_refusal')}

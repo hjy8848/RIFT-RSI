@@ -57,7 +57,18 @@ def episode_metrics(episode):
             lengths.append(len(generated))
         elif type(call.completion_tokens) is int:
             lengths.append(call.completion_tokens)
+    task = getattr(episode, 'task', None)
+    refusal_codes = {goal.reason_code for goal in getattr(task, 'refusal_goals', ())}
+    if not refusal_codes:
+        refusal_class = None
+    elif refusal_codes == {'CUSTOMER_DECLINED'}:
+        refusal_class = 'customer_declined'
+    elif 'CUSTOMER_DECLINED' in refusal_codes:
+        refusal_class = 'mixed_refusal'
+    else:
+        refusal_class = 'rule_refusal'
     return {"category": classify_episode(episode), "tool_calls": len(episode.tool_executions),
+            "refusal_class": refusal_class,
             "response_token_lengths": lengths}
 
 

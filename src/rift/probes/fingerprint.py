@@ -27,7 +27,7 @@ def task_fingerprint(world, task):
         line = world.lines[line_id]
         sku, order = world.skus[line.sku_id], world.orders[line.order_id]
         age = max(0, (world.clock - order.delivered_at).days)
-        discrete = (remedies, sku.product_family, tuple(sorted(sku.attributes.items())),
+        discrete = (remedies, sku.product_family, _fingerprint_attributes(sku.attributes),
                     order.fulfillment_status, sku.return_required)
         numeric = (quantity, line.allocated_paid_cents // 5000, age // 7)
         entries.append((discrete, numeric))
@@ -38,6 +38,23 @@ def task_fingerprint(world, task):
         len(task.remedy_goals) + len(task.cancellation_goals) + len(task.information_goals)
         + len(getattr(task, 'refusal_goals', ()))),),
         tuple(item[1] for item in entries))
+
+
+def _fingerprint_attributes(attributes):
+    """Drop per-instance labels while retaining product characteristics.
+
+    The family generator seeds ``model`` names and uses ``instance`` solely to
+    keep sibling products addressable. Those values must not make a copied task
+    look like a different capability.
+    """
+    normalized = []
+    for name, value in attributes.items():
+        if name == 'instance':
+            continue
+        if name == 'model':
+            value = '<instance-model>'
+        normalized.append((name, value))
+    return tuple(sorted(normalized))
 
 
 def fingerprint_distance(left, right):

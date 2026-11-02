@@ -459,7 +459,7 @@ def _run_candidate(world, task, scenario, candidates, attempt_id, max_steps):
         if reason:
             break
     else:
-        score = evaluate_state_goals(world, state, task)
+        score = evaluate_state_goals(world, state, task, include_refusal_goals=False)
         result_map = tuple((row.goal_id, row.status) for row in score)
         if all(row.status == "PASS" for row in score):
             return ProofAttempt(candidate_hash=digest([row.model_dump(mode="json") for row in candidates]),
@@ -471,7 +471,8 @@ def _run_candidate(world, task, scenario, candidates, attempt_id, max_steps):
                         candidates=candidates, status="REJECTED",
                         reason=reason, steps=tuple(steps), final_state_hash=state.state_hash,
                         goal_results=tuple((row.goal_id, row.status)
-                                           for row in evaluate_state_goals(world, state, task)))
+                                           for row in evaluate_state_goals(
+                                               world, state, task, include_refusal_goals=False)))
 
 
 def certify_task(world: World, task: TaskSpec, customer_scenario: CustomerScenario,
@@ -537,7 +538,7 @@ def certify_task(world: World, task: TaskSpec, customer_scenario: CustomerScenar
         status = "UNSAT"
     else:
         status = "UNKNOWN"
-    full = bool(witnesses) and not task.information_goals
+    full = bool(witnesses) and not task.information_goals and not getattr(task, 'refusal_goals', ())
     return TaskCertification(
         status=status, world_hash=world.state_hash, task_hash=task.record_hash,
         customer_scenario_hash=customer_scenario.record_hash, proof_budget=budget,

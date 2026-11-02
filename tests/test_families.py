@@ -86,6 +86,66 @@ def test_customer_decline_requires_recorded_customer_turn_and_replays():
     assert replay_episode(episode).verified
 
 
+def test_mixed_refusal_certificate_requires_an_execution_subcertificate(monkeypatch):
+    from types import SimpleNamespace
+    from usami_v2.scenarios import refusal_certification
+    from usami_v2.scenarios.task_certification import ProofBudget, TaskCertification
+
+    budget = ProofBudget()
+    world = SimpleNamespace(state_hash='world-hash')
+    task = SimpleNamespace(record_hash='task-hash', customer_id='customer',
+        remedy_goals=(object(),), cancellation_goals=(), information_goals=(),
+        refusal_goals=(SimpleNamespace(goal_id='decline', reason_code='CUSTOMER_DECLINED'),))
+    scenario = SimpleNamespace(record_hash='scenario-hash', accepts_proposals=False)
+    execution = TaskCertification(status='CERTIFIED', world_hash='world-hash',
+        task_hash='task-hash', customer_scenario_hash='scenario-hash', proof_budget=budget,
+        budget_hash=budget.record_hash, candidates_examined=1, search_complete=False,
+        minimum_witnesses=1, minimum_witnesses_met=True, business_reachability_certified=True,
+        full_task_reachability_certified=False)
+    monkeypatch.setattr(refusal_certification, '_bind_scenario', lambda *args: (task, scenario))
+    monkeypatch.setattr(refusal_certification, '_customer_delegation', lambda *args: (world, None))
+    monkeypatch.setattr(refusal_certification, 'certify_task', lambda *args: execution)
+
+    certificate = refusal_certification.certify_refusal(world, task, scenario, budget)
+    assert certificate.status == 'CERTIFIED'
+    assert certificate.execution_required is True
+    assert certificate.execution_certificate == execution
+    assert certificate.full_task_reachability_certified is True
+    missing_execution = certificate.model_copy(update={'execution_certificate': None})
+    assert missing_execution.full_task_reachability_certified is False
+    pure_refusal = refusal_certification.RefusalCertificate(
+        world_hash='world-hash', task_hash='task-hash', scenario_hash='scenario-hash',
+        budget=budget, status='CERTIFIED', attempts=({'kind': 'customer_declines'},),
+        candidates_exhausted=True)
+    assert 'execution_required' not in pure_refusal.model_dump(mode='json')
+    assert 'execution_certificate' not in pure_refusal.model_dump(mode='json')
+
+
+def test_host_certifies_mixed_execution_and_rule_refusal_goals():
+    from rift.tasks import Proposal
+    from usami_v2.scenarios.grounding import AbstractChallenge
+
+    instance = FAMILIES['F11'].instance({'target_count': 2, 'order_count': 2}, 95)
+    challenge_data = instance.challenges[0].model_dump(mode='json', exclude={'record_hash'})
+    challenge_data['remedy_goals'] = challenge_data['remedy_goals'][:1]
+    challenge_data['refusal_goals'] = [{
+        'goal_id': 'declined-by-rule', 'line_alias': 'item_1',
+        'reason_code': 'ORDER_NOT_CANCELLABLE', 'requested_action': 'cancel'}]
+    challenge = AbstractChallenge.model_validate(challenge_data).checked()
+    proposal = Proposal('mixed-refusal-plan', 'one executable goal and one rule refusal',
+        ability_id='NEW', world_draft=instance.draft.model_dump(mode='json', exclude={'record_hash'}),
+        challenges=(challenge,))
+    host = host_for(instance)
+    result = host.certify_training_plan(proposal, world_seed=95)
+    assert result.build.status == 'SAT'
+    assert len(result.tasks) == 1, result.challenge_results
+    record = host.task_registry.resolve_record(result.tasks[0].record_hash)
+    assert record.certificate.status == 'CERTIFIED'
+    assert record.certificate.execution_required is True
+    assert record.certificate.execution_certificate.business_reachability_certified is True
+    assert record.certificate.full_task_reachability_certified is True
+
+
 def test_refusal_fails_when_another_unrequested_line_is_settled():
     from datetime import timedelta
     from types import SimpleNamespace
@@ -162,7 +222,6 @@ def test_default_family_builds_a_full_distinct_training_package(family_id):
 
 
 def test_siblings_keep_capability_but_change_visible_product_instance():
-    from math import inf
     from rift.probes.fingerprint import fingerprint_distance, task_fingerprint
     family = FAMILIES['F1']
     original = family.instance({'distractor_orders': 1}, 31)
@@ -175,4 +234,4 @@ def test_siblings_keep_capability_but_change_visible_product_instance():
         records.append(host.task_registry.resolve_record(result.tasks[0].record_hash))
     assert records[0].identity.family == records[1].identity.family
     assert records[0].identity.lineage != records[1].identity.lineage
-    assert fingerprint_distance(*(task_fingerprint(row.world, row.task) for row in records)) == inf
+    assert fingerprint_distance(*(task_fingerprint(row.world, row.task) for row in records)) == 0

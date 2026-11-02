@@ -140,14 +140,24 @@ class LearningProgressPolicy(CurriculumPolicy):
 
 
 class BanditPolicy(CurriculumPolicy):
-    def propose(self, round_index, history):
-        rng, rows = self._random(round_index), self._by_arm(history)
+    def __init__(self, arms, *, seed=0, window=10):
+        super().__init__(arms, seed=seed)
+        if type(window) is not int or window < 1:
+            raise ValueError('positive bandit history window required')
+        self.window = window
+
+    def _posterior(self, observations):
+        recent = observations[-self.window:]
         # Beta pseudocounts accept fractional learnability observations; use
         # one update per valid group so a larger observed sample counts more.
+        alpha = 1 + sum(row.learnability * row.valid_groups for row in recent)
+        beta = 1 + sum((1 - row.learnability) * row.valid_groups for row in recent)
+        return alpha, beta
+
+    def propose(self, round_index, history):
+        rng, rows = self._random(round_index), self._by_arm(history)
         def sample(arm):
-            history_for_arm = rows[arm.arm_key]
-            alpha = 1 + sum(row.learnability * row.valid_groups for row in history_for_arm)
-            beta = 1 + sum((1 - row.learnability) * row.valid_groups for row in history_for_arm)
+            alpha, beta = self._posterior(rows[arm.arm_key])
             return rng.betavariate(alpha, beta)
         return max(self.arms, key=sample)
 

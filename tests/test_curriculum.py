@@ -28,6 +28,17 @@ def test_bandit_finds_best_synthetic_arm():
     assert sum(row.selection == ARMS[2] for row in history[-50:]) >= 45
 
 
+def test_bandit_forgets_an_arm_when_its_learnability_decays():
+    policy = BanditPolicy(ARMS[:2], seed=8, window=4)
+    history = ([Observation(ARMS[0], .5, .95, 8) for _ in range(12)]
+               + [Observation(ARMS[0], .5, .05, 8) for _ in range(4)]
+               + [Observation(ARMS[1], .5, .6, 8) for _ in range(4)])
+    alpha_a, beta_a = policy._posterior([row for row in history if row.selection == ARMS[0]])
+    alpha_b, beta_b = policy._posterior([row for row in history if row.selection == ARMS[1]])
+    assert alpha_a / (alpha_a + beta_a) < alpha_b / (alpha_b + beta_b)
+    assert policy.window == 4
+
+
 def test_difficulty_uses_observed_success_and_progress_uses_recent_change():
     difficulty = DifficultyOnlyPolicy(ARMS, seed=0)
     history = [Observation(arm, mean, .3, 4) for arm, mean in zip(ARMS, [.1, .45, .8])]
