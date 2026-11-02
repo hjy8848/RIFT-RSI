@@ -517,6 +517,12 @@ def test_verl_extension_with_real_usami_session_and_fake_server(tmp_path, monkey
         episode = await session.finish()
         assert output.reward_score == 1.0 and sink.verify_trajectory(episode, cp)
         assert len(episode.model_calls) == loop.server_manager.i
+        # The collectors compare this field with checkpoint_json() character by character;
+        # a different JSON spelling once made every real training round fail.
+        from rift.runtime.evaluator import checkpoint_json
+        assert output.extra_fields['rift_checkpoint'] == checkpoint_json(cp)
+        assert output.extra_fields['rift_group_id'] == 'group'
+        assert output.extra_fields['rift_seed'] == 23
         assert 0 in output.response_mask and 1 in output.response_mask
     asyncio.run(run())
     from rift.verl.sampling import rollout_seed

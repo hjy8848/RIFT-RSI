@@ -218,7 +218,10 @@ def __getattr__(name):
                                   'rift_task_ref': task_ref,
                                   'rift_mode': mode,
                                   'rift_episode_id': episode.record_hash,
-                                  'rift_checkpoint': json.dumps(asdict(checkpoint), sort_keys=True),
+                                  # Same canonical text as rift.runtime.evaluator.checkpoint_json,
+                                  # which callers compare this field against character by character.
+                                  'rift_checkpoint': json.dumps(asdict(checkpoint), sort_keys=True,
+                                                                separators=(',', ':')),
                                   'rift_group_id': group_id if mode == 'train' else None,
                                   'rift_seed': (kwargs.get('rift_sampling_seed') if mode == 'probe'
                                                 else kwargs.get('rift_sampling_seed')),
