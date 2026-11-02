@@ -512,7 +512,10 @@ def render_customer_request(world, customer_id, remedy_goals, information_goals,
         else:
             action = " or ".join(labels)
         subject = _line_description(world, goal.line_id)
-        quantity = "" if goal.quantity == 1 else " for {} items".format(goal.quantity)
+        # A single unit is implied only when the line holds one; on a multi-unit line the
+        # request must say how many, or the goal cannot be inferred from public text.
+        quantity = ("" if goal.quantity == 1 and line.quantity == 1
+                    else " for {} item{}".format(goal.quantity, "" if goal.quantity == 1 else "s"))
         sentence = "{}. Please arrange {}{} for the {} item in my order".format(
             index, action, quantity, subject)
         if goal.required_attributes:
