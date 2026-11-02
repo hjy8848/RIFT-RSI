@@ -300,8 +300,9 @@ class ExperimentContext:
 
     def persists(self, index):
         """Whether the update of round ``index`` writes real checkpoint files."""
-        every = max(1, self.persist_every)
-        return (index + 1) % every == 0 or (self.total_rounds is not None and index + 1 >= self.total_rounds)
+        if self.persist_every and (index + 1) % self.persist_every == 0:
+            return True
+        return self.total_rounds is not None and index + 1 >= self.total_rounds   # 0 = last round only
 
     def open_runtime(self, checkpoint):
         """Start one runtime for ``checkpoint``; registries must already hold every task."""
@@ -574,9 +575,9 @@ def main(argv=None):
     train_parser.add_argument('--learning-rate', type=float, default=1e-6)
     train_parser.add_argument('--response-length', type=int, default=12288,
         help='VERL aborts the whole round when one episode outgrows this')
-    train_parser.add_argument('--persist-every', type=int, default=5,
-        help='write real checkpoint files every N rounds (and after the last); the rounds in '
-             'between update the live runtime only, which is much faster')
+    train_parser.add_argument('--persist-every', type=int, default=0,
+        help='write real checkpoint files every N rounds; 0 (default) writes only after the '
+             'last round. Rounds in between update the live runtime only, which is much faster')
     train_parser.add_argument('--init-from-run',
         help='an earlier run directory whose base checkpoint to start from (skips writing a new one)')
     train_parser.add_argument('--restart-each-round', action='store_true',

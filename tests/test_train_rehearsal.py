@@ -154,6 +154,15 @@ class TrainRehearsal(unittest.TestCase):
             final = json.loads((Path(root) / 'final.json').read_text(encoding='utf-8'))
             self.assertEqual(final['checkpoint']['revision'], '3')
 
+    def test_zero_means_only_the_last_round_is_written(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._initial(root)
+            context, result = self._train(root, rounds=3, persist_every=0)
+            steps = Path(root) / 'checkpoints' / 'service'
+            self.assertEqual(sorted(path.name for path in steps.iterdir()), ['global-step-00000003'])
+            self.assertEqual({cp.revision for cp in context.checkpoint_store.virtual}, {'1', '2'})
+            self.assertEqual(result['final_checkpoint']['revision'], '3')
+
     def test_a_new_process_cannot_resume_from_an_in_memory_version(self):
         from rift.schemas import Checkpoint
         with tempfile.TemporaryDirectory() as root:
