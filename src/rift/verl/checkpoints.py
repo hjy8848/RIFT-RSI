@@ -35,6 +35,21 @@ def _artifact_metadata_digest(directory):
     return digest.hexdigest()
 
 
+def _artifact_stat_digest(directory):
+    """Host-independent fingerprint: relative names, sizes and mtimes only."""
+    root = Path(directory)
+    if not root.is_dir() or root.is_symlink(): raise ValueError('invalid checkpoint directory')
+    digest = hashlib.sha256()
+    for path in sorted((p for p in root.rglob('*') if p.is_file()),
+                       key=lambda p: p.relative_to(root).as_posix()):
+        if path.is_symlink(): raise ValueError('checkpoint symlinks are unsupported')
+        metadata = path.stat()
+        encoded = json.dumps([path.relative_to(root).as_posix(), metadata.st_size,
+                              metadata.st_mtime_ns], separators=(',', ':')).encode('utf-8')
+        digest.update(len(encoded).to_bytes(8, 'big') + encoded)
+    return digest.hexdigest()
+
+
 def model_digest(directory, world_size):
     root = Path(directory)
     if type(world_size) is not int or world_size < 1: raise ValueError('invalid world size')
@@ -188,20 +203,41 @@ class FSDPCheckpointStore:
         except (OSError, ValueError, TypeError):
             return False
     def save_manifest(self, path):
-        records = [{'checkpoint': asdict(cp), 'path': str(Path(location).resolve()),
-                    'artifact_digest': self.artifact_digests[cp]}
-                   for cp, location in self.paths.items()]
+        records = []
+        for cp, location in self.paths.items():
+            row = {'checkpoint': asdict(cp), 'path': str(Path(location).resolve()),
+                   'artifact_digest': self.artifact_digests[cp]}
+            if self.verify(cp):
+                # Names, sizes and mtimes of a checkpoint whose contents were just verified.
+                row['stat_digest'] = _artifact_stat_digest(location)
+            records.append(row)
         with Path(path).open('x', encoding='utf-8') as stream:
             json.dump({'world_size': self.world_size, 'records': records}, stream, sort_keys=True)
     @classmethod
     def load_manifest(cls, path):
         data = json.loads(Path(path).read_text(encoding='utf-8'))
-        paths, digests = {}, {}
+        paths, digests, stats = {}, {}, {}
         for row in data['records']:
             cp = Checkpoint(**row['checkpoint'])
             if cp in paths: raise ValueError('duplicate checkpoint identity')
             paths[cp] = row['path']; digests[cp] = row['artifact_digest']
+            stats[cp] = row.get('stat_digest')
         store = cls(paths, world_size=data['world_size'], artifact_digests=digests)
-        if any(not store.verify(cp) for cp in paths):
-            raise ValueError('checkpoint manifest does not match stored files')
+        for cp, location in paths.items():
+            try:
+                unchanged = stats[cp] is not None and _artifact_stat_digest(location) == stats[cp]
+            except (OSError, ValueError):
+                unchanged = False
+            if unchanged:
+                # Same files, sizes and mtimes as when the contents were hashed: do not
+                # reread gigabytes of weights just to load the manifest.
+                store._trust(cp)
+            elif not store.verify(cp):
+                raise ValueError('checkpoint manifest does not match stored files')
         return store
+    def _trust(self, checkpoint):
+        root = Path(self.resolve(checkpoint))
+        entry = (_VERIFY_CACHE_VERSION, str(root), self.world_size, checkpoint.weights_digest,
+                 self.artifact_digests[checkpoint], _artifact_metadata_digest(root))
+        self._verified_fingerprints[checkpoint] = entry
+        _PROCESS_VERIFICATION_CACHE[(checkpoint, str(root), self.world_size)] = entry
