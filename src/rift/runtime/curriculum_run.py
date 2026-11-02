@@ -68,7 +68,9 @@ def summarize_outcomes(rows):
     for key, task_ref, outcome in rows:
         entry = groups.setdefault(key, {'tasks': {}})
         counts = entry['tasks'].setdefault(task_ref, {'success': 0, 'failure': 0, 'unknown': 0})
-        counts[outcome if outcome in ('success', 'failure') else 'unknown'] += 1
+        # rift.schemas.Outcome values are upper case ("SUCCESS"); accept either spelling.
+        normalized = str(getattr(outcome, 'value', outcome)).lower()
+        counts[normalized if normalized in ('success', 'failure') else 'unknown'] += 1
     report = {}
     for key, entry in sorted(groups.items()):
         success = sum(row['success'] for row in entry['tasks'].values())

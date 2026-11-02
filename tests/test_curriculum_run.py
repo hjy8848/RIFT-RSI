@@ -37,6 +37,12 @@ class SpecTests(unittest.TestCase):
         self.assertLess(report['wilson95'][0], 0.75)
         self.assertGreater(report['wilson95'][1], 0.75)
 
+    def test_summary_accepts_the_real_outcome_values(self):
+        """The Agent Loop reports Outcome.value, which is upper case."""
+        rows = [('k', 't', 'SUCCESS')] * 3 + [('k', 't', 'FAILURE'), ('k', 't', 'UNKNOWN')]
+        report = run.summarize_outcomes(rows)['k']
+        self.assertEqual((report['success'], report['failure'], report['unknown']), (3, 1, 1))
+
     def test_wilson_bounds(self):
         low, high = run.wilson_interval(0, 10)
         self.assertEqual(low, 0.0)
