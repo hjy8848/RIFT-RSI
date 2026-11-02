@@ -7,12 +7,12 @@ from datetime import timedelta
 import re
 from typing import Dict, Literal, Optional, Tuple
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from usami_harness.models import digest
 from usami_v2.contracts import FactEvidence, FactKind, Scalar, Sealed, SourceRef
 from usami_v2.commerce.invariants import invariants
-from usami_v2.commerce.models import Consent, Delegation, PREPARATIONS, World
+from usami_v2.commerce.models import Consent, Delegation, PREPARATIONS, World, omit_default_fields
 from usami_v2.scenarios.tasks import TaskSpecV3, delegated_line_ids
 
 
@@ -78,9 +78,14 @@ class CustomerProfileV3(CustomerProfile):
 
     protocol: Literal["commerce-customer-profile-v3"] = "commerce-customer-profile-v3"
     intent_bundle_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    accepts_proposals: bool = True
+
+    @model_serializer(mode='wrap')
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ('accepts_proposals',))
 
 
-def bind_customer_profile(profile: CustomerProfile, task: TaskSpecV3):
+def bind_customer_profile(profile: CustomerProfile, task: TaskSpecV3, *, accepts_proposals=True):
     """Bind an existing fixed Customer policy to the compiler-issued task intent."""
     profile, task = profile.checked(), task.checked()
     if profile.customer_id != task.customer_id:
@@ -96,7 +101,7 @@ def bind_customer_profile(profile: CustomerProfile, task: TaskSpecV3):
         disclose_fact_ids=profile.disclose_fact_ids, private_facts=profile.private_facts,
         delegation_lifetime_hours=profile.delegation_lifetime_hours,
         consent_lifetime_hours=profile.consent_lifetime_hours,
-        intent_bundle_hash=task.request_bundle.record_hash)
+        intent_bundle_hash=task.request_bundle.record_hash, accepts_proposals=accepts_proposals)
 
 
 class HumanCustomerProfileV2(CustomerProfileV2):
@@ -136,11 +141,18 @@ class CustomerDecision(Sealed):
     withdraw_delegation_ids: Tuple[str, ...] = ()
     disclose_fact_ids: Tuple[str, ...] = ()
     finish: bool = False
+    declines_proposal: bool = False
+
+    @model_serializer(mode='wrap')
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ('declines_proposal',))
 
     @model_validator(mode="after")
     def coherent_decision(self):
         if self.accept_quote_id and self.reject_quote_id:
             raise ValueError("a Customer cannot accept and reject offers in one turn")
+        if self.declines_proposal and self.accept_quote_id:
+            raise ValueError('a Customer cannot decline and accept the same proposal')
         if self.accept_quote_id is None and self.accept_operation is not None:
             raise ValueError("consent operation requires an accepted quote")
         if self.accept_quote_id is not None and self.accept_operation is None:
@@ -338,6 +350,10 @@ class CustomerRuntime:
     def apply(self, world: World, decision: CustomerDecision, *,
               presentation: Optional[OfferPresentation] = None, event_index: int) -> CustomerTransition:
         decision, profile = decision.checked(), self.profile
+        if not getattr(profile, 'accepts_proposals', True) and decision.accept_quote_id:
+            raise ValueError('Customer profile does not accept proposals')
+        if decision.declines_proposal and getattr(profile, 'accepts_proposals', True):
+            raise ValueError('Customer profile does not declare proposal refusal')
         if decision.delegate_line_ids and not set(decision.delegate_line_ids).issubset(profile.delegated_line_ids):
             raise ValueError("Customer attempted to delegate a line outside its private profile")
         if decision.allowed_preparations and not set(decision.allowed_preparations).issubset(profile.allowed_preparations):

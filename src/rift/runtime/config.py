@@ -1,5 +1,6 @@
 """Load the existing RIFT and VERL YAML files as one validated runtime config."""
 from dataclasses import dataclass
+from math import isfinite
 import os
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,8 @@ class ProductionConfig:
         algorithm = self.verl.get("algorithm", {})
         trainer = self.verl.get("trainer", {})
         checks = (
+            (service.get('tool_profile', 'full9') in ('core4', 'full9'),
+             'Service tool_profile must be core4 or full9'),
             (package.get("grpo_group_size") == rollout.get("n"),
              "RIFT grpo_group_size must equal VERL rollout.n"),
             (rollout.get("name") == "vllm", "production rollout backend must be vllm"),
@@ -90,6 +93,19 @@ class ProductionConfig:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("RIFT training package configuration is invalid") from exc
+        update = service.get("update", {})
+        if not isinstance(update, dict):
+            raise ValueError("service.update must be a mapping")
+        mini = update.get("mini_batch_size")
+        epochs = update.get("epochs", 1)
+        rate = update.get("learning_rate", 1.0e-6)
+        rollout_count = package["tasks_per_round"] * package["grpo_group_size"]
+        if (mini is not None and (type(mini) is not int or mini < 8 or mini % 8
+                                  or rollout_count % mini)):
+            raise ValueError("service mini_batch_size must divide the rollout budget and eight devices")
+        if (type(epochs) is not int or epochs < 1 or isinstance(rate, bool)
+                or not isinstance(rate, (int, float)) or not isfinite(rate) or rate <= 0):
+            raise ValueError("service update requires positive epochs and learning_rate")
         if self.performance_enabled:
             token_budget = actor_config.get("ppo_max_token_len_per_gpu")
             if type(token_budget) is not int or token_budget < 1:

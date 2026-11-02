@@ -363,7 +363,8 @@ class TrainingPackage:
 
 def assemble_training_package(*, package_id, proposal, designer_action_ref,
         target_ability_id, designer_result, benchmark_pool, task_registry,
-        service_checkpoint_before, config=TrainingPackageConfig(), round_index=0):
+        service_checkpoint_before, config=TrainingPackageConfig(), round_index=0,
+        benchmark_selector=None):
     """Select an exact Designer/Benchmark task mix from certified task records."""
     from rift.tasks import Proposal
     if (not isinstance(proposal, Proposal) or not proposal.is_training_plan
@@ -387,8 +388,16 @@ def assemble_training_package(*, package_id, proposal, designer_action_ref,
 
     designer_tasks = successes[:config.designer_task_count]
     seed = config.seed_for_round(round_index)
-    benchmark_refs = tuple(random.Random(seed).sample(
-        sorted(benchmark_pool.task_refs), config.benchmark_task_count))
+    if benchmark_selector is None:
+        benchmark_refs = tuple(random.Random(seed).sample(
+            sorted(benchmark_pool.task_refs), config.benchmark_task_count))
+    else:
+        benchmark_refs = tuple(benchmark_selector.select(benchmark_pool.task_refs,
+            config.benchmark_task_count, round_index=round_index, seed=seed))
+        if (len(benchmark_refs) != config.benchmark_task_count
+                or len(set(benchmark_refs)) != len(benchmark_refs)
+                or not set(benchmark_refs).issubset(benchmark_pool.task_refs)):
+            raise ValueError('benchmark selector returned an invalid certified task selection')
     sources = []
     for source, refs in (("designer", tuple(row.record_hash for row in designer_tasks)),
                          ("benchmark", benchmark_refs)):

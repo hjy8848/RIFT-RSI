@@ -21,6 +21,20 @@ class ExclusivePolicyResources:
         self._factories = {"service": service_factory, "designer": designer_factory}
         self._lock = Lock()
         self._active = None
+        self._service_update = None
+        self._service_profile = None
+
+    def configure_service_update(self, update):
+        """Pass the validated update config to the deployment's Service factory."""
+        if self._active is not None:
+            raise RuntimeError("cannot change runtime settings while a policy is active")
+        self._service_update = dict(update)
+
+    def configure_service_profile(self, tool_profile, evaluation_protocol):
+        if self._active is not None:
+            raise RuntimeError('cannot change runtime settings while a policy is active')
+        self._service_profile = {'tool_profile': tool_profile,
+                                 'evaluation_protocol': dict(evaluation_protocol)}
 
     @contextmanager
     def acquire(self, role, checkpoint):
@@ -31,7 +45,12 @@ class ExclusivePolicyResources:
         handle = None
         try:
             self._active = role
-            handle = self._factories[role](checkpoint)
+            options = {}
+            if role == 'service' and self._service_update is not None:
+                options['service_update'] = dict(self._service_update)
+            if role == 'service' and self._service_profile is not None:
+                options.update(self._service_profile)
+            handle = self._factories[role](checkpoint, **options)
             if (getattr(handle, "role", None) != role
                     or getattr(handle, "checkpoint", None) != checkpoint
                     or not callable(getattr(handle, "close", None))):
@@ -56,12 +75,21 @@ class RoleBoundBackend:
     handle therefore constructs a fresh backend for every UpdateRequest.
     """
     def __init__(self, resources, role, *, checkpoint_root, metric_sink=None,
-                 round_index=None):
+                 round_index=None, service_update=None):
         if role not in ("service", "designer"):
             raise ValueError("unknown VERL policy role")
         self.resources, self.role = resources, role
         self.checkpoint_root = Path(checkpoint_root)
         self.metric_sink, self.round_index = metric_sink, round_index
+        self.service_update = dict(service_update or {}) if role == 'service' else {}
+
+    def budget_for(self, request):
+        if self.role != 'service':
+            raise ValueError('matched-control budgets are defined for Service updates')
+        from rift.evolution.matched_control import UpdateBudget
+        return UpdateBudget(self.service_update.get('mini_batch_size') or max(8, len(request.rollouts)),
+                            self.service_update.get('epochs', 1),
+                            self.service_update.get('learning_rate', 1e-6))
 
     def train(self, request):
         started = time.perf_counter()
@@ -78,10 +106,14 @@ class RoleBoundBackend:
             create_backend = getattr(runtime, "create_update_backend", None)
             if not callable(create_backend):
                 raise ValueError(f"{self.role} runtime must create a checkpoint-bound VERL backend per update")
+            update_args = {}
+            if self.service_update:
+                update_args = {'mini_batch_size': self.service_update.get('mini_batch_size'),
+                               'epochs': self.service_update.get('epochs', 1)}
             backend = create_backend(request, metric_sink=self.metric_sink,
                 round_index=self.round_index, output_dir=output_dir,
                 after_revision=str(after_step), run_id=run_id,
-                checkpoint_manifest_path=checkpoint_manifest_path)
+                checkpoint_manifest_path=checkpoint_manifest_path, **update_args)
             if not callable(getattr(backend, "train", None)):
                 raise ValueError(f"{self.role} runtime did not construct its pinned VERL backend")
             result = backend.train(request)

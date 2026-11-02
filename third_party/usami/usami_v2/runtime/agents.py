@@ -184,11 +184,13 @@ def _public_tool(name, description, properties, required):
                        "required": required, "additionalProperties": False}}}
 
 
-def service_tools():
+def service_tools(profile='full9'):
     """The small Agent-facing surface; internal case/quote/consent steps stay hidden."""
     line = {"type": "string", "description": "Order line ID from get_order_details."}
     quantity = {"type": "integer", "minimum": 1, "description": "Number of purchased units."}
-    return [
+    if profile not in ('core4', 'full9'):
+        raise ValueError('unknown Service tool profile')
+    tools = [
         _public_tool("list_customer_orders",
                      "List the orders belonging to the authenticated customer. An order that has not been "
                      "delivered shows fulfillment_status 'unshipped' or 'shipped'; an order without that "
@@ -239,6 +241,11 @@ def service_tools():
                      "Send the next customer-facing message.",
                      {"message": {"type": "string"}}, ["message"]),
     ]
+    if profile == 'core4':
+        names = {'list_customer_orders', 'get_order_details',
+                 'return_delivered_order_items', 'respond_to_customer'}
+        return [tool for tool in tools if tool['function']['name'] in names]
+    return tools
 
 
 CUSTOMER_TOOLS = [{"type": "function", "function": {
@@ -271,6 +278,9 @@ class OpenAICustomerAgent:
             "no longer want to continue.\n"
             "PRIVATE CUSTOMER PROFILE: " + json.dumps(profile.model_dump(mode="json"), ensure_ascii=False)
         )
+        if not getattr(profile, 'accepts_proposals', True):
+            system += ("\nYour private choice is to decline the proposed action. "
+                       "Reply no and set declines_proposal=true in customer_turn.")
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": json.dumps({
                         "public_request": prompt.public_request,
@@ -278,7 +288,14 @@ class OpenAICustomerAgent:
                         "presented_offer": prompt.offer.model_dump(mode="json") if prompt.offer else None,
                         "conversation": [row.model_dump(mode="json") for row in prompt.conversation],
                     }, ensure_ascii=False)}]
-        request = self.settings.request(messages, CUSTOMER_TOOLS)
+        customer_tools = CUSTOMER_TOOLS
+        if not getattr(profile, 'accepts_proposals', True):
+            from copy import deepcopy
+            customer_tools = deepcopy(CUSTOMER_TOOLS)
+            properties = customer_tools[0]['function']['parameters']['properties']
+            properties['declines_proposal'] = {'type': 'boolean'}
+            customer_tools[0]['function']['parameters']['required'].append('declines_proposal')
+        request = self.settings.request(messages, customer_tools)
         request["tool_choice"] = {"type": "function", "function": {"name": "customer_turn"}}
         try:
             raw = self.client.complete(request)
@@ -326,9 +343,28 @@ class OpenAIServiceAgent:
         "multiple function calls in one response."
     )
 
+    CORE4_SYSTEM = (
+        "You are a commerce customer-service agent. Use only the shown tools and public customer request. "
+        "List the customer's orders, read the relevant order details, and explain the requested refund. "
+        "Ask the customer for confirmation before returning delivered items and never act if they decline. "
+        "Respect delivery status, return windows, quantities and the original payment method. "
+        "Report only results supported by tool output. Use respond_to_customer for replies and make "
+        "exactly one function call per response."
+    )
+
+    @classmethod
+    def system_for_profile(cls, profile):
+        if profile == 'full9':
+            return cls.SYSTEM
+        if profile == 'core4':
+            return cls.CORE4_SYSTEM
+        raise ValueError('unknown Service tool profile')
+
     def __init__(self, client: CompletionClient, *, skill_snapshot=None,
-                 skill_domain: str = "aftersales"):
+                 skill_domain: str = "aftersales", tool_profile='full9'):
         self.client = client
+        self.tool_profile = tool_profile
+        self.system_for_profile(tool_profile)
         self.settings: ModelSettings = client.settings.model_copy(deep=True)
         self.last_call: Optional[AgentCall] = None
         # Skills are optional and are only used by the Research Studio's
@@ -346,7 +382,7 @@ class OpenAIServiceAgent:
 
     def decide(self, prompt: ServicePrompt):
         self.last_call = None
-        system_prompt = self.SYSTEM
+        system_prompt = self.system_for_profile(self.tool_profile)
         self.last_skill_injection = None
         messages = [{"role": "system", "content": system_prompt},
                     {"role": "user", "content": json.dumps({
@@ -368,7 +404,7 @@ class OpenAIServiceAgent:
                 domain=self.skill_domain,
                 public_text=prompt.customer_request,
                 available_tools=tuple(sorted({
-                    row["function"]["name"] for row in service_tools()
+                    row["function"]["name"] for row in service_tools(self.tool_profile)
                     if isinstance(row, dict) and isinstance(row.get("function"), dict)
                     and isinstance(row["function"].get("name"), str)
                 })),
@@ -386,7 +422,7 @@ class OpenAIServiceAgent:
                 "rendered": rendered,
                 "rendered_hash": digest(rendered),
             }
-        request = self.settings.request(messages, service_tools())
+        request = self.settings.request(messages, service_tools(self.tool_profile))
         # Qwen thinking models reject `tool_choice=required`; keep automatic
         # selection and handle a safe, side-effect-free text reply explicitly.
         request["parallel_tool_calls"] = False
@@ -416,6 +452,10 @@ class OpenAIServiceAgent:
                 return ServiceAction(kind="reply", message=content, call=self.last_call)
         except (KeyError, TypeError, IndexError, AttributeError):
             pass
+        message = _one_tool_call(raw)
+        name = message['tool_calls'][0]['function']['name']
+        if name not in {tool['function']['name'] for tool in service_tools(self.tool_profile)}:
+            raise ServiceError('MODEL_OUTPUT_INVALID', 'Service selected a tool outside the active profile')
         action = ServiceAction.from_tool_message(raw, prompt.customer_id, prompt.observed_subject_ids,
                                                 prompt.available_merchant_scope_ids)
         data = action.model_dump(mode="json", exclude={"record_hash"})

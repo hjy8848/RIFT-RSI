@@ -359,6 +359,97 @@ def test_role_bound_backend_builds_per_update_and_closes_after_failure(tmp_path)
     assert events[2] == ("closed",)
 
 
+def test_service_update_options_reach_runtime_factory_and_backend(tmp_path):
+    from rift.runtime.resources import RoleBoundBackend
+    checkpoint = Checkpoint('service', '1', 'tok', 'digest')
+    options = {'mini_batch_size': 16, 'epochs': 3, 'learning_rate': 2e-6}
+    seen = {}
+
+    class Runtime:
+        role = 'service'
+        def __init__(self): self.checkpoint = checkpoint
+        def verify_loaded_state(self, expected): return expected == checkpoint
+        def create_update_backend(self, request, **kwargs):
+            seen['backend'] = kwargs
+            return SimpleNamespace(train=lambda request: 'updated')
+        def close(self): pass
+
+    def factory(expected, *, service_update):
+        assert expected == checkpoint
+        seen['factory'] = service_update
+        return Runtime()
+    resources = ExclusivePolicyResources(factory, lambda _: None)
+    resources.configure_service_update(options)
+    request = SimpleNamespace(policy_before=checkpoint, package_id='package')
+    backend = RoleBoundBackend(resources, 'service', checkpoint_root=tmp_path,
+                               service_update=options)
+    assert backend.train(request) == 'updated'
+    assert seen['factory'] == options
+    assert seen['backend']['mini_batch_size'] == 16 and seen['backend']['epochs'] == 3
+
+
+def test_learning_rate_override_updates_restored_optimizer_and_scheduler():
+    from rift.runtime.ascend_910b3 import _set_constant_learning_rate
+    optimizer = SimpleNamespace(param_groups=[{'lr': 1e-6, 'initial_lr': 1e-6},
+                                               {'lr': 1e-6, 'initial_lr': 1e-6}])
+    scheduler = SimpleNamespace(base_lrs=[1e-6, 1e-6], _last_lr=[1e-6, 1e-6])
+    engine = SimpleNamespace(optimizer=optimizer, lr_scheduler=scheduler)
+    assert _set_constant_learning_rate(engine, 2e-6) == 2e-6
+    assert all(group['lr'] == group['initial_lr'] == 2e-6 for group in optimizer.param_groups)
+    assert scheduler.base_lrs == scheduler._last_lr == [2e-6, 2e-6]
+    with pytest.raises(ValueError):
+        _set_constant_learning_rate(engine, 0)
+
+
+def test_restoring_second_matched_arm_reloads_the_shared_start_checkpoint():
+    from rift.runtime.ascend_910b3 import Ascend910B3RoleRuntime
+    start = Checkpoint('service', '0', 'tok', 'start')
+    after = Checkpoint('service', '1', 'tok', 'after-treatment')
+    loaded = []
+    worker = SimpleNamespace(load_checkpoint=lambda path: loaded.append(path))
+    runtime = object.__new__(Ascend910B3RoleRuntime)
+    runtime.role, runtime.worker_group, runtime._loaded_checkpoint = 'service', worker, after
+    runtime.checkpoint_store = SimpleNamespace(verify=lambda checkpoint: True,
+                                               resolve=lambda checkpoint: '/shared/start')
+    runtime.verify_runtime_environment = lambda role, group: role == 'service' and group is worker
+    runtime.serving_attestor = SimpleNamespace(verify_serving=lambda checkpoint: True)
+    assert not runtime.verify_resident_training_state('service', worker, start)
+    assert runtime.restore_training_state('service', worker, start)
+    assert loaded == ['/shared/start']
+    assert runtime.verify_runtime('service', worker, start)
+
+
+def test_service_update_config_validates_budget_and_learning_rate():
+    from copy import deepcopy
+    from dataclasses import replace
+    config = load_production_config(**_config_kwargs())
+    for update in ({'mini_batch_size': 24, 'epochs': 1, 'learning_rate': 1e-6},
+                   {'mini_batch_size': 16, 'epochs': 1, 'learning_rate': 0},
+                   {'mini_batch_size': 16, 'epochs': 0, 'learning_rate': 1e-6}):
+        rift = deepcopy(config.rift)
+        rift['service']['update'] = update
+        with pytest.raises(ValueError, match='service'):
+            replace(config, rift=rift).validate()
+
+
+def test_smoke_cli_forwards_configured_episode_budget(tmp_path, monkeypatch, capsys):
+    import json
+    from rift.runtime import ascend_910b3
+    budget = {'max_customer_turns': 4, 'max_service_decisions': 14,
+              'max_service_tool_calls': 10, 'max_model_calls': 18}
+    config = tmp_path / 'budget.json'
+    config.write_text(json.dumps(budget), encoding='utf-8')
+    seen = {}
+    def run(**kwargs):
+        seen.update(kwargs)
+        return {'status': 'fake'}
+    monkeypatch.setattr(ascend_910b3, 'run_service_smoke', run)
+    ascend_910b3.service_smoke_main(['--service-model', 'model', '--run-root', 'run',
+        '--verl-config-dir', 'config', '--episode-budget-config', str(config)])
+    assert seen['episode_budget'] == budget
+    assert json.loads(capsys.readouterr().out)['status'] == 'fake'
+
+
 def test_agent_loop_batch_rejects_incomplete_probe_result():
     class Batch:
         def generate(self, requests): return ()

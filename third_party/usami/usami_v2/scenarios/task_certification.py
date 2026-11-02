@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from itertools import product
 from typing import Dict, Literal, Optional, Tuple
 
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 
 from usami_harness.engine import Engine, replay_trace
 from usami_harness.models import Request, digest
@@ -19,7 +19,7 @@ from usami_v2.commerce import adapter
 from usami_v2.commerce.external import apply_event, reference_event
 from usami_v2.commerce.models import (
     BUSINESS_ACTIONS, Consent, Delegation, ExternalEvent, Operation, PREPARATIONS, World, case_id,
-    unit_credit,
+    unit_credit, omit_default_fields,
 )
 from .tasks import RemedyGoal, TaskSpec, check_task_scope, delegated_line_ids, evaluate_state_goals
 
@@ -45,6 +45,11 @@ class CustomerScenario(Sealed):
     return_received_after_days: Optional[int] = Field(default=None, ge=0, le=365, strict=True)
     second_refund_consent: bool = True
     reviews: Tuple[ReviewPlan, ...] = ()
+    accepts_proposals: bool = True
+
+    @model_serializer(mode='wrap')
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ('accepts_proposals',))
 
     @model_validator(mode="after")
     def unique_policy(self):
@@ -92,9 +97,14 @@ class TaskDesignCapabilities(Sealed):
     return_receipt_event_configured: bool = False
     policy_review_event_configured: bool = False
     customer_scopes: Tuple[CustomerTaskScope, ...] = ()
+    tools_available: Tuple[str, ...] = ()
     grounding_protocol: Literal[
         "public-intent-grounding-v1", "structured-intent-grounding-v2"
     ] = "structured-intent-grounding-v2"
+
+    @model_serializer(mode='wrap')
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ('tools_available',))
 
     @model_validator(mode="after")
     def capability_consistency(self):

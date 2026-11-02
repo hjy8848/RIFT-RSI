@@ -10,10 +10,12 @@ description = "Replay-grounded learning value research contracts"
 rift-verl-round = "rift.verl.cli:main"
 rift-evolve = "rift.evolution.cli:main"
 rift-ascend910b3-smoke = "rift.runtime.ascend_910b3:service_smoke_main"
+rift-diagnose-episodes = "rift.runtime.diagnose_episodes:main"
+rift-matched-control = "rift.evolution.matched_control:main"
 
 [project.optional-dependencies]
 usami = ["pydantic>=2.12,<3"]
-test = ["pytest>=8,<9"]
+test = ["pytest>=8,<9", "hypothesis>=6,<7"]
 runtime = ["PyYAML>=6,<7"]
 [tool.pytest.ini_options]
 pythonpath = ["src", "third_party/usami"]

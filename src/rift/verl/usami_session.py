@@ -35,7 +35,7 @@ class NativeUsamiSession:
     def __init__(self, world, task, profile, customer_agent, parser, *, budget, parser_schemas=None,
                  mode='reference', external_events=(), rollout_id=None, group_id=None, group_size=None,
                  sampling_seed=None, sampling_scope=None, task_ref=None, rift_mode='train',
-                 customer_seed=None, protocol_ref=None, protocol_digest=None):
+                 customer_seed=None, protocol_ref=None, protocol_digest=None, tool_profile='full9'):
         self.world, self.task, self.profile, self.customer_agent = world, task, profile, customer_agent
         self.parser, self.budget, self.parser_schemas = parser, budget, parser_schemas
         self.mode, self.external_events = mode, external_events
@@ -49,6 +49,9 @@ class NativeUsamiSession:
         self.task_ref, self.rift_mode = task_ref, rift_mode
         self.customer_seed = customer_seed
         self.protocol_ref, self.protocol_digest = protocol_ref, protocol_digest
+        from usami_v2.runtime.agents import service_tools
+        service_tools(tool_profile)
+        self.tool_profile = tool_profile
         if rift_mode not in ('train', 'probe'):
             raise ValueError('RIFT episode mode must be train or probe')
         if rift_mode == 'probe' and (not task_ref or not protocol_ref or not protocol_digest):
@@ -66,7 +69,8 @@ class NativeUsamiSession:
         from verl.experimental.agent_loop.tool_parser import ToolParser
         from verl.tools.schemas import OpenAIFunctionToolSchema
         from usami_v2.runtime.agents import service_tools
-        schemas = [OpenAIFunctionToolSchema.model_validate(row) for row in service_tools()]
+        schemas = [OpenAIFunctionToolSchema.model_validate(row)
+                   for row in service_tools(kwargs.get('tool_profile', 'full9'))]
         return cls(world, task, profile, customer_agent,
             ToolParser.get_tool_parser(parser_format, tokenizer), parser_schemas=schemas, **kwargs)
 
@@ -77,7 +81,7 @@ class NativeUsamiSession:
         self._events = asyncio.Queue()
         from usami_v2.runtime.runner import run_episode
         from usami_v2.runtime.agents import OpenAIServiceAgent, service_tools
-        self._tools = service_tools()
+        self._tools = service_tools(self.tool_profile)
         owner = self
         class BlockingService:
             uses_model = True
@@ -105,7 +109,7 @@ class NativeUsamiSession:
             raise ValueError('native episode ended before the first Service decision') from (value if kind == 'error' else None)
         self._prompt = value
         self._waiting = True
-        messages = [{'role': 'system', 'content': OpenAIServiceAgent.SYSTEM + "\n\n"
+        messages = [{'role': 'system', 'content': OpenAIServiceAgent.system_for_profile(self.tool_profile) + "\n\n"
                     + service_tool_protocol_reminder(self._tools)},
             {'role': 'user', 'content': json.dumps({'authenticated_customer_id': value.customer_id,
                 'available_merchant_scope_ids': list(value.available_merchant_scope_ids),
@@ -131,7 +135,8 @@ class NativeUsamiSession:
             'generation_id': generation_id, 'rift_mode': self.rift_mode,
             'task_ref': self.task_ref, 'sampling_seed': self.sampling_seed,
             'customer_seed': self.customer_seed, 'protocol_ref': self.protocol_ref,
-            'protocol_digest': self.protocol_digest}, response=response)
+            'protocol_digest': self.protocol_digest, 'tool_profile': self.tool_profile,
+            'system_prompt_sha256': self.system_prompt_hash()}, response=response)
         try:
             content, calls = await self.parser.extract_tool_calls(list(token_ids), self.parser_schemas)
             if not isinstance(content, str) or not isinstance(calls, (list, tuple)):
@@ -150,6 +155,8 @@ class NativeUsamiSession:
                 action = ServiceAction(kind='invalid', call=call)
             elif calls:
                 try:
+                    if calls[0].name not in {row['function']['name'] for row in self._tools}:
+                        raise ServiceError('MODEL_OUTPUT_INVALID', 'tool is outside the active profile')
                     parsed = ServiceAction.from_tool_message(
                         response, self._prompt.customer_id, self._prompt.observed_subject_ids,
                         self._prompt.available_merchant_scope_ids)
@@ -200,6 +207,10 @@ class NativeUsamiSession:
     async def finish(self):
         if self._finished is None: raise ValueError('native episode has not finished')
         return self._finished
+
+    def system_prompt_hash(self):
+        from rift.runtime.service_protocol import service_profile_descriptor
+        return service_profile_descriptor(self.tool_profile)['system_prompt_sha256']
 
     async def cancel_for_budget(self):
         """Cancel a pending decision when its public context cannot fit."""

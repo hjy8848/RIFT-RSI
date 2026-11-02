@@ -397,7 +397,9 @@ def replay_episode(record: EpisodeRecord):
     replay = _event_replay(record.initial_world, record.task, record.profile, record)
     errors = list(replay.errors)
     try:
-        goals = evaluate_state_goals(record.initial_world, record.final_world, record.task)
+        goals = evaluate_state_goals(record.initial_world, record.final_world, record.task,
+                                     tool_executions=record.tool_executions, episode_status=record.status,
+                                     events=record.events)
         compliance = (evaluate_task_compliance(record.initial_world, record.final_world, record.task)
                       + (evaluate_execution_compliance(record.tool_executions),))
         end_index = max((row.event_index for row in record.service_messages), default=0)
@@ -776,7 +778,8 @@ def run_episode(initial_world: World, task: Union[TaskSpecV3, TaskSpecV2, TaskSp
         events = _append(events, "termination", {"status": status, "reason": terminal_reason}, world, world)
 
     # Independent result evaluation; the Service never sees these targets/results.
-    state_goals = evaluate_state_goals(base_world, world, task)
+    state_goals = evaluate_state_goals(base_world, world, task,
+                                       tool_executions=tools, episode_status=status, events=events)
     compliance = evaluate_task_compliance(base_world, world, task) + (evaluate_execution_compliance(tools),)
     end_index = max((row.event_index for row in service_messages), default=0)
     communication = evaluate_task_communication(base_world, task, facts=facts, messages=service_messages,
@@ -808,8 +811,9 @@ def save_episode(record: EpisodeRecord, path):
     payload = (record.model_dump_json(indent=2) + "\n").encode("utf-8")
     fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", suffix=".tmp", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as stream:
+            if hasattr(os, 'fchmod'):
+                os.fchmod(stream.fileno(), 0o600)
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())

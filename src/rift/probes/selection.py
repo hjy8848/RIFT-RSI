@@ -26,13 +26,14 @@ class ProbeSelector:
                before_checkpoint, recovery_tasks, retention_tasks, seed,
                protocol_ref, protocol_digest, frozen_at_ns=0,
                target_ability_id=None, ability_task_refs=(),
-               current_baseline_candidates=()):
+               current_baseline_candidates=(), fingerprint_resolver=None, min_distance=None):
         if type(seed) is not int or seed < 0:
             raise ValueError("non-negative integer sampling seed required")
         if type(recovery_tasks) is not int or recovery_tasks < 1 or type(retention_tasks) is not int or retention_tasks < 1:
             raise ValueError("positive recovery and retention task counts required")
         if not protocol_ref or not protocol_digest or not split_registry.policy_version:
             raise ValueError("protocol and versioned SplitRegistry required")
+        train_package_identities = tuple(train_package_identities)
         current_baselines = {}
         for row in current_baseline_candidates:
             if not isinstance(row, TaskEvidenceRecord):
@@ -40,15 +41,17 @@ class ProbeSelector:
             if row.task_ref in current_baselines:
                 raise ValueError("multiple current baseline records for one task")
             current_baselines[row.task_ref] = row
+        fingerprint_reject = self._fingerprint_filter(train_package_identities,
+            fingerprint_resolver, min_distance)
         recovery, recovery_reasons = self._eligible(recovery_candidates,
             DataPurpose.RECOVERY_FEEDBACK, before_checkpoint, protocol_digest,
             split_registry, train_package_identities,
-            current_baselines)
+            current_baselines, fingerprint_reject)
         retention, retention_reasons = self._eligible(retention_candidates,
             DataPurpose.RETENTION_FEEDBACK, before_checkpoint, protocol_digest,
             split_registry, tuple(train_package_identities)
                 + tuple(r.identity for r in recovery),
-            current_baselines)
+            current_baselines, fingerprint_reject)
         if target_ability_id is not None and not target_ability_id:
             raise ValueError("non-empty target ability ID required")
         ability_task_refs = frozenset(ability_task_refs)
@@ -141,7 +144,7 @@ class ProbeSelector:
 
     def preselect(self, *, recovery_candidates, retention_candidates, train_package_identities,
                   split_registry, recovery_tasks, retention_tasks, seed, target_ability_id=None,
-                  ability_task_refs=(), oversample=2):
+                  ability_task_refs=(), oversample=2, fingerprint_resolver=None, min_distance=None):
         """History-only stage: pick the tasks that deserve a fresh baseline measurement.
 
         Measuring a baseline costs real Service rollouts, so only a bounded shortlist
@@ -154,11 +157,15 @@ class ProbeSelector:
                 or retention_tasks < 1 or type(oversample) is not int or oversample < 1):
             raise ValueError("positive task counts and oversampling factor required")
         linked = frozenset(ability_task_refs)
+        train_package_identities = tuple(train_package_identities)
+        fingerprint_reject = self._fingerprint_filter(train_package_identities,
+            fingerprint_resolver, min_distance)
 
         def latest(candidates, purpose, excluded):
             best = {}
             for history in candidates:
-                if self._history_rejection(history, purpose, split_registry, excluded) is None:
+                if (self._history_rejection(history, purpose, split_registry, excluded) is None
+                        and not fingerprint_reject(history.task_ref)):
                     old = best.get(history.task_ref)
                     if old is None or history.observed_at > old.observed_at:
                         best[history.task_ref] = history
@@ -177,14 +184,30 @@ class ProbeSelector:
             retention, min(retention_tasks * oversample, len(retention)))
         return tuple(chosen_recovery), tuple(chosen_retention)
 
+    @staticmethod
+    def _fingerprint_filter(train_identities, resolver, min_distance):
+        if resolver is None and min_distance is None:
+            return lambda task_ref: False
+        from math import isfinite
+        from rift.probes.fingerprint import fingerprint_distance
+        if (not callable(resolver) or isinstance(min_distance, bool)
+                or not isinstance(min_distance, (float, int))
+                or not isfinite(min_distance) or min_distance <= 0):
+            raise ValueError('fingerprint resolver and a positive finite minimum distance are required')
+        training = tuple(resolver(identity.task) for identity in train_identities)
+        return lambda task_ref: any(fingerprint_distance(resolver(task_ref), item) < min_distance
+                                    for item in training)
+
     def _eligible(self, candidates, probe_purpose, checkpoint, protocol_digest,
-                  registry, excluded_identities, current_baselines):
+                  registry, excluded_identities, current_baselines, fingerprint_reject):
         rows, rejected, history_by_task = [], {}, {}
         def reject(reason): rejected[reason] = rejected.get(reason, 0) + 1
         for history in candidates:
             reason = self._history_rejection(history, probe_purpose, registry, excluded_identities)
             if reason is not None:
                 reject(reason); continue
+            if fingerprint_reject(history.task_ref):
+                reject('near_duplicate_of_training'); continue
 
             # The baseline must be measured separately from the trials that selected the
             # task. There is deliberately no fallback to the historical record itself.

@@ -34,12 +34,18 @@ class JsonlMetricSink:
 
 class NativeProbeTrialVerifier:
     """Verify Probe output from its persisted native Episode and token capture."""
-    def __init__(self, task_registry, capture_store):
+    def __init__(self, task_registry, capture_store, *, tool_profile=None):
         if not callable(getattr(task_registry, "resolve_record", None)):
             raise TypeError("Host certified task registry required")
         if not callable(getattr(capture_store, "resolve_episode", None)):
             raise TypeError("native Episode and capture resolver required")
         self.task_registry, self.capture_store = task_registry, capture_store
+        if tool_profile is not None:
+            from rift.runtime.service_protocol import service_profile_descriptor
+            self.profile_descriptor = service_profile_descriptor(tool_profile)
+        else:
+            self.profile_descriptor = None
+        self.tool_profile = tool_profile
 
     def verify_probe_trial(self, trial, probe, checkpoint):
         try:
@@ -72,6 +78,10 @@ class NativeProbeTrialVerifier:
                 return False
             for turn, call in enumerate(calls):
                 request = call.request
+                if self.profile_descriptor is not None and (
+                        request.get('tool_profile') != self.profile_descriptor['tool_profile']
+                        or request.get('system_prompt_sha256') != self.profile_descriptor['system_prompt_sha256']):
+                    return False
                 if (request.get("rift_mode") != "probe" or request.get("task_ref") != trial.task_ref
                         or request.get("sampling_seed") != trial.seed
                         or request.get("protocol_ref") != probe.protocol_ref

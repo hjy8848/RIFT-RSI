@@ -93,8 +93,24 @@ def _resolve(value):
     raise RuntimeError("Ascend Worker lifecycle cannot block an active asyncio loop")
 
 
+def _set_constant_learning_rate(engine, learning_rate):
+    """Apply an explicit run override after optimizer/scheduler restoration."""
+    from math import isfinite
+    if isinstance(learning_rate, bool) or not isfinite(learning_rate) or learning_rate <= 0:
+        raise ValueError("a positive finite learning rate is required")
+    optimizer, scheduler = engine.optimizer, engine.lr_scheduler
+    if optimizer is None or scheduler is None or not optimizer.param_groups:
+        raise ValueError("restored actor has no optimizer or learning-rate scheduler")
+    for group in optimizer.param_groups:
+        group['lr'] = learning_rate
+        group['initial_lr'] = learning_rate
+    scheduler.base_lrs = [learning_rate] * len(optimizer.param_groups)
+    scheduler._last_lr = [learning_rate] * len(optimizer.param_groups)
+    return learning_rate
+
+
 def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
-                 group_size=4, prompt_length=4096, response_length=8192):
+                 group_size=4, prompt_length=4096, response_length=8192, learning_rate=1.0e-6):
     """Compose the installed VERL v0.9.1 defaults and apply the RIFT target config."""
     import torch_npu  # noqa: F401 - load CANN platform support before VERL config inspection.
     import verl
@@ -118,8 +134,13 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu = max_sequence_length
     config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu = 1
     config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu = max_sequence_length
-    config.actor_rollout_ref.actor.optim.lr = 1.0e-6
+    config.actor_rollout_ref.actor.optim.lr = learning_rate
     config.actor_rollout_ref.actor.optim.total_training_steps = 1
+    # VERL v0.9.1 steps this scheduler once per outer update, after all PPO
+    # minibatches. A constant schedule with no warmup remains valid over rounds.
+    config.actor_rollout_ref.actor.optim.lr_scheduler_type = "constant"
+    config.actor_rollout_ref.actor.optim.lr_warmup_steps = 0
+    config.actor_rollout_ref.actor.optim.lr_warmup_steps_ratio = 0.0
     config.actor_rollout_ref.actor.checkpoint.save_contents = ["model", "optimizer", "extra"]
     config.actor_rollout_ref.actor.checkpoint.load_contents = ["model", "optimizer", "extra"]
     config.actor_rollout_ref.rollout.name = "vllm"
@@ -171,10 +192,13 @@ class _UsamiCustomer:
     def decide(self, prompt, profile):
         from usami_v2.runtime.customer import CustomerDecision
         self.turns += 1
+        if not getattr(profile, 'accepts_proposals', True):
+            return CustomerDecision(message='No, please do not proceed.',
+                                    declines_proposal=True, finish=True)
         if self.turns == 1:
-            # The Service must ask before refunding; this is the spoken yes.
+            # A neutral confirmation works for all supported remedy types.
             return CustomerDecision(
-                message="Yes, please go ahead with the refund to my original card.")
+                message="Yes, please go ahead.")
         return CustomerDecision(message="Thanks, that is all.", finish=True)
 
 
@@ -193,6 +217,12 @@ def service_host_provider_from_config(*, config, tokenizer, processor=None):
     if not manifest_path or not checkpoint_raw:
         raise RuntimeError("RIFT Ascend run manifest/checkpoint are absent in VERL AgentLoop worker")
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    from rift.runtime.service_protocol import service_profile_descriptor
+    selected_profile = manifest.get('tool_profile', 'full9')
+    descriptor = service_profile_descriptor(selected_profile)
+    if (('service_profile' in manifest and manifest['service_profile'] != descriptor)
+            or (selected_profile == 'core4' and manifest.get('service_profile') != descriptor)):
+        raise ValueError('worker manifest differs from the active Service tool profile or prompt')
     from rift.replay.splits import SplitRegistry
     from rift.schemas import Checkpoint
     from rift.verl.capture_store import NativeCaptureStore
@@ -221,7 +251,9 @@ def service_host_provider_from_config(*, config, tokenizer, processor=None):
     return NativeHostProvider(task_registry, task_registry, _UsamiCustomerFactory(),
         checkpoint_source, checkpoint_store, capture_store, budget=budget,
         parser_format=manifest.get("parser_format", "hermes"),
-        mode=manifest.get("usami_mode", "reference"))
+        mode=manifest.get("usami_mode", "reference"),
+        tool_profile=manifest.get("tool_profile", "full9"),
+        evaluation_protocol=manifest.get("evaluation_protocol"))
 
 
 def _start_ray(config, run_root, *, worker_manifest_path=None, checkpoint=None):
@@ -301,7 +333,8 @@ class Ascend910B3RoleRuntime:
     def __init__(self, role, checkpoint, *, model_path, run_root,
                  checkpoint_store, serving_attestor, agent_loop_config=None,
                  worker_manifest_path=None, open_agent_loop=False,
-                 backend_bindings=None, initialize_vllm=True):
+                 backend_bindings=None, initialize_vllm=True, service_update=None,
+                 tool_profile='full9', evaluation_protocol=None):
         if role not in ("service", "designer"):
             raise ValueError("Ascend policy role must be Service or Designer")
         if open_agent_loop and (role != "service" or agent_loop_config is None):
@@ -310,20 +343,34 @@ class Ascend910B3RoleRuntime:
             raise ValueError("Service AgentLoop needs a verified checkpoint and worker-side manifest")
         if open_agent_loop and not initialize_vllm:
             raise ValueError("Service AgentLoop needs an initialized vLLM server")
+        if role == 'service':
+            from rift.runtime.service_protocol import service_profile_descriptor
+            descriptor = service_profile_descriptor(tool_profile)
+            if tool_profile == 'core4' and evaluation_protocol is None:
+                raise ValueError('core4 requires its evaluation protocol')
+            if open_agent_loop and evaluation_protocol is not None:
+                worker_manifest = json.loads(Path(worker_manifest_path).read_text(encoding='utf-8'))
+                if (worker_manifest.get('tool_profile') != tool_profile
+                        or worker_manifest.get('service_profile') != descriptor
+                        or worker_manifest.get('evaluation_protocol') != evaluation_protocol):
+                    raise ValueError('worker manifest is not bound to the configured Service profile')
         if checkpoint is not None and not initialize_vllm:
             raise ValueError("restoring an active role checkpoint needs an initialized vLLM server")
         self.role, self.checkpoint = role, checkpoint
+        self.tool_profile = tool_profile
         self.model_path, self.run_root = Path(model_path), Path(run_root)
         self.checkpoint_store, self.serving_attestor = checkpoint_store, serving_attestor
         self.initialize_vllm = initialize_vllm
         self.backend_bindings = dict(backend_bindings or {})
+        self.service_update = dict(service_update or {}) if role == "service" else {}
         self.closed = False
         if not self.model_path.is_dir():
             raise FileNotFoundError(f"{role} model directory is unavailable: {self.model_path}")
         if checkpoint is not None and checkpoint_store.verify(checkpoint) is not True:
             raise ValueError(f"{role} checkpoint failed full shard verification")
         self.config = _verl_config(role, self.model_path, run_root=self.run_root,
-            agent_loop_config=agent_loop_config)
+            agent_loop_config=agent_loop_config,
+            learning_rate=self.service_update.get("learning_rate", 1.0e-6))
         self._start_time = time.perf_counter()
         _start_ray(self.config, self.run_root,
                    worker_manifest_path=worker_manifest_path, checkpoint=checkpoint)
@@ -383,6 +430,12 @@ class Ascend910B3RoleRuntime:
         )
         from verl.trainer.ppo.utils import Role
         from verl.workers.engine_workers import ActorRolloutRefWorker
+        from verl.single_controller.base.decorator import Dispatch, register
+
+        class RIFTActorRolloutRefWorker(ActorRolloutRefWorker):
+            @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+            def set_training_learning_rate(self, learning_rate):
+                return _set_constant_learning_rate(self.actor.engine, learning_rate)
 
         # Initial checkpoint creation only needs the trainable actor. VERL's
         # ActorRolloutRefWorker.init_model() constructs the rollout engine when
@@ -393,7 +446,7 @@ class Ascend910B3RoleRuntime:
             mapping={role_enum: "global_pool"}, max_colocate_count=1)
         self.resource_pool_manager.create_resource_pool()
         class_dict = {str(role_enum): RayClassWithInitArgs(
-            cls=ray.remote(ActorRolloutRefWorker),
+            cls=ray.remote(RIFTActorRolloutRefWorker),
             config=self.config.actor_rollout_ref,
             distillation_config=self.config.get("distillation"),
             role=str(role_enum))}
@@ -471,10 +524,28 @@ class Ascend910B3RoleRuntime:
                 and self._loaded_checkpoint == checkpoint
                 and self.serving_attestor.verify_serving(checkpoint) is True)
 
+    def apply_training_hyperparameters(self, role, worker_group):
+        if role == 'service' and 'learning_rate' in self.service_update:
+            value = self.service_update['learning_rate']
+            results = worker_group.set_training_learning_rate(value)
+            if len(results) != WORLD_SIZE or any(item != value for item in results):
+                raise ValueError('learning-rate override was not applied on every FSDP rank')
+        return True
+
     def verify_runtime(self, role, worker_group, checkpoint):
         return (self.verify_runtime_environment(role, worker_group)
                 and self.checkpoint_store.verify(checkpoint) is True
                 and self._loaded_checkpoint == checkpoint)
+
+    def restore_training_state(self, role, worker_group, checkpoint):
+        """Restore and record the actual actor/optimizer/scheduler/RNG checkpoint."""
+        if (not self.verify_runtime_environment(role, worker_group)
+                or self.checkpoint_store.verify(checkpoint) is not True
+                or checkpoint.policy != role):
+            return False
+        worker_group.load_checkpoint(self.checkpoint_store.resolve(checkpoint))
+        self._loaded_checkpoint = checkpoint
+        return self.verify_runtime(role, worker_group, checkpoint)
 
     def record_saved_checkpoint(self, role, worker_group, checkpoint):
         if (not self.verify_runtime_environment(role, worker_group)
@@ -486,7 +557,7 @@ class Ascend910B3RoleRuntime:
 
     def create_update_backend(self, request, *, output_dir, after_revision,
                               run_id, metric_sink=None, round_index=None,
-                              checkpoint_manifest_path=None):
+                              checkpoint_manifest_path=None, mini_batch_size=None, epochs=None):
         from rift.verl.actor_backend import VerlServiceRLBackend, VerlDesignerRLBackend
         required = ("rollout_verifier", "run_recorder", "update_verifier")
         if any(name not in self.backend_bindings for name in required):
@@ -505,7 +576,10 @@ class Ascend910B3RoleRuntime:
             output_dir=output_dir, after_revision=after_revision, run_id=run_id,
             pad_token_id=int(self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None
                              else self.tokenizer.eos_token_id),
-            mini_batch_size=max(WORLD_SIZE, len(request.rollouts)), epochs=1,
+            mini_batch_size=(mini_batch_size if mini_batch_size is not None else
+                self.service_update.get("mini_batch_size") or max(WORLD_SIZE, len(request.rollouts))),
+            epochs=epochs if epochs is not None else self.service_update.get("epochs", 1),
+            learning_rate=self.service_update.get('learning_rate', 1e-6),
             metric_sink=metric_sink, round_index=round_index,
             checkpoint_manifest_path=checkpoint_manifest_path)
         backend_type = VerlServiceRLBackend if self.role == "service" else VerlDesignerRLBackend
@@ -519,13 +593,13 @@ class Ascend910B3RoleRuntime:
 
 def initialize_checkpoint(role, model_path, output_dir, *, checkpoint_store,
                           serving_attestor, run_root, agent_loop_config=None,
-                          initialize_vllm=True, synchronize=True):
+                          initialize_vllm=True, synchronize=True, service_update=None):
     """Create and verify one true starting checkpoint through VERL's FSDP2 worker."""
     tokenizer_id = str(Path(model_path).resolve())
     runtime = Ascend910B3RoleRuntime(role, None, model_path=model_path,
         run_root=run_root, checkpoint_store=checkpoint_store,
         serving_attestor=serving_attestor, agent_loop_config=agent_loop_config,
-        initialize_vllm=initialize_vllm)
+        initialize_vllm=initialize_vllm, service_update=service_update)
     try:
         return runtime.save_initial_checkpoint(output_dir, tokenizer_id=tokenizer_id,
             synchronize=synchronize)
@@ -561,7 +635,7 @@ def _smoke_scenario_draft():
             quantity=fixed(3)),), refund_approval_limit_cents=50000)
 
 
-def _create_smoke_task_registry(root):
+def _create_smoke_task_registry(root, *, episode_budget=None):
     """Certify a native Usami TRAIN task; this is not a benchmark data substitute."""
     from rift.benchmark.usami import CommerceHost
     from rift.replay.splits import SplitRegistry
@@ -590,7 +664,7 @@ def _create_smoke_task_registry(root):
             build.world_hash, task.record_hash, "smoke-refund", "ascend-smoke-v1",
             Split.TRAIN, DataPurpose.TRAIN),
         proof_budget=ProofBudget(),
-        episode_budget=EpisodeBudget(max_customer_turns=4,
+        episode_budget=episode_budget or EpisodeBudget(max_customer_turns=4,
             max_service_decisions=10, max_service_tool_calls=8, max_model_calls=10),
         task_registry=task_registry)
     challenge = {
@@ -614,7 +688,7 @@ def _create_smoke_task_registry(root):
     return task_registry, split_registry, result.tasks[0]
 
 
-def run_service_smoke(*, service_model, run_root, verl_config_dir):
+def run_service_smoke(*, service_model, run_root, verl_config_dir, episode_budget=None):
     """Run one real 8-NPU FSDP2 GRPO update on eight native Usami rollouts."""
     from dataclasses import asdict
     from hashlib import sha256
@@ -629,6 +703,11 @@ def run_service_smoke(*, service_model, run_root, verl_config_dir):
     from rift.verl.version import require_verl_version
     from rift.training.service_data import prepare_service_trajectory_update
     from rift.verl.sampling import rollout_seed
+    from usami_v2.runtime.runner import EpisodeBudget
+
+    budget = EpisodeBudget.model_validate(episode_budget or {
+        "max_customer_turns": 4, "max_service_decisions": 10,
+        "max_service_tool_calls": 8, "max_model_calls": 10})
 
     root = Path(run_root).resolve()
     if root.exists():
@@ -637,7 +716,7 @@ def run_service_smoke(*, service_model, run_root, verl_config_dir):
     for name in ("task_registry", "checkpoints", "episodes", "generations", "serving"):
         (root / name).mkdir()
     require_verl_version()
-    task_registry, _split_registry, task = _create_smoke_task_registry(root)
+    task_registry, _split_registry, task = _create_smoke_task_registry(root, episode_budget=budget)
     tokenizer_id = str(Path(service_model).resolve())
     checkpoint_store = FSDPCheckpointStore({}, world_size=WORLD_SIZE)
     serving_attestor = VerlServingAttestor(root / "serving", checkpoint_store)
@@ -657,6 +736,7 @@ def run_service_smoke(*, service_model, run_root, verl_config_dir):
     capture_store = NativeCaptureStore(root / "episodes", serialization=serialization,
         attestor=generation_attestor)
     worker_manifest = root / "worker-manifest.json"
+    from rift.runtime.service_protocol import service_profile_descriptor
     worker_manifest.write_text(json.dumps({
         "checkpoint_manifest": str(checkpoint_manifest),
         "split_registry": str(root / "task_registry" / "splits.json"),
@@ -665,8 +745,8 @@ def run_service_smoke(*, service_model, run_root, verl_config_dir):
         "generation_ledger": str(root / "generations"),
         "capture_store": str(root / "episodes"),
         "serialization": serialization,
-        "episode_budget": {"max_customer_turns": 4, "max_service_decisions": 10,
-            "max_service_tool_calls": 8, "max_model_calls": 10},
+        "episode_budget": budget.model_dump(mode="json", exclude={"record_hash"}),
+        "tool_profile": "full9", "service_profile": service_profile_descriptor("full9"),
         "parser_format": "hermes", "usami_mode": "reference",
     }, sort_keys=True, indent=2), encoding="utf-8")
 
@@ -736,9 +816,14 @@ def service_smoke_main(argv=None):
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--verl-config-dir", required=True,
         help="RIFT configs/verl directory visible on the Ascend host")
+    parser.add_argument("--episode-budget-config", help="JSON file containing EpisodeBudget fields")
     args = parser.parse_args(argv)
+    episode_budget = None
+    if args.episode_budget_config:
+        episode_budget = json.loads(Path(args.episode_budget_config).read_text(encoding="utf-8"))
     result = run_service_smoke(service_model=args.service_model,
-        run_root=args.run_root, verl_config_dir=Path(args.verl_config_dir))
+        run_root=args.run_root, verl_config_dir=Path(args.verl_config_dir),
+        episode_budget=episode_budget)
     print(json.dumps(result, sort_keys=True))
 
 

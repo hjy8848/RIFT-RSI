@@ -68,12 +68,15 @@ class BootstrapRunner:
             raise TypeError("BootstrapEvidenceVerifier required")
 
     def run(self, task_manifest: Sequence[BootstrapTask], checkpoint: Checkpoint, *,
-            protocol, trials_per_task=3, seed=0):
+            protocol, trials_per_task=3, seed=0, tool_profile=None):
         tasks = tuple(task_manifest)
         if not tasks or len({row.task_ref for row in tasks}) != len(tasks):
             raise ValueError("non-empty task manifest with distinct TaskRefs required")
         if type(trials_per_task) is not int or trials_per_task < 1 or type(seed) is not int or seed < 0:
             raise ValueError("positive trial budget and non-negative integer seed required")
+        if tool_profile is not None:
+            from rift.runtime.service_protocol import bind_service_protocol
+            protocol = bind_service_protocol(protocol, tool_profile)
         protocol_hash = _protocol_digest(protocol)
         manager = BankManager(success_threshold=self.success_threshold,
                               failure_threshold=self.failure_threshold)

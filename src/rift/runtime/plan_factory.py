@@ -89,7 +89,8 @@ class ProductionPlanFactory:
                  probe_seed=4100, designer_sampling_params=None,
                  designer_reward_baseline=0.0, lambda_retention=0.5,
                  min_valid_fraction=0.8, allowed_training_hashes=(), metric_sink=None,
-                 checkpoint_root=None, baseline_evidence_store=None):
+                 checkpoint_root=None, baseline_evidence_store=None, task_stats_store=None,
+                 service_update=None):
         required = (resources, commerce_host, benchmark_pool, task_registry, split_registry,
             task_evidence_store, probe_selector, probe_evidence_store, capture_store,
             designer_capture_store, checkpoint_store, update_verifier, reward_verifier,
@@ -141,6 +142,8 @@ class ProductionPlanFactory:
         self.allowed_training_hashes = tuple(allowed_training_hashes)
         self.metric_sink = metric_sink
         self.checkpoint_root = Path(checkpoint_root)
+        self.task_stats_store = task_stats_store
+        self.service_update = dict(service_update or {})
 
     def _action(self, round_index, service_checkpoint, designer_checkpoint,
                 banks, ability_registry, failures, ability_options):
@@ -312,6 +315,8 @@ class ProductionPlanFactory:
                     capture_store=self.capture_store, metric_sink=self.metric_sink,
                     round_index=round_index)
                 service_request, _realized_package = collector.collect(package, service_checkpoint)
+        if self.task_stats_store is not None:
+            self.task_stats_store.record_request(package, service_request, round_index)
         return recovery_snapshot, retention_snapshot, service_request
 
     def _make_plan(self, *, state, package, proposal, target_ability_id,
@@ -346,7 +351,8 @@ class ProductionPlanFactory:
             retention_snapshot=retention_snapshot,
             service_backend=RoleBoundBackend(self.resources, "service",
                 checkpoint_root=self.checkpoint_root,
-                metric_sink=self.metric_sink, round_index=state.round_index),
+                metric_sink=self.metric_sink, round_index=state.round_index,
+                service_update=self.service_update),
             designer_backend=RoleBoundBackend(self.resources, "designer",
                 checkpoint_root=self.checkpoint_root,
                 metric_sink=self.metric_sink, round_index=state.round_index),
@@ -389,7 +395,7 @@ class ProductionPlanFactory:
             task_registry=self.task_registry,
             service_checkpoint_before=service_checkpoint,
             config=self.package_config,
-            round_index=round_index)
+            round_index=round_index, benchmark_selector=self.task_stats_store)
         if proposal.ability_id == "NEW":
             ability_record = None
         else:

@@ -248,3 +248,120 @@ def test_host_renders_all_scored_bounds_from_structured_intent():
     assert "within 3 days" in task.customer_request
     assert task.request_bundle.intent_hash
     assert task.request_bundle.request_hash == digest(task.customer_request)
+
+
+def test_compile_rejects_duplicate_public_line_description_but_keeps_distinct_lines():
+    from usami_v2.scenarios.designer import TaskCapabilityUnsupported
+    distribution, slot = distribution_and_slot(70)
+    base = scenario_draft()
+    order = base.orders[0]
+    duplicate = replace_sealed(order.lines[0], alias='duplicate')
+    ambiguous = replace_sealed(base, orders=(replace_sealed(order,
+        lines=order.lines + (duplicate,)),))
+    spec = ambiguous.compile(distribution)
+    built = build_world(spec, slot.seed)
+    assert built.status == 'SAT'
+    with pytest.raises(TaskCapabilityUnsupported) as error:
+        compile_task(task_draft(), spec, built, distribution)
+    assert error.value.code == 'AMBIGUOUS_TARGET'
+    refusal = TaskDraft(task_id='ambiguous-refusal', customer_alias='customer', refusal_goals=({
+        'goal_id': 'decline', 'line_alias': 'damaged', 'reason_code': 'RETURN_WINDOW_EXPIRED'},))
+    with pytest.raises(TaskCapabilityUnsupported) as error:
+        compile_task(refusal, spec, built, distribution)
+    assert error.value.code == 'AMBIGUOUS_TARGET'
+    distinct_spec = base.compile(distribution)
+    assert compile_task(task_draft(), distinct_spec, build_world(distinct_spec, slot.seed),
+                        distribution).remedy_goals
+
+
+def test_compile_rejects_duplicate_public_order_descriptions():
+    from usami_v2.scenarios.designer import TaskCapabilityUnsupported
+    distribution, slot = distribution_and_slot(71)
+    base = scenario_draft()
+    order = base.orders[0]
+    copied_lines = tuple(replace_sealed(line, alias='copy_' + line.alias) for line in order.lines)
+    second = replace_sealed(order, alias='second_purchase', lines=copied_lines)
+    spec = replace_sealed(base, orders=(order, second)).compile(distribution)
+    built = build_world(spec, slot.seed)
+    assert built.status == 'SAT'
+    draft = TaskDraft(task_id='cancel-ambiguous', customer_alias='customer',
+        cancellation_goals=({'goal_id': 'cancel', 'line_alias': 'damaged'},))
+    with pytest.raises(TaskCapabilityUnsupported) as error:
+        compile_task(draft, spec, built, distribution)
+    assert error.value.code == 'AMBIGUOUS_TARGET'
+
+
+def test_refusal_goal_requires_order_details_and_finished_episode():
+    from types import SimpleNamespace
+    from usami_v2.scenarios.tasks import delegated_line_ids, evaluate_state_goals
+    distribution, slot = distribution_and_slot(72)
+    spec = scenario_draft().compile(distribution)
+    built = build_world(spec, slot.seed)
+    draft = TaskDraft(task_id='refusal', customer_alias='customer', refusal_goals=({
+        'goal_id': 'decline-refund', 'line_alias': 'damaged',
+        'reason_code': 'RETURN_WINDOW_EXPIRED', 'requested_action': 'refund'},))
+    task = compile_task(draft, spec, built, distribution)
+    line_id = dict(built.private_aliases)['damaged']
+    order_id = built.world.lines[line_id].order_id
+    assert delegated_line_ids(task) == (line_id,)
+    assert 'refund' in task.customer_request
+    assert evaluate_state_goals(built.world, built.world, task, episode_status='customer_finished')[0].status == 'FAIL'
+    read = SimpleNamespace(operation={'name': 'get_order_details', 'resource_id': order_id},
+                           result={'success': True})
+    assert evaluate_state_goals(built.world, built.world, task, tool_executions=(read,),
+                                episode_status='budget_exhausted')[0].status == 'FAIL'
+    assert evaluate_state_goals(built.world, built.world, task, tool_executions=(read,),
+                                episode_status='customer_finished')[0].status == 'PASS'
+    assert TaskDraft.model_validate(draft.model_dump(mode='json')).record_hash == draft.record_hash
+
+
+def test_refusal_certificate_checks_reason_and_recomputes():
+    from usami_v2.scenarios.refusal_certification import certify_refusal, verify_refusal_certificate
+    from usami_v2.scenarios.schema import IntegerRange
+    from usami_v2.scenarios.tasks import delegated_line_ids
+    distribution, slot = distribution_and_slot(73)
+    base = scenario_draft()
+    expired_order = replace_sealed(base.orders[0], delivered_days_ago=IntegerRange(low=40, high=40))
+    spec = replace_sealed(base, orders=(expired_order,)).compile(distribution)
+    built = build_world(spec, slot.seed)
+    draft = TaskDraft(task_id='expired-refund', customer_alias='customer', refusal_goals=({
+        'goal_id': 'refuse', 'line_alias': 'damaged', 'reason_code': 'RETURN_WINDOW_EXPIRED'},))
+    task = compile_task(draft, spec, built, distribution)
+    scenario = CustomerScenario(customer_id=task.customer_id, delegated_line_ids=delegated_line_ids(task))
+    certificate = certify_refusal(built.world, task, scenario)
+    assert certificate.status == 'CERTIFIED', certificate.blockers
+    assert certificate.candidates_exhausted and certificate.attempts[0]['verified']
+    assert verify_refusal_certificate(built.world, task, scenario, certificate)
+    wrong = replace_sealed(draft.refusal_goals[0], reason_code='APPROVAL_REQUIRED')
+    other_task = compile_task(replace_sealed(draft, refusal_goals=(wrong,)), spec, built, distribution)
+    assert certify_refusal(built.world, other_task, scenario).status == 'UNKNOWN'
+
+
+@pytest.mark.parametrize(('reason', 'action', 'status', 'days', 'limit'), [
+    ('RETURN_WINDOW_EXPIRED', 'refund', 'delivered', 40, 50000),
+    ('ORDER_NOT_CANCELLABLE', 'cancel', 'shipped', 1, 50000),
+    ('APPROVAL_REQUIRED', 'refund', 'delivered', 1, 1),
+    ('INSUFFICIENT_STOCK', 'reship', 'delivered', 1, 50000),
+    ('ORDER_NOT_DELIVERED', 'refund', 'shipped', 1, 50000),
+])
+def test_refusal_certificate_covers_business_rejection_codes(reason, action, status, days, limit):
+    from usami_v2.scenarios.refusal_certification import certify_refusal
+    from usami_v2.scenarios.schema import IntegerRange
+    from usami_v2.scenarios.tasks import delegated_line_ids
+    distribution, slot = distribution_and_slot(74)
+    base = scenario_draft()
+    order = replace_sealed(base.orders[0], fulfillment_status=status,
+                           delivered_days_ago=IntegerRange(low=days, high=days))
+    scenario = replace_sealed(base, orders=(order,), refund_approval_limit_cents=limit,
+                              default_stock=IntegerRange(low=0, high=0))
+    spec = scenario.compile(distribution)
+    built = build_world(spec, slot.seed)
+    assert built.status == 'SAT'
+    draft = TaskDraft(task_id='refusal-' + reason, customer_alias='customer', refusal_goals=({
+        'goal_id': 'refuse', 'line_alias': 'damaged', 'reason_code': reason,
+        'requested_action': action},))
+    task = compile_task(draft, spec, built, distribution)
+    profile = CustomerScenario(customer_id=task.customer_id, delegated_line_ids=delegated_line_ids(task))
+    certificate = certify_refusal(built.world, task, profile)
+    assert certificate.status == 'CERTIFIED', certificate.blockers
+    assert all(row['result']['error_code'] == reason for row in certificate.attempts)

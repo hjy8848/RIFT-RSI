@@ -17,7 +17,7 @@ class UpdateLedger:
         if not run_id or len(run_id) > 128 or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for c in run_id):
             raise ValueError('invalid update run ID')
         return self.root / (run_id + '.json')
-    def record_update(self, run_id, request, after, metrics):
+    def record_update(self, run_id, request, after, metrics, *, update_budget=None):
         before = request.policy_before
         if not self.checkpoint_store.verify(before) or not self.checkpoint_store.verify(after):
             raise ValueError('checkpoint evidence was not verified')
@@ -28,10 +28,23 @@ class UpdateLedger:
         row = {'run_id':run_id, 'request_digest':digest(asdict(request)), 'before':asdict(before),
             'after':asdict(after), 'before_artifact':self.checkpoint_store.artifact_digests[before],
             'after_artifact':self.checkpoint_store.artifact_digests[after]}
+        if update_budget is not None:
+            row['update_budget'] = asdict(update_budget)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         with path.open('x', encoding='utf-8') as stream:
             json.dump(row, stream, sort_keys=True)
         return str(path.resolve())
+
+    def record_update_with_budget(self, run_id, request, after, metrics, budget):
+        return self.record_update(run_id, request, after, metrics, update_budget=budget)
+
+    def verify_update_budget(self, update, budget):
+        if self.verify_update(update) is not True:
+            return False
+        try:
+            return json.loads(self._path(update.run_id).read_text(encoding='utf-8')).get('update_budget') == asdict(budget)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
     def verify_update(self, update):
         if not isinstance(update, CompletedUpdate): return False
         try:

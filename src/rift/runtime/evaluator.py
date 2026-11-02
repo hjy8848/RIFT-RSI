@@ -296,9 +296,27 @@ class ProductionServiceRolloutCollector:
         if set(episodes_by_request) != set(request_to_group):
             raise ValueError("one or more frozen Service rollout identities could not be recovered")
         episodes = [episodes_by_request[request["rift_request_id"]] for request in requests]
-        request = prepare_package_service_update(package, self.task_registry, episodes,
-                                                 checkpoint, self.capture_store)
         if self.metric_sink is not None:
+            from collections import Counter
+            from rift.runtime.diagnose_episodes import confirmation_order_compliance, episode_metrics
+            categories = Counter()
+            for episode in episodes:
+                metrics = episode_metrics(episode)
+                categories[metrics["category"]] += 1
+                self.metric_sink('service_episode_tool_calls', metrics['tool_calls'],
+                    round_index=self.round_index, task_ref=episode.task.record_hash,
+                    episode_id=episode.record_hash)
+                order = confirmation_order_compliance(episode)
+                self.metric_sink('service_confirmation_order_compliance', order,
+                    round_index=self.round_index, task_ref=episode.task.record_hash,
+                    episode_id=episode.record_hash, applicable=order is not None)
+                for length in metrics['response_token_lengths']:
+                    self.metric_sink('service_response_tokens', length,
+                        round_index=self.round_index, task_ref=episode.task.record_hash,
+                        episode_id=episode.record_hash)
+            for category, count in sorted(categories.items()):
+                self.metric_sink('service_episode_category_count', count,
+                    round_index=self.round_index, category=category)
             self.metric_sink('service_rollout_seconds', rollout_seconds,
                 round_index=self.round_index, request_count=len(pending))
             self.metric_sink('service_generated_tokens', generated_tokens,
@@ -306,6 +324,24 @@ class ProductionServiceRolloutCollector:
             self.metric_sink('service_tokens_per_second',
                 generated_tokens / rollout_seconds if rollout_seconds > 0 else 0.0,
                 round_index=self.round_index, source='newly_generated_rollouts')
-            self.metric_sink('service_valid_grpo_groups',
-                len({row.group_id for row in request.rollouts}), round_index=self.round_index)
-        return request
+        request, recorded_package = prepare_package_service_update(
+            package, self.task_registry, episodes, checkpoint, self.capture_store)
+        if self.metric_sink is not None:
+            grouped = {}
+            for row in request.rollouts:
+                grouped.setdefault(row.group_id, []).append(row)
+            for group in package.task_groups:
+                rows = grouped.get(group.group_id)
+                if rows is None:
+                    continue
+                successes = sum(int(row.reward) for row in rows)
+                self.metric_sink('service_group_successes', successes,
+                    round_index=self.round_index, task_ref=group.task_ref,
+                    group_id=group.group_id, source=group.source,
+                    group_size=group.group_size,
+                    informative=0 < successes < group.group_size)
+            self.metric_sink('service_valid_grpo_groups', len(grouped), round_index=self.round_index)
+            self.metric_sink('service_uniform_group_fraction',
+                sum(all(row.reward == rows[0].reward for row in rows) for rows in grouped.values()) / len(grouped),
+                round_index=self.round_index)
+        return request, recorded_package

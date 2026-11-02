@@ -52,11 +52,14 @@ def atomic_json(path, value: Any, immutable: bool = False) -> None:
                     raise ValueError("concurrent immutable publication conflict")
         else:
             os.replace(tmp, path)
-        directory = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        # Windows does not expose directory handles through os.open; the
+        # file itself has already been flushed before atomic publication.
+        if os.name != 'nt':
+            directory = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)

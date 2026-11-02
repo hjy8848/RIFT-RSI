@@ -33,9 +33,15 @@ probes:
   reuse_exact_task_seed_protocol: true
 service:
   algorithm: grpo
+  tool_profile: full9
   full_parameter: true
   lora_rank: 0
   unknown_group_policy: discard_entire_group
+  update:
+    # null uses all surviving rollouts (64 with the default full package).
+    mini_batch_size: null
+    epochs: 1
+    learning_rate: 1.0e-6
 training_package:
   schema_version: 1
   designer_worlds_per_round: 1

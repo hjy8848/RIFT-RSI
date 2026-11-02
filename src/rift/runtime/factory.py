@@ -67,8 +67,28 @@ def build_production_runtime(config, deployment, *, run_root):
     config.require_deployment_paths(deployment.paths)
     if Path(deployment.paths['run_root']).resolve() != Path(run_root).resolve():
         raise ValueError("deployment run_root and CLI run_root must identify the same run directory")
+    from rift.runtime.service_protocol import service_profile_descriptor, service_protocol_digest
+    tool_profile = config.rift.get('service', {}).get('tool_profile', 'full9')
+    profile_descriptor = service_profile_descriptor(tool_profile)
+    protocol = deployment.plan_dependencies.get('evaluation_protocol')
+    if protocol is None:
+        raise ValueError('production deployment requires its profile-bound evaluation_protocol')
+    expected_digest = service_protocol_digest(protocol, tool_profile)
+    if (deployment.bootstrap.protocol_digest != expected_digest
+            or deployment.plan_dependencies.get('protocol_digest') != expected_digest):
+        raise ValueError('Bootstrap and Probe protocols must bind the active Service tool profile')
+    if getattr(deployment.plan_dependencies.get('trial_verifier'), 'tool_profile', None) != tool_profile:
+        raise ValueError('Probe trial verifier must enforce the active Service tool profile')
+    if (tool_profile == 'core4'
+            and getattr(deployment.plan_dependencies.get('commerce_host'), 'tool_profile', None) != tool_profile):
+        raise ValueError('core4 requires a matching CommerceHost capability profile')
+    configure_profile = getattr(deployment.resources, 'configure_service_profile', None)
+    if not callable(configure_profile):
+        raise ValueError('production requires configurable Service runtime resources')
+    configure_profile(tool_profile, protocol)
     root = prepare_run_directory(run_root, config_snapshot=_config_snapshot(config),
         manifest={"requested_verl_commit": config.ascend["verl_commit"],
+                  "service_profile": profile_descriptor,
                   "target_platform": config.ascend.get("platform"),
                   "target_accelerator": config.ascend.get("accelerator"),
                   "target_device_count": config.ascend.get("devices"),
@@ -81,6 +101,7 @@ def build_production_runtime(config, deployment, *, run_root):
         deployment.task_evidence_store.save(record)
 
     dependencies = dict(deployment.plan_dependencies)
+    dependencies.pop('evaluation_protocol', None)
     checkpoint_store = dependencies.get('checkpoint_store')
     if (not callable(getattr(checkpoint_store, 'verify', None))
             or not callable(getattr(checkpoint_store, 'save_manifest', None))
@@ -139,6 +160,15 @@ def build_production_runtime(config, deployment, *, run_root):
     if dependencies.get('metric_sink') is not None and dependencies['metric_sink'] is not metrics:
         raise ValueError("production metrics must be written to this run's metrics.jsonl")
     dependencies['metric_sink'] = metrics
+    update = dict(config.rift.get('service', {}).get('update', {}))
+    dependencies['service_update'] = update
+    if update.get('learning_rate', 1.0e-6) != 1.0e-6:
+        configure = getattr(deployment.resources, 'configure_service_update', None)
+        if not callable(configure):
+            raise ValueError('custom Service learning rate requires a configurable Service runtime factory')
+        configure(update)
+    from rift.training.task_stats import TaskStatsStore
+    dependencies.setdefault('task_stats_store', TaskStatsStore(root / 'task-stats.jsonl'))
     plan_factory = ProductionPlanFactory(**dependencies)
     if deployment.bank_updater is None:
         bank_updater = ProductionBankUpdater(

@@ -4,6 +4,9 @@ No worker or model is created by importing this module. The host must supply
 real rollout and update attestors; fake evidence is never accepted implicitly.
 """
 from pathlib import Path
+from collections.abc import Mapping
+from math import isfinite
+from numbers import Real
 import time
 from rift.training.contracts import CompletedUpdate, UpdateRequest
 from rift.training.records import comparable_designer_rollouts
@@ -53,7 +56,7 @@ class VerlGRPOBackend:
     def __init__(self, role, worker_group, checkpoint_store, rollout_verifier,
                  run_recorder, update_verifier, runtime_verifier, weight_sync, *, output_dir, after_revision,
                  run_id, pad_token_id, mini_batch_size, epochs=1,
-                 metric_sink=None, round_index=None, checkpoint_manifest_path=None):
+                 metric_sink=None, round_index=None, checkpoint_manifest_path=None, learning_rate=1e-6):
         self.role, self.worker_group = role, worker_group
         self.checkpoint_store, self.rollout_verifier = checkpoint_store, rollout_verifier
         self.run_recorder, self.update_verifier = run_recorder, update_verifier
@@ -61,6 +64,7 @@ class VerlGRPOBackend:
         self.weight_sync = weight_sync
         self.output_dir, self.after_revision, self.run_id = Path(output_dir), after_revision, run_id
         self.pad_token_id, self.mini_batch_size, self.epochs = pad_token_id, mini_batch_size, epochs
+        self.learning_rate = learning_rate
         self.metric_sink, self.round_index = metric_sink, round_index
         self.checkpoint_manifest_path = (None if checkpoint_manifest_path is None
                                          else Path(checkpoint_manifest_path))
@@ -69,6 +73,18 @@ class VerlGRPOBackend:
         if self.metric_sink is not None:
             self.metric_sink(name, value, round_index=self.round_index,
                              role=self.role, **fields)
+
+    def _report_gradient_norms(self, metrics):
+        """Forward VERL's available gradient-norm measurements to run metrics."""
+        if self.metric_sink is None or not isinstance(metrics, Mapping):
+            return
+        for name, raw_value in metrics.items():
+            normalized_name = str(name).casefold()
+            if 'grad' not in normalized_name or 'norm' not in normalized_name:
+                continue
+            value = raw_value.item() if callable(getattr(raw_value, 'item', None)) else raw_value
+            if isinstance(value, Real) and not isinstance(value, bool) and isfinite(float(value)):
+                self._metric('service_gradient_norm', float(value), metric_name=str(name))
 
     def train(self, request):
         update_started = time.perf_counter()
@@ -106,10 +122,18 @@ class VerlGRPOBackend:
         resident = (callable(verify_resident)
                     and verify_resident(self.role, self.worker_group, request.policy_before) is True)
         if not resident:
-            self.worker_group.load_checkpoint(self.checkpoint_store.resolve(request.policy_before))
+            restore = getattr(self.runtime_verifier, 'restore_training_state', None)
+            if callable(restore):
+                if restore(self.role, self.worker_group, request.policy_before) is not True:
+                    raise ValueError('FSDP2 actor checkpoint restore failed')
+            else:
+                self.worker_group.load_checkpoint(self.checkpoint_store.resolve(request.policy_before))
             if self.runtime_verifier.verify_runtime(
                     self.role, self.worker_group, request.policy_before) is not True:
                 raise ValueError('restored FSDP2 actor does not match the requested checkpoint')
+        configure = getattr(self.runtime_verifier, 'apply_training_hyperparameters', None)
+        if callable(configure) and configure(self.role, self.worker_group) is not True:
+            raise ValueError('configured training hyperparameters were not applied')
         proto = DataProto.from_dict(tensors=tensors)
         infer = left_right_2_no_padding(proto.to_tensordict())
         tu.assign_non_tensor(infer, calculate_entropy=False, compute_loss=False, temperature=1.0)
@@ -151,6 +175,7 @@ class VerlGRPOBackend:
         backward_started = time.perf_counter()
         metrics = self.worker_group.update_actor(update_batch)
         self._metric(f'{self.role}_backward_seconds', time.perf_counter() - backward_started)
+        self._report_gradient_norms(metrics)
         checkpoint_started = time.perf_counter()
         self.worker_group.save_checkpoint(str(self.output_dir), global_step=after_step)
         self._metric('checkpoint_save_seconds', time.perf_counter() - checkpoint_started)
@@ -175,7 +200,13 @@ class VerlGRPOBackend:
         peak_memory = getattr(self.worker_group, 'get_peak_npu_memory_bytes', None)
         self._metric('npu_peak_memory_bytes', peak_memory() if callable(peak_memory) else None,
                      available=callable(peak_memory))
-        evidence = self.run_recorder.record_update(self.run_id, request, after, metrics)
+        record_budget = getattr(self.run_recorder, 'record_update_with_budget', None)
+        if self.role == 'service' and callable(record_budget):
+            from rift.evolution.matched_control import UpdateBudget
+            evidence = record_budget(self.run_id, request, after, metrics,
+                UpdateBudget(self.mini_batch_size, self.epochs, self.learning_rate))
+        else:
+            evidence = self.run_recorder.record_update(self.run_id, request, after, metrics)
         completed = CompletedUpdate(request, after, self.run_id, evidence)
         if self.update_verifier.verify_update(completed) is not True:
             raise ValueError('completed update evidence failed verification')

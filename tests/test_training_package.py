@@ -91,6 +91,115 @@ def _package(fixture, package_id='package-1'):
         service_checkpoint_before=checkpoint, config=config, round_index=3)
 
 
+def test_learnability_source_coverage_and_verification(native_fixture):
+    from rift.rewards.learnability import score_learnability, LearnabilityVerifier
+    from rift.rewards.learning_value import InsufficientEvidenceError
+
+    package = _package(native_fixture)
+    rollouts = []
+    for index, group in enumerate(package.task_groups):
+        for member in range(group.group_size):
+            rollouts.append(Rollout(Tokens((100 + index,), (200 + member,), (True,)),
+                package.service_checkpoint_before, group.task_ref, f'{index}-{member}',
+                float(member if group.source == 'designer' else 0), 'outcome', group.group_id))
+    def request(rows):
+        return UpdateRequest(package.service_checkpoint_before, package.package_id, tuple(rows), 'grpo')
+    stats = score_learnability(package, request(rollouts))
+    assert stats.scalar == 1 and stats.benchmark_mean == 0
+    assert stats.designer_informative_fraction == 1
+    verifier = LearnabilityVerifier()
+    assert verifier.verify_reward(stats, package, request(rollouts))
+    assert not verifier.verify_reward(replace(stats, designer_valid_groups=1), package, request(rollouts))
+    removed = package.designer_task_refs[0]
+    partial = request([r for r in rollouts if r.task_id != removed])
+    assert score_learnability(package, partial).designer_expected_groups == 2
+    with pytest.raises(InsufficientEvidenceError):
+        score_learnability(package, partial, min_valid=.75)
+
+
+@pytest.mark.parametrize(('successes', 'expected'), [(0, 0), (1, .75), (2, 1), (3, .75), (4, 0)])
+def test_learnability_formula(native_fixture, successes, expected):
+    from rift.rewards.learnability import score_learnability
+    package = _package(native_fixture)
+    package = replace(package, mix_configuration=replace(package.mix_configuration, group_size=4),
+                      task_groups=tuple(replace(group, group_size=4) for group in package.task_groups))
+    group = package.task_groups[0]
+    rollouts = tuple(Rollout(Tokens((1,), (2 + member,), (True,)),
+        package.service_checkpoint_before, group.task_ref, str(member),
+        float(member < successes), 'outcome', group.group_id) for member in range(4))
+    request = UpdateRequest(package.service_checkpoint_before, package.package_id, rollouts, 'grpo')
+    assert score_learnability(package, request).scalar == expected
+
+
+def test_refusal_challenge_is_grounded_certified_and_registry_reloads(tmp_path):
+    from usami_v2.scenarios.schema import IntegerRange
+    from rift.verl.task_registry import CertifiedTaskRegistry
+    distribution, _ = distribution_and_slot(101)
+    draft = scenario_draft('expired-world')
+    draft_data = draft.model_dump(mode='json', exclude={'record_hash'})
+    draft_data['orders'][0].pop('record_hash', None)
+    draft_data['orders'][0]['delivered_days_ago'] = IntegerRange(low=40, high=40).model_dump(
+        mode='json', exclude={'record_hash'})
+    from usami_v2.scenarios.designer import ScenarioDraft
+    draft = ScenarioDraft.model_validate(draft_data)
+    registry = SplitRegistry(policy_version=INSTANCE_DISJOINT_WITHIN_FAMILY_V1)
+    host = _host(distribution, registry)
+    challenge = {'task_id': 'expired', 'customer_alias': 'customer',
+        'hypothesis': 'the return period has expired',
+        'refusal_goals': [{'goal_id': 'refuse', 'line_alias': 'item',
+                           'reason_code': 'RETURN_WINDOW_EXPIRED'}],
+        'line_selectors': [{'alias': 'item', 'family': 'device', 'issue': 'damaged'}]}
+    proposal = Proposal('refusal-plan', 'respect policy', ability_id='NEW',
+        diagnosis_task_refs=('failure-1',),
+        world_draft=draft.model_dump(mode='json', exclude={'record_hash'}),
+        challenges=(challenge,))
+    result = host.certify_training_plan(proposal, world_seed=101)
+    assert len(result.tasks) == 1, result.challenge_results
+    task = result.tasks[0]
+    record = host.task_registry.resolve_record(task.record_hash)
+    assert record.certificate.protocol == 'commerce-refusal-certificate-v1'
+    path = tmp_path / 'certified-tasks.json'
+    host.task_registry.save(path)
+    restored = CertifiedTaskRegistry.load(path, registry)
+    assert restored.resolve_record(task.record_hash) == record
+    from rift_usami_fixtures import ScriptedCustomer
+    from usami_v2.commerce.models import Operation
+    from usami_v2.runtime.agents import ServiceAction
+    from usami_v2.runtime.runner import replay_episode, run_episode
+
+    class Service:
+        uses_model = False
+        last_call = None
+        def __init__(self, read, attempt=False):
+            self.read, self.attempt, self.index = read, attempt, 0
+        def decide(self, prompt):
+            self.index += 1
+            if self.read and self.index == 1:
+                return ServiceAction(kind='operation', operation=Operation(name='list_customer_orders',
+                    scope_id=next(iter(record.world.merchants)), resource_id=next(iter(record.world.merchants))))
+            if self.read and self.index == 2:
+                line_id = task.refusal_goals[0].line_ids[0]
+                return ServiceAction(kind='operation', operation=Operation(name='get_order_details',
+                    scope_id=next(iter(record.world.merchants)),
+                    resource_id=record.world.lines[line_id].order_id))
+            if self.read and self.attempt and self.index == 3:
+                return ServiceAction(kind='operation', operation=Operation(
+                    name='return_delivered_order_items', scope_id=next(iter(record.world.merchants)),
+                    resource_id=task.refusal_goals[0].line_ids[0], params={'quantity': 1}))
+            return ServiceAction(kind='reply', message='The return window has expired.')
+
+    complete = run_episode(record.world, task, record.profile, ScriptedCustomer(), Service(True))
+    assert complete.outcome.business_goal_success is True
+    assert replay_episode(complete).verified
+    skipped = run_episode(record.world, task, record.profile, ScriptedCustomer(), Service(False))
+    assert skipped.outcome.business_goal_success is False
+    assert replay_episode(skipped).verified
+    blocked = run_episode(record.world, task, record.profile, ScriptedCustomer(), Service(True, True))
+    assert blocked.tool_executions[-1].result['error_code'] == 'RETURN_WINDOW_EXPIRED'
+    assert blocked.outcome.business_goal_success is True
+    assert replay_episode(blocked).verified
+
+
 @pytest.fixture(scope='module')
 def native_fixture():
     return _native_fixture()
@@ -458,8 +567,11 @@ def test_production_factory_builds_runtime_without_model_or_worker_start(tmp_pat
 
     class Resources:
         def acquire(self, *args, **kwargs): raise AssertionError('runtime assembly must not create workers')
+        def configure_service_profile(self, profile, protocol):
+            assert profile == 'full9' and protocol == {'fixture': True}
 
     class TrialVerifier:
+        tool_profile = 'full9'
         def verify_probe_trial(self, *args): return True
 
     class CheckpointStore:
@@ -474,7 +586,9 @@ def test_production_factory_builds_runtime_without_model_or_worker_start(tmp_pat
     checkpoint_designer = Checkpoint('designer', 'r0', 'tok-d', 'weights-d')
     checkpoint_paths = {checkpoint_service: tmp_path / 'service-checkpoint',
                         checkpoint_designer: tmp_path / 'designer-checkpoint'}
-    bootstrap = BootstrapResult(checkpoint, 'protocol-digest', 42, 1, (), BankManager())
+    from rift.runtime.service_protocol import service_protocol_digest
+    protocol_digest = service_protocol_digest({'fixture': True}, 'full9')
+    bootstrap = BootstrapResult(checkpoint, protocol_digest, 42, 1, (), BankManager())
     bootstrap_runner = BootstrapRunner(BootstrapEvaluator(), BootstrapVerifier())
     config = load_production_config(
         rift_path='configs/dual_bank.yaml',
@@ -498,7 +612,7 @@ def test_production_factory_builds_runtime_without_model_or_worker_start(tmp_pat
         'reward_verifier': object(), 'action_verifier': object(),
         'snapshot_verifier': object(), 'trial_verifier': TrialVerifier(),
         'freeze_order_verifier': object(), 'protocol_ref': 'eval-v1',
-        'protocol_digest': 'protocol-digest',
+        'protocol_digest': protocol_digest, 'evaluation_protocol': {'fixture': True},
     }
     deployment = ProductionDeployment(
         paths={'service_model': str(service_model), 'designer_model': str(designer_model),
@@ -510,6 +624,11 @@ def test_production_factory_builds_runtime_without_model_or_worker_start(tmp_pat
         initial_designer=checkpoint_designer,
         resources=resources, task_evidence_store=task_evidence_store,
         plan_dependencies=dependencies, rounds=1)
+
+    mismatched = replace(deployment, plan_dependencies={**dependencies, 'protocol_digest': 'wrong-profile'})
+    with pytest.raises(ValueError, match='bind the active Service tool profile'):
+        build_production_runtime(config, mismatched, run_root=run_root)
+    assert not run_root.exists()
 
     runtime = build_production_runtime(config, deployment, run_root=run_root)
     assert isinstance(runtime, EvolutionRunRuntime)

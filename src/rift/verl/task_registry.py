@@ -128,6 +128,7 @@ class CertifiedTaskRegistry:
         from usami_v2.commerce.models import ExternalEvent, World
         from usami_v2.runtime.customer import CustomerProfileV3
         from usami_v2.scenarios.task_certification import CustomerScenario, TaskCertification
+        from usami_v2.scenarios.refusal_certification import RefusalCertificate
         from usami_v2.scenarios.tasks import TaskSpecV3
         registry = cls(split_registry)
         for task_ref, row in raw['records'].items():
@@ -141,7 +142,8 @@ class CertifiedTaskRegistry:
                 TaskSpecV3.model_validate(row['task']),
                 CustomerProfileV3.model_validate(row['profile']),
                 CustomerScenario.model_validate(row['scenario']),
-                TaskCertification.model_validate(row['certificate']), identity,
+                (RefusalCertificate if row['certificate'].get('protocol') == 'commerce-refusal-certificate-v1'
+                 else TaskCertification).model_validate(row['certificate']), identity,
                 tuple(ExternalEvent.model_validate(event) for event in row['external_events']))
             if record.task.record_hash != task_ref:
                 raise ValueError('CertifiedTaskRegistry key differs from native TaskRef')
@@ -152,6 +154,7 @@ class CertifiedTaskRegistry:
         return registry
     def _check(self, record, *, require_registered_identity=True):
         from usami_v2.scenarios.task_certification import verify_task_certificate
+        from usami_v2.scenarios.refusal_certification import RefusalCertificate, verify_refusal_certificate
         identity, task, world, profile, scenario, cert = (record.identity, record.task, record.world,
             record.profile, record.scenario, record.certificate)
         if not isinstance(identity, Identity): return False
@@ -188,11 +191,14 @@ class CertifiedTaskRegistry:
                 or set(profile.allowed_preparations) != set(scenario.allowed_preparations)
                 or profile.accepted_remedies != scenario.accepted_remedies
                 or profile.maximum_extra_charge_cents != scenario.maximum_extra_charge_cents
+                or profile.accepts_proposals != scenario.accepts_proposals
                 or profile.return_pickup_slot != scenario.return_pickup_slot): return False
         if ((scenario.latest_arrival is None) != (profile.latest_arrival_days is None)
                 or (scenario.latest_arrival is not None
                     and world.clock + timedelta(days=profile.latest_arrival_days) < scenario.latest_arrival)):
             return False
+        if isinstance(cert, RefusalCertificate):
+            return verify_refusal_certificate(world, task, scenario, cert) is True
         return verify_task_certificate(world, task, scenario, cert)['verified'] is True
     def resolve(self, task_ref):
         record = self._records.get(task_ref)

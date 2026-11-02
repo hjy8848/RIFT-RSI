@@ -1,5 +1,6 @@
 """P3/P4 focused tests: customer authority, one frozen-world episode and Replay."""
 import json
+import os
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -686,7 +687,8 @@ def test_read_only_request_is_scored_from_delivered_fact_and_replayed(tmp_path):
     assert record.replay_verified and replay_episode(record).verified
     artifact = tmp_path / "private" / "episode.json"
     save_episode(record, artifact)
-    assert artifact.stat().st_mode & 0o077 == 0
+    if os.name != "nt":  # POSIX mode bits do not represent Windows ACLs.
+        assert artifact.stat().st_mode & 0o077 == 0
     assert verify_episode_artifact(artifact)["verified"]
     with pytest.raises(FileExistsError):
         save_episode(record, artifact)
@@ -773,10 +775,12 @@ def test_explicit_openai_adapters_capture_request_and_raw_output_without_network
     }
     assert "PRIVATE CUSTOMER PROFILE" not in json.dumps(service_client.requests[0])
     available_tools = {row["function"]["name"]: row["function"] for row in service_tools()}
-    assert "merchant ID" in available_tools["list_customer_orders"]["description"]
-    assert "evidence references" in available_tools["get_case_status"]["description"]
-    assert "case ID" in available_tools["prepare_remedy_quote"]["description"]
-    assert "exact customer consent" in available_tools["commit_accepted_quote"]["description"]
+    assert len(available_tools) == 9
+    assert "authenticated customer" in available_tools["list_customer_orders"]["description"]
+    assert "order" in available_tools["get_order_details"]["description"]
+    assert "original payment" in available_tools["return_delivered_order_items"]["description"]
+    assert "cancel_order" in available_tools and "exchange_delivered_order_items" in available_tools
+    assert "prepare_remedy_quote" not in available_tools and "commit_accepted_quote" not in available_tools
 
     # Some compatible providers choose a normal final response under tool_choice=auto.
     # It is a safe, side-effect-free Customer reply rather than a malformed operation.

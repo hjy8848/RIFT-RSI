@@ -18,14 +18,23 @@ class DesignerTrainingWorld:
     tasks: tuple[object, ...]
 
 def certify_native(proposal_id, world, task, customer_scenario, budget):
+    if getattr(task, 'refusal_goals', ()):
+        from usami_v2.scenarios.refusal_certification import certify_refusal
+        return certify_refusal(world, task, customer_scenario, budget)
     from usami_v2.scenarios.task_certification import certify_task
     return certify_task(world, task, customer_scenario, budget)
 
-def certify(proposal_id, world, task, customer_scenario, budget):
+def verify_native_certificate(world, task, customer_scenario, certificate):
+    from usami_v2.scenarios.refusal_certification import RefusalCertificate, verify_refusal_certificate
+    if isinstance(certificate, RefusalCertificate):
+        return verify_refusal_certificate(world, task, customer_scenario, certificate)
     from usami_v2.scenarios.task_certification import verify_task_certificate
+    return verify_task_certificate(world, task, customer_scenario, certificate)['verified'] is True
+
+def certify(proposal_id, world, task, customer_scenario, budget):
     certificate = certify_native(proposal_id, world, task, customer_scenario, budget)
-    verification = verify_task_certificate(world, task, customer_scenario, certificate)
-    return public_certification(proposal_id, certificate, verified=verification["verified"])
+    verified = verify_native_certificate(world, task, customer_scenario, certificate)
+    return public_certification(proposal_id, certificate, verified=verified)
 
 def run_episode(*args, **kwargs):
     from usami_v2.runtime.runner import run_episode as native_run
@@ -54,6 +63,12 @@ def _customer_limits(task, build):
     """Build Customer bounds from structured remedy goals, if any."""
     if task.protocol != 'commerce-task-v3':
         raise ValueError('default Customer requires a structured commerce-task-v3 task')
+    refusals = getattr(task, 'refusal_goals', ())
+    if not task.remedy_goals and refusals:
+        allowed = {goal.requested_action for goal in refusals if goal.requested_action != 'cancel'}
+        limits = [goal.maximum_extra_charge_cents for goal in refusals
+                  if goal.maximum_extra_charge_cents is not None]
+        return tuple(sorted(allowed)), max(limits) if limits else 100_000_000, None, None
     if not task.remedy_goals:
         # Information-only tasks need no transaction delegation or consent.
         return (), 0, None, None
@@ -78,7 +93,9 @@ def default_customer_scenario(task, spec, build, *, return_received_after_days=N
     return CustomerScenario(customer_id=task.customer_id,
         delegated_line_ids=delegated_line_ids(task),
         accepted_remedies=allowed, maximum_extra_charge_cents=maximum, latest_arrival=latest,
-        return_received_after_days=return_received_after_days if returns else None)
+        return_received_after_days=return_received_after_days if returns else None,
+        accepts_proposals=not any(goal.reason_code == 'CUSTOMER_DECLINED'
+                                  for goal in getattr(task, 'refusal_goals', ())))
 
 def default_customer_profile(task, spec, build, *, delegation_lifetime_hours=24):
     from usami_v2.runtime.customer import CustomerProfile, bind_customer_profile
@@ -86,7 +103,9 @@ def default_customer_profile(task, spec, build, *, delegation_lifetime_hours=24)
     profile = CustomerProfile(customer_id=task.customer_id,
         accepted_remedies=allowed, maximum_extra_charge_cents=maximum, latest_arrival_days=days,
         delegation_lifetime_hours=delegation_lifetime_hours)
-    return bind_customer_profile(profile, task)
+    return bind_customer_profile(profile, task,
+        accepts_proposals=not any(goal.reason_code == 'CUSTOMER_DECLINED'
+                                  for goal in getattr(task, 'refusal_goals', ())))
 
 def _receipt_events(world, task, scenario):
     """Frozen receipt events the certified witness relied on; the rollout must schedule them."""
@@ -95,7 +114,7 @@ def _receipt_events(world, task, scenario):
 
 class CommerceHost:
     """Trusted native host with bounded grounding and certified task storage."""
-    def __init__(self, worlds, distribution, scenario_factory, profile_factory, customer_agent, *, registry, identity_factory, proof_budget, episode_budget, grounding_budget=None, task_registry=None, return_receipt_after_days=None):
+    def __init__(self, worlds, distribution, scenario_factory, profile_factory, customer_agent, *, registry, identity_factory, proof_budget, episode_budget, grounding_budget=None, task_registry=None, return_receipt_after_days=None, tool_profile=None):
         self.worlds = tuple(worlds)
         if distribution.split != "train" or any(spec.distribution_hash != distribution.record_hash for _, spec, _ in self.worlds):
             raise ValueError("Host requires a registered training distribution")
@@ -110,6 +129,11 @@ class CommerceHost:
         lifetime = 24 * ((return_receipt_after_days or 0) + 1)
         self.capability_options = ({'return_receipt_event_configured': True}
                                    if return_receipt_after_days is not None else None)
+        if tool_profile is not None:
+            from usami_v2.runtime.agents import service_tools
+            service_tools(tool_profile)
+            self.capability_options = {**(self.capability_options or {}), 'tool_profile': tool_profile}
+        self.tool_profile = tool_profile
         self.scenario_factory = scenario_factory or (
             lambda task, spec, build: default_customer_scenario(
                 task, spec, build, return_received_after_days=return_receipt_after_days))
@@ -158,12 +182,11 @@ class CommerceHost:
                 proposal.proposal_id, build.world, task, scenario, self.proof_budget)
             if (native_certificate.status != 'CERTIFIED'
                     or not native_certificate.full_task_reachability_certified):
-                from usami_v2.scenarios.task_certification import verify_task_certificate
-                verification = verify_task_certificate(
+                verification = verify_native_certificate(
                     build.world, task, scenario, native_certificate)
                 certification = public_certification(
                     proposal.proposal_id, native_certificate,
-                    verified=verification['verified'])
+                    verified=verification)
                 if certification.status is CertificationStatus.UNKNOWN:
                     unresolved = certification
                 else:
@@ -237,18 +260,24 @@ class CommerceHost:
                     reasons = tuple(native_certificate.blockers)
                     if (native_status != 'CERTIFIED'
                             or not native_certificate.full_task_reachability_certified):
-                        from usami_v2.scenarios.task_certification import verify_task_certificate
-                        verification = verify_task_certificate(
+                        verification = verify_native_certificate(
                             build.world, task, scenario, native_certificate)
                         public_result = public_certification(
                             proposal.proposal_id, native_certificate,
-                            verified=verification['verified'])
+                            verified=verification)
                         attempts.append({'candidate_index':index, 'task_ref':task.record_hash,
                             'status':public_result.status.value, 'native_status':native_status,
                             'reason':list(reasons)})
                         continue
-                    from usami_v2.scenarios.task_certification import certification_cost
-                    witness_cost = certification_cost(native_certificate)
+                    if getattr(task, 'refusal_goals', ()):
+                        orders = {build.world.lines[line_id].order_id for goal in task.refusal_goals
+                                  for line_id in goal.line_ids}
+                        tool_calls = 1 + len(orders)
+                        witness_cost = {'tool_calls': tool_calls, 'service_decisions': tool_calls + 1,
+                                        'customer_turns': 1, 'model_calls': tool_calls + 2}
+                    else:
+                        from usami_v2.scenarios.task_certification import certification_cost
+                        witness_cost = certification_cost(native_certificate)
                     if not self._budget_covers(witness_cost):
                         attempts.append({'candidate_index':index, 'task_ref':task.record_hash,
                             'status':'UNKNOWN', 'native_status':native_status,

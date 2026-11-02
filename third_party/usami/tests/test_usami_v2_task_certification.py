@@ -61,8 +61,11 @@ def test_frozen_task_finds_two_independent_valid_skus_and_replays_certificates()
     assert certificate.minimum_witnesses_met and len(certificate.witness_hashes) == 2
     chosen = {row.candidates[0].target_sku_id for row in certificate.attempts if row.status == "WITNESS"}
     assert chosen == {aliases["correct_choice_D"], aliases["correct_choice_E"]}
-    assert all(any(step.kind == "customer_consent" for step in row.steps)
-               and any(step.kind == "operation" for step in row.steps)
+    assert all(any(step.kind == "customer_delegation" for step in row.steps)
+               and any(step.kind == "operation"
+                       and step.evidence.get("request", {}).get("operation", {}).get("name")
+                       == "exchange_delivered_order_items"
+                       for step in row.steps)
                for row in certificate.attempts if row.status == "WITNESS")
     assert verify_task_certificate(world, task, scenario, certificate)["verified"]
 
@@ -101,7 +104,7 @@ def test_tampered_private_witness_is_detected_even_if_outer_hash_is_resealed():
         verify_task_certificate(world, task, scenario, resealed)
 
 
-def test_return_required_refund_needs_frozen_return_event_and_second_consent():
+def test_return_required_refund_needs_frozen_return_event_and_public_operations():
     world, aliases = frozen_world()
     world = world.clone()
     original_id = world.lines[aliases["damaged"]].sku_id
@@ -115,7 +118,10 @@ def test_return_required_refund_needs_frozen_return_event_and_second_consent():
                                                                   max_witnesses=1))
     assert certificate.status == "CERTIFIED"
     witness = next(row for row in certificate.attempts if row.status == "WITNESS")
-    assert sum(step.kind == "customer_consent" for step in witness.steps) == 2
+    operations = [step.evidence.get("request", {}).get("operation", {}).get("name")
+                  for step in witness.steps if step.kind == "operation"]
+    assert operations == ["list_customer_orders", "get_order_details", "request_item_return",
+                          "return_delivered_order_items"]
     assert sum(step.kind == "external_event" and step.evidence.get("action") == "apply"
                for step in witness.steps) == 1
     assert verify_task_certificate(world, task, scenario, certificate)["verified"]
@@ -125,10 +131,10 @@ def test_return_required_refund_needs_frozen_return_event_and_second_consent():
                                       maximum_extra_charge_cents=0)
     blocked = certify_task(world, task, missing_event)
     assert blocked.status == "UNKNOWN"
-    assert "return_receipt_event_not_registered_in_frozen_customer_scenario" in blocked.blockers
+    assert "return_receipt_event_not_configured" in blocked.blockers
 
 
-def test_frozen_approval_event_is_used_only_after_reference_requests_review():
+def test_refund_over_approval_limit_remains_unsupported_in_phase_one():
     world, aliases = frozen_world()
     world = world.clone()
     world.merchants[aliases["merchant"]].refund_approval_limit_cents = 1
@@ -138,19 +144,15 @@ def test_frozen_approval_event_is_used_only_after_reference_requests_review():
         reviews=(ReviewPlan(line_id=aliases["damaged"], approved=True, result_after_days=2),))
     certificate = certify_task(world, task, scenario,
                                ProofBudget(max_plan_candidates=8, max_operation_steps=12, max_witnesses=1))
-    assert certificate.status == "CERTIFIED"
-    witness = next(row for row in certificate.attempts if row.status == "WITNESS")
-    assert any(step.kind == "external_event" and step.evidence.get("action") == "apply"
-               for step in witness.steps)
-    assert any(step.kind == "operation"
-               and step.evidence.get("request", {}).get("operation", {}).get("name") == "request_policy_review"
-               for step in witness.steps)
+    assert certificate.status == "UNKNOWN"
+    assert not certificate.witness_hashes
+    assert "refund_exceeds_approval_limit_without_review_path_in_phase_1" in certificate.blockers
     assert verify_task_certificate(world, task, scenario, certificate)["verified"]
 
     no_review = customer_scenario(aliases, maximum_extra_charge_cents=0, latest_arrival=None)
     blocked = certify_task(world, task, no_review)
     assert blocked.status == "UNKNOWN"
-    assert "policy_review_event_not_registered_in_frozen_customer_scenario" in blocked.blockers
+    assert "refund_exceeds_approval_limit_without_review_path_in_phase_1" in blocked.blockers
 
 
 def test_task_certificate_cli_artifact_rebuilds_world_and_replays_private_witness(tmp_path):

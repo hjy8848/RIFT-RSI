@@ -65,6 +65,33 @@ class AcceptAll:
     def verify_probe_trial(self, trial_, probe, checkpoint): return True
 
 
+def test_optional_fingerprint_filter_applies_to_preselection_and_freeze():
+    from rift.probes.fingerprint import TaskFingerprint
+    near = fixed_record('near', WEAK)
+    other = fixed_record('other', WEAK)
+    retained = fixed_record('retained', MASTERED)
+    histories = (near, other, retained)
+    registry = SplitRegistry(tuple(row.identity for row in histories),
+                             policy_version=INSTANCE_DISJOINT_WITHIN_FAMILY_V1)
+    train = Identity('train-world', 'train-task', 'family', 'train-lineage', Split.TRAIN,
+                     DataPurpose.TRAIN)
+    same = TaskFingerprint((('refund',),), ((1, 2, 3),))
+    far = TaskFingerprint((('exchange',),), ((1, 2, 3),))
+    values = {'train-task': same, 'near': same, 'other': far, 'retained': far}
+    selector = ProbeSelector(record_verifier=AcceptAll())
+    kwargs = dict(recovery_candidates=(near, other), retention_candidates=(retained,),
+        train_package_identities=(train,), split_registry=registry, recovery_tasks=1,
+        retention_tasks=1, seed=3, fingerprint_resolver=values.__getitem__, min_distance=.5)
+    recovery, _ = selector.preselect(**kwargs)
+    assert [row.task_ref for row in recovery] == ['other']
+    baselines = tuple(fixed_record(row.task_ref, WEAK if row is not retained else MASTERED,
+                                  first_seed=2000) for row in histories)
+    recovery_snapshot, _ = selector.freeze(**kwargs, before_checkpoint=BEFORE,
+        protocol_ref='protocol', protocol_digest=PROTOCOL, current_baseline_candidates=baselines)
+    assert recovery_snapshot.probes[0].task_ref == 'other'
+    assert dict(recovery_snapshot.exclusions)['near_duplicate_of_training'] == 1
+
+
 class NullPolicyEvaluator:
     """Same success probability at every checkpoint."""
     def __init__(self, p_by_task): self.p = p_by_task

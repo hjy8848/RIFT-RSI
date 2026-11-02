@@ -15,7 +15,7 @@ from usami_v2.scenarios.schema import (
 )
 from usami_v2.scenarios.task_certification import CustomerTaskScope, TaskDesignCapabilities
 from usami_v2.scenarios.tasks import (
-    CustomerRequestBundle, OrderCancellationGoal, RemedyGoal, StructuredInformationObjective, TaskSpecV3,
+    CustomerRequestBundle, OrderCancellationGoal, RefusalGoal, RemedyGoal, StructuredInformationObjective, TaskSpecV3,
     check_task_scope, render_customer_request, request_intent_hash,
 )
 class ScenarioDraft(Sealed):
@@ -74,6 +74,20 @@ class CancellationDraft(Sealed):
     )
 
 
+class RefusalDraft(Sealed):
+    goal_id: str
+    line_alias: str
+    reason_code: Literal['RETURN_WINDOW_EXPIRED', 'ORDER_NOT_CANCELLABLE',
+                         'APPROVAL_REQUIRED', 'INSUFFICIENT_STOCK', 'ORDER_NOT_DELIVERED',
+                         'CUSTOMER_DECLINED', 'RESHIP_NOT_ELIGIBLE']
+    requested_action: Literal['refund', 'exchange', 'reship', 'cancel'] = 'refund'
+    maximum_extra_charge_cents: Optional[int] = Field(default=None, ge=0, strict=True)
+
+    @model_serializer(mode='wrap')
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ('requested_action', 'maximum_extra_charge_cents'))
+
+
 class InformationDraft(Sealed):
     goal_id: str
     subject_alias: str = Field(
@@ -99,14 +113,15 @@ class TaskDraft(Sealed):
     parent_training_evidence_hashes: Tuple[str, ...] = ()
     cancellation_goals: Tuple[CancellationDraft, ...] = Field(
         default=(), description="Whole-order cancellations of unshipped orders, one goal per order.")
+    refusal_goals: Tuple[RefusalDraft, ...] = ()
 
     @model_serializer(mode="wrap")
     def _compatible_dump(self, handler):
-        return omit_default_fields(handler(self), self, ("cancellation_goals",))
+        return omit_default_fields(handler(self), self, ("cancellation_goals", "refusal_goals"))
 
     @model_validator(mode="after")
     def unique_goal_ids(self):
-        rows = self.remedy_goals + self.information_goals + self.cancellation_goals
+        rows = self.remedy_goals + self.information_goals + self.cancellation_goals + self.refusal_goals
         if not rows or len({row.goal_id for row in rows}) != len(rows):
             raise ValueError("TaskDraft needs unique business or information goals")
         if any(len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value)
@@ -130,7 +145,7 @@ def task_design_capabilities(spec: ScenarioSpec, build: BuildResult, *,
                              information_goals_certifiable=False,
                              delivery_confirmation_available=False,
                              return_receipt_event_configured=False,
-                             policy_review_event_configured=False):
+                             policy_review_event_configured=False, tool_profile=None):
     """Construct the exact capability manifest shared by prompt and compiler."""
     aliases = dict(build.private_aliases)
     scopes = []
@@ -150,6 +165,10 @@ def task_design_capabilities(spec: ScenarioSpec, build: BuildResult, *,
     interaction = bool(interaction_certifier_available)
     information = bool(information_goals_certifiable)
     delivery = bool(delivery_confirmation_available)
+    tools_available = ()
+    if tool_profile is not None:
+        from usami_v2.runtime.agents import service_tools
+        tools_available = tuple(row['function']['name'] for row in service_tools(tool_profile))
     return TaskDesignCapabilities(
         scenario_hash=spec.record_hash,
         world_hash=build.world_hash,
@@ -159,8 +178,36 @@ def task_design_capabilities(spec: ScenarioSpec, build: BuildResult, *,
         delivery_confirmation_available=delivery,
         return_receipt_event_configured=bool(return_receipt_event_configured),
         policy_review_event_configured=bool(policy_review_event_configured),
-        customer_scopes=tuple(scopes),
+        customer_scopes=tuple(scopes), tools_available=tools_available,
     )
+
+
+def ensure_task_tools(task, world, tools_available):
+    """Reject new tasks outside the configured agent surface before certification."""
+    available = set(tools_available)
+    required = {'list_customer_orders', 'get_order_details', 'respond_to_customer'}
+    for goal in task.remedy_goals:
+        sku = world.skus[world.lines[goal.line_id].sku_id]
+        for remedy in goal.allowed_remedies:
+            required.update({'refund': {'return_delivered_order_items'},
+                             'exchange': {'list_exchange_options', 'exchange_delivered_order_items'},
+                             'reship': {'reship_order_items'}}[remedy])
+            if remedy == 'refund' and sku.return_required:
+                required.add('request_item_return')
+    if task.cancellation_goals:
+        required.add('cancel_order')
+    for goal in getattr(task, 'refusal_goals', ()):
+        required.update({'refund': {'return_delivered_order_items'}, 'cancel': {'cancel_order'},
+                         'exchange': {'list_exchange_options', 'exchange_delivered_order_items'},
+                         'reship': {'reship_order_items'}}[goal.requested_action])
+        if goal.requested_action == 'refund' and any(
+                world.skus[world.lines[line_id].sku_id].return_required for line_id in goal.line_ids):
+            required.add('request_item_return')
+    missing = required - available
+    if missing:
+        raise TaskCapabilityUnsupported('TOOL_PROFILE_UNSUPPORTED',
+            'task needs unavailable Service tools: ' + ', '.join(sorted(missing)))
+    return True
 
 
 
@@ -266,17 +313,55 @@ def compile_task(draft: TaskDraft, spec: ScenarioSpec, build: BuildResult,
             line_ids=tuple(sorted(line.id for line in build.world.lines.values() if line.order_id == order_id))))
     customer_id = aliases[draft.customer_alias]
     remedies, information, cancellations = tuple(remedies), tuple(information), tuple(cancellations)
-    customer_request = render_customer_request(build.world, customer_id, remedies, information, cancellations)
+    refusals = []
+    for row in draft.refusal_goals:
+        if row.line_alias not in customer_scope.line_aliases:
+            raise ValueError('refusal goal references an unknown order-line alias')
+        line_id = aliases[row.line_alias]
+        line_ids = (line_id,)
+        if row.requested_action == 'cancel':
+            order_id = build.world.lines[line_id].order_id
+            line_ids = tuple(sorted(line.id for line in build.world.lines.values() if line.order_id == order_id))
+        refusals.append(RefusalGoal(goal_id=row.goal_id, line_ids=line_ids,
+                                    reason_code=row.reason_code, requested_action=row.requested_action,
+                                    maximum_extra_charge_cents=row.maximum_extra_charge_cents))
+    refusals = tuple(refusals)
+    # This is a design-time gate, not a replay or certification rule: old
+    # frozen tasks must remain readable even if their wording was ambiguous.
+    from .tasks import _line_description
+    world = build.world
+    owned_lines = [line for line in world.lines.values()
+                   if world.orders[line.order_id].customer_id == customer_id]
+    line_targets = [goal.line_id for goal in remedies]
+    line_targets += [line_id for goal in refusals if goal.requested_action != 'cancel' for line_id in goal.line_ids]
+    for line_id in line_targets:
+        description = _line_description(world, line_id)
+        if sum(_line_description(world, line.id) == description for line in owned_lines) != 1:
+            raise TaskCapabilityUnsupported("AMBIGUOUS_TARGET", "public line description is not unique")
+    for goal in cancellations + tuple(goal for goal in refusals if goal.requested_action == 'cancel'):
+        descriptions = sorted(_line_description(world, line_id) for line_id in goal.line_ids)
+        matching_orders = 0
+        for order in world.orders.values():
+            if order.customer_id == customer_id:
+                candidate = sorted(_line_description(world, line.id) for line in owned_lines
+                                   if line.order_id == order.id)
+                matching_orders += candidate == descriptions
+        if matching_orders != 1:
+            raise TaskCapabilityUnsupported("AMBIGUOUS_TARGET", "public order description is not unique")
+    customer_request = render_customer_request(build.world, customer_id, remedies, information, cancellations, refusals)
     request_bundle = CustomerRequestBundle(
         customer_id=customer_id,
-        goal_ids=tuple(row.goal_id for row in remedies + cancellations + information),
-        intent_hash=request_intent_hash(customer_id, remedies, information, cancellations),
+        goal_ids=tuple(row.goal_id for row in remedies + cancellations + refusals + information),
+        intent_hash=request_intent_hash(customer_id, remedies, information, cancellations, refusals),
         request_hash=digest(customer_request))
     task = TaskSpecV3(
         task_id=draft.task_id, world_hash=build.world_hash, customer_id=aliases[draft.customer_alias],
         customer_request=customer_request, remedy_goals=remedies,
-        information_goals=information, cancellation_goals=cancellations, partition=distribution.split,
+        information_goals=information, cancellation_goals=cancellations, refusal_goals=refusals,
+        partition=distribution.split,
         source_distribution_hash=distribution.record_hash,
         parent_training_evidence_hashes=draft.parent_training_evidence_hashes,
         request_bundle=request_bundle)
+    if capabilities.tools_available:
+        ensure_task_tools(task, build.world, capabilities.tools_available)
     return check_task_scope(build.world, task)

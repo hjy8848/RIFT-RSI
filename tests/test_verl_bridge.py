@@ -781,5 +781,12 @@ def test_update_ledger_detects_checkpoint_and_receipt_tampering(tmp_path):
     ref=ledger.record_update('run1',request,after,{'mock':True})
     update=CompletedUpdate(request,after,'run1',ref)
     assert ledger.verify_update(update)
+    from rift.evolution.matched_control import UpdateBudget
+    budget = UpdateBudget(1, 2, 2e-6)
+    budget_ref = ledger.record_update_with_budget('run2', request, after, {'mock': True}, budget)
+    budget_update = CompletedUpdate(request, after, 'run2', budget_ref)
+    assert ledger.verify_update_budget(budget_update, budget)
+    assert not ledger.verify_update_budget(budget_update, UpdateBudget(1, 1, 2e-6))
+    assert not ledger.verify_update_budget(update, budget)
     (paths[1] / 'optim_world_size_1_rank_0.pt').write_bytes(b'tampered')
     assert not ledger.verify_update(update)
