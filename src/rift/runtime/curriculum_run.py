@@ -222,6 +222,14 @@ class ExperimentContext:
         marker.write_text(json.dumps(asdict(checkpoint), sort_keys=True), encoding='utf-8')
         return checkpoint
 
+    def adopt_initial_from(self, run_root):
+        """Start this run from another run's base checkpoint instead of writing a new one."""
+        checkpoint = self.checkpoint_from_run(run_root)
+        self.checkpoint_store.save_manifest(self.root / 'checkpoints' / 'initial.json')
+        (self.root / 'initial-checkpoint.json').write_text(
+            json.dumps(asdict(checkpoint), sort_keys=True), encoding='utf-8')
+        return checkpoint
+
     def checkpoint_from_run(self, run_root):
         """Load a finished ``train`` run's final checkpoint, or an earlier run's initial one.
 
@@ -408,13 +416,16 @@ def build_policy(name, arms, *, seed, window, fixed_family=None):
 
 
 def train(context, *, policy_name, arms, bench_specs, rounds, seed, package_config, window=10,
-          fixed_family=None):
+          fixed_family=None, init_from_run=None):
     """Run ``rounds`` curriculum rounds; resumable from the run directory."""
     from rift.benchmark.families import FAMILIES
     from rift.evolution.curriculum import CurriculumRunner, Selection
     from rift.training.package import FrozenBenchmarkTrainingPool
     from rift.training.task_stats import TaskStatsStore
-    initial = context.initial_checkpoint()
+    if init_from_run and not (context.root / 'initial-checkpoint.json').exists():
+        initial = context.adopt_initial_from(init_from_run)
+    else:
+        initial = context.initial_checkpoint()
     pool_path = context.root / 'bench-pool.json'
     if pool_path.exists():
         refs = tuple(json.loads(pool_path.read_text(encoding='utf-8'))['task_refs'])
@@ -550,6 +561,8 @@ def main(argv=None):
     train_parser.add_argument('--mini-batch-size', type=int, default=WORLD_SIZE)
     train_parser.add_argument('--epochs', type=int, default=1)
     train_parser.add_argument('--learning-rate', type=float, default=1e-6)
+    train_parser.add_argument('--init-from-run',
+        help='an earlier run directory whose base checkpoint to start from (skips writing a new one)')
     train_parser.add_argument('--restart-each-round', action='store_true',
         help='tear the NPU runtime down after every update (slow; the default keeps it up)')
     eval_parser = sub.add_parser('eval', help='evaluate a frozen checkpoint without updating it')
@@ -574,7 +587,8 @@ def main(argv=None):
         result = train(context, policy_name=args.policy, rounds=args.rounds, seed=args.seed,
             arms=load_json_argument(args.arms) if args.arms else list(DEFAULT_ARMS),
             bench_specs=load_json_argument(args.bench_specs) if args.bench_specs else list(DEFAULT_BENCH),
-            package_config=package_config, window=args.window, fixed_family=args.fixed_family)
+            package_config=package_config, window=args.window, fixed_family=args.fixed_family,
+            init_from_run=args.init_from_run)
     else:
         context = _context(args, UpdateBudget(WORLD_SIZE, 1, 1e-6), args.group_size,
                            response_length=args.response_length)
