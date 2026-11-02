@@ -13,6 +13,7 @@ from dataclasses import asdict
 from hashlib import sha256
 import json
 import math
+import os
 from pathlib import Path
 
 from rift.runtime.ascend_910b3 import CHAT_TEMPLATE_KWARGS, WORLD_SIZE
@@ -143,8 +144,10 @@ class WorldKit:
 class ExperimentContext:
     """Checkpoint/attestation stores shared by every runtime of one run directory."""
     def __init__(self, *, root, service_model, verl_config_dir, episode_budget, update_budget,
-                 tool_profile='full9', runtime_factory=None, group_size=4, response_length=8192):
+                 tool_profile='full9', runtime_factory=None, group_size=4, response_length=8192,
+                 keep_runtime=True):
         from rift.verl.checkpoints import FSDPCheckpointStore
+        self.keep_runtime = keep_runtime
         self.root, self.service_model = Path(root).resolve(), str(service_model)
         self.verl_config_dir, self.episode_budget = Path(verl_config_dir), episode_budget
         self.update_budget, self.tool_profile, self.group_size = update_budget, tool_profile, group_size
@@ -252,9 +255,12 @@ class ExperimentContext:
             manifest_path = self.root / 'checkpoints' / 'adopted.json'
             if not manifest_path.exists():
                 self.checkpoint_store.save_manifest(manifest_path)
-        path = self.root / ('worker-manifest-%s.json' % sha256(
-            json.dumps(asdict(checkpoint), sort_keys=True).encode()).hexdigest()[:12])
-        path.write_text(json.dumps({
+        # One fixed path: a runtime that stays up across rounds keeps the path it was
+        # started with, and its workers re-read this file whenever it changes.
+        path = self.root / 'worker-manifest.json'
+        temporary = path.with_name(path.name + '.tmp')
+        temporary.write_text(json.dumps({
+            'active_checkpoint': asdict(checkpoint),
             'checkpoint_manifest': str(manifest_path),
             'split_registry': str(self.world.splits_path),
             'task_registry': str(self.world.tasks_path),
@@ -268,6 +274,7 @@ class ExperimentContext:
             'parser_format': 'hermes', 'usami_mode': 'reference',
             'chat_template_kwargs': dict(CHAT_TEMPLATE_KWARGS),
         }, sort_keys=True, indent=2), encoding='utf-8')
+        os.replace(temporary, path)   # workers never see a half-written manifest
         return path
 
     def _ascend_runtime(self, checkpoint):
@@ -284,15 +291,38 @@ class ExperimentContext:
 
     def open_runtime(self, checkpoint):
         """Start one runtime for ``checkpoint``; registries must already hold every task."""
+        import time
         self.close_runtime()
         self.world.save()
+        started = time.perf_counter()
         self.runtime = self.runtime_factory(checkpoint)
+        self.metric_sink('runtime_start_seconds', time.perf_counter() - started)
         return self.runtime
+
+    def ensure_runtime(self, checkpoint):
+        """Reuse the live runtime when it already serves ``checkpoint``.
+
+        Starting one costs most of a round (Ray, FSDP workers, checkpoint load, vLLM), and
+        after an update the runtime itself holds the new weights, so it stays up across
+        rounds. Its workers pick up the round's new tasks and checkpoint from the
+        rewritten worker manifest and registries.
+        """
+        runtime = self.runtime
+        if runtime is not None and self.keep_runtime and runtime_checkpoint(runtime) == checkpoint:
+            self.world.save()
+            self._worker_manifest(checkpoint)
+            return runtime
+        return self.open_runtime(checkpoint)
 
     def close_runtime(self):
         runtime, self.runtime = self.runtime, None
         if runtime is not None:
             runtime.close()
+
+
+def runtime_checkpoint(runtime):
+    """The checkpoint a runtime currently holds (it moves forward after each update)."""
+    return getattr(runtime, '_loaded_checkpoint', None) or runtime.checkpoint
 
 
 class LazyBatch:
@@ -301,14 +331,11 @@ class LazyBatch:
         self.context, self.checkpoint = context, checkpoint
 
     def generate(self, requests):
-        runtime = self.context.runtime
-        if runtime is None or runtime.checkpoint != self.checkpoint:
-            runtime = self.context.open_runtime(self.checkpoint)
-        return runtime.service_batch.generate(requests)
+        return self.context.ensure_runtime(self.checkpoint).service_batch.generate(requests)
 
 
 class RoundBackend:
-    """Runs the real VERL update on the round's runtime, then releases the NPUs."""
+    """Runs the real VERL update on the live runtime, which stays up for the next round."""
     def __init__(self, context, index, checkpoint):
         self.context, self.index, self.checkpoint = context, index, checkpoint
 
@@ -319,9 +346,7 @@ class RoundBackend:
         from rift.verl.serving import checkpoint_step
         from rift.verl.rollout_evidence import NativeServiceRolloutVerifier
         context, step = self.context, checkpoint_step(request.policy_before) + 1
-        runtime = context.runtime
-        if runtime is None or runtime.checkpoint != self.checkpoint:
-            runtime = context.open_runtime(self.checkpoint)
+        runtime = context.ensure_runtime(self.checkpoint)
         try:
             runtime.backend_bindings = {
                 'rollout_verifier': NativeServiceRolloutVerifier(
@@ -334,9 +359,13 @@ class RoundBackend:
                 checkpoint_manifest_path=context.root / 'checkpoints' / ('service-step-%d.json' % step),
                 mini_batch_size=context.update_budget.mini_batch_size,
                 epochs=context.update_budget.epochs)
-            return backend.train(request)
-        finally:
+            completed = backend.train(request)
+        except BaseException:
+            context.close_runtime()    # a half-updated runtime must not serve another round
+            raise
+        if not context.keep_runtime:
             context.close_runtime()
+        return completed
 
 
 def run_id_for(index):
@@ -493,7 +522,7 @@ def _common(parser):
     parser.add_argument('--seed', type=int, default=2000)
 
 
-def _context(args, update_budget, group_size, response_length=8192):
+def _context(args, update_budget, group_size, response_length=8192, keep_runtime=True):
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.runtime.ascend_910b3 import _default_smoke_episode_budget
     budget = (EpisodeBudget.model_validate(json.loads(Path(args.episode_budget_config).read_text(encoding='utf-8')))
@@ -501,7 +530,7 @@ def _context(args, update_budget, group_size, response_length=8192):
     return ExperimentContext(root=args.run_root, service_model=args.service_model,
         verl_config_dir=args.verl_config_dir, episode_budget=budget,
         update_budget=update_budget, tool_profile=args.tool_profile, group_size=group_size,
-        response_length=response_length)
+        response_length=response_length, keep_runtime=keep_runtime)
 
 
 def main(argv=None):
@@ -521,6 +550,8 @@ def main(argv=None):
     train_parser.add_argument('--mini-batch-size', type=int, default=WORLD_SIZE)
     train_parser.add_argument('--epochs', type=int, default=1)
     train_parser.add_argument('--learning-rate', type=float, default=1e-6)
+    train_parser.add_argument('--restart-each-round', action='store_true',
+        help='tear the NPU runtime down after every update (slow; the default keeps it up)')
     eval_parser = sub.add_parser('eval', help='evaluate a frozen checkpoint without updating it')
     _common(eval_parser)
     eval_parser.add_argument('--specs', help='JSON list of {family, knobs, instances, seed}; inline or file')
@@ -539,7 +570,7 @@ def main(argv=None):
         budget = UpdateBudget(args.mini_batch_size, args.epochs, args.learning_rate)
         package_config = TrainingPackageConfig(tasks_per_round=args.tasks_per_round,
             sampling_seed=args.seed, group_size=args.group_size)
-        context = _context(args, budget, args.group_size)
+        context = _context(args, budget, args.group_size, keep_runtime=not args.restart_each_round)
         result = train(context, policy_name=args.policy, rounds=args.rounds, seed=args.seed,
             arms=load_json_argument(args.arms) if args.arms else list(DEFAULT_ARMS),
             bench_specs=load_json_argument(args.bench_specs) if args.bench_specs else list(DEFAULT_BENCH),

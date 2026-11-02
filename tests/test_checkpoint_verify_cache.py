@@ -8,6 +8,30 @@ sys.path[:0] = ['src', 'third_party/usami']
 from rift.verl import checkpoints
 
 
+class ParallelHashTests(unittest.TestCase):
+    def test_concurrent_hashing_gives_the_serial_result(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / 'ckpt'
+            directory.mkdir()
+            for kind in ('model', 'optim', 'extra_state'):
+                for rank in range(8):
+                    (directory / f'{kind}_world_size_8_rank_{rank}.pt').write_bytes(
+                        bytes([rank]) * (9 * 1024 * 1024 + rank))   # more than one read chunk
+            model, artifact = checkpoints._checkpoint_content_digests(directory, 8)
+            digests = {p.relative_to(directory).as_posix(): hashlib.sha256(p.read_bytes()).digest()
+                       for p in sorted(directory.rglob('*')) if p.is_file()}
+            expected_model = hashlib.sha256()
+            for rank in range(8):
+                name = f'model_world_size_8_rank_{rank}.pt'
+                expected_model.update(name.encode() + b'\0' + digests[name])
+            expected_artifact = hashlib.sha256()
+            for name, digest in sorted(digests.items()):
+                encoded = name.encode()
+                expected_artifact.update(len(encoded).to_bytes(8, 'big') + encoded + digest)
+            self.assertEqual((model, artifact), (expected_model.hexdigest(), expected_artifact.hexdigest()))
+
+
 class VerifyCacheTests(unittest.TestCase):
     def test_a_second_store_from_the_manifest_does_not_rehash(self):
         """VERL builds a fresh store per sample; the process must hash the shards once."""

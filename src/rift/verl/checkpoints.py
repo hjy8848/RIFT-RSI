@@ -88,7 +88,7 @@ def _checkpoint_content_digests(directory, world_size):
         raise ValueError('invalid world size')
     if not root.is_dir() or root.is_symlink():
         raise ValueError('invalid checkpoint directory')
-    content_digests = {}
+    files = []
     for path in sorted(root.rglob('*'), key=lambda p: p.relative_to(root).as_posix()):
         if path.is_symlink():
             raise ValueError('checkpoint symlinks are unsupported')
@@ -96,11 +96,21 @@ def _checkpoint_content_digests(directory, world_size):
             continue
         if not path.is_file():
             raise ValueError('checkpoint contains a non-regular file')
+        files.append(path)
+
+    def file_digest(path):
         content = hashlib.sha256()
         with path.open('rb') as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b''):
                 content.update(chunk)
-        content_digests[path.relative_to(root).as_posix()] = content.digest()
+        return content.digest()
+
+    # One shard per rank: hashing releases the GIL, so the shards are read concurrently.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, min(16, len(files)))) as pool:
+        digests = list(pool.map(file_digest, files))
+    content_digests = {path.relative_to(root).as_posix(): digest
+                       for path, digest in zip(files, digests)}
 
     for rank in range(world_size):
         for kind in ('model', 'optim', 'extra_state'):

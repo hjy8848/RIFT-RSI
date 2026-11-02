@@ -249,35 +249,120 @@ class EvaluateRehearsalTests(unittest.TestCase):
             self.assertTrue(runtimes and all(item.closed for item in runtimes))
 
 
+class RuntimeLifetimeTests(unittest.TestCase):
+    """The live runtime is reused across rounds and rebuilt whenever it cannot be trusted."""
+    def _context(self, root, keep=True):
+        from usami_v2.runtime.runner import EpisodeBudget
+        self.opened = []
+        parent = self
+
+        class Fake:
+            def __init__(self, loaded):
+                self.checkpoint, self._loaded_checkpoint, self.closed = loaded, loaded, False
+                parent.opened.append(self)
+
+            def close(self):
+                self.closed = True
+
+        context = run.ExperimentContext(root=root, service_model='m', verl_config_dir='.',
+            episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6),
+            runtime_factory=Fake, keep_runtime=keep)
+        context._worker_manifest = lambda checkpoint: self.published.append(checkpoint)
+        self.published = []
+        return context
+
+    def test_one_runtime_serves_every_round(self):
+        first, second = Checkpoint('service', '0', 't', 'w0'), Checkpoint('service', '1', 't', 'w1')
+        with tempfile.TemporaryDirectory() as root:
+            context = self._context(root)
+            runtime = context.ensure_runtime(first)
+            self.assertIs(context.ensure_runtime(first), runtime)
+            runtime._loaded_checkpoint = second          # what an update leaves behind
+            self.assertIs(context.ensure_runtime(second), runtime)
+            self.assertEqual(len(self.opened), 1)
+            self.assertEqual(self.published, [first, second])   # workers were told each round
+
+    def test_a_runtime_holding_another_checkpoint_is_replaced(self):
+        first, other = Checkpoint('service', '0', 't', 'w0'), Checkpoint('service', '5', 't', 'w5')
+        with tempfile.TemporaryDirectory() as root:
+            context = self._context(root)
+            old = context.ensure_runtime(first)
+            fresh = context.ensure_runtime(other)
+            self.assertIsNot(fresh, old)
+            self.assertTrue(old.closed)
+
+    def test_restart_each_round_never_reuses(self):
+        first = Checkpoint('service', '0', 't', 'w0')
+        with tempfile.TemporaryDirectory() as root:
+            context = self._context(root, keep=False)
+            context.ensure_runtime(first)
+            context.ensure_runtime(first)
+            self.assertEqual(len(self.opened), 2)
+
+    def test_a_failed_update_releases_the_runtime(self):
+        from types import SimpleNamespace
+        first = Checkpoint('service', '0', 't', 'w0')
+        with tempfile.TemporaryDirectory() as root:
+            context = self._context(root)
+            runtime = context.ensure_runtime(first)
+
+            def explode(*args, **kwargs):
+                raise RuntimeError('NaN loss')
+            runtime.create_update_backend = explode
+            request = SimpleNamespace(policy_before=first)
+            with self.assertRaises(RuntimeError):
+                run.RoundBackend(context, 0, first).train(request)
+            self.assertTrue(runtime.closed and context.runtime is None)
+
+
 class HostProviderReuseTests(unittest.TestCase):
-    def test_the_worker_builds_its_provider_once_per_manifest_and_checkpoint(self):
+    def _worker(self, root):
+        """A worker manifest on disk plus the stand-in registries it points at."""
+        import os
+        root = Path(root)
+        (root / 'splits.json').write_text('{}', encoding='utf-8')
+        (root / 'tasks.json').write_text('{}', encoding='utf-8')
+
+        def write(checkpoint):
+            (root / 'manifest.json').write_text(json.dumps({
+                'split_registry': str(root / 'splits.json'), 'task_registry': str(root / 'tasks.json'),
+                'active_checkpoint': checkpoint}), encoding='utf-8')
+        write({'revision': '0'})
+        os.environ['RIFT_ASCEND910B3_RUN_MANIFEST'] = str(root / 'manifest.json')
+        return write
+
+    def test_the_worker_rebuilds_its_provider_only_when_the_round_changes(self):
         import os
         from rift.runtime import ascend_910b3 as ascend
         built = []
         original = ascend._build_service_host_provider
         ascend._build_service_host_provider = lambda manifest, checkpoint: built.append(
-            (manifest, checkpoint)) or object()
+            checkpoint) or object()
         ascend._HOST_PROVIDERS.clear()
-        saved = {key: os.environ.get(key) for key in
-                 ('RIFT_ASCEND910B3_RUN_MANIFEST', 'RIFT_ASCEND910B3_ACTIVE_CHECKPOINT')}
+        saved = os.environ.get('RIFT_ASCEND910B3_RUN_MANIFEST')
         try:
-            os.environ['RIFT_ASCEND910B3_RUN_MANIFEST'] = 'm1.json'
-            os.environ['RIFT_ASCEND910B3_ACTIVE_CHECKPOINT'] = '{"c": 1}'
-            first = [ascend.service_host_provider_from_config(config=None, tokenizer=None)
-                     for _ in range(44)]
-            self.assertEqual(len(built), 1)
-            self.assertEqual(len({id(item) for item in first}), 1)
-            os.environ['RIFT_ASCEND910B3_ACTIVE_CHECKPOINT'] = '{"c": 2}'
-            ascend.service_host_provider_from_config(config=None, tokenizer=None)
-            self.assertEqual(len(built), 2)      # a different checkpoint is a different provider
+            with tempfile.TemporaryDirectory() as root:
+                write = self._worker(root)
+                first = [ascend.service_host_provider_from_config(config=None, tokenizer=None)
+                         for _ in range(44)]
+                self.assertEqual(len(built), 1)                    # 44 samples, one build
+                self.assertEqual(len({id(item) for item in first}), 1)
+                (Path(root) / 'tasks.json').write_text('{"grown": true}', encoding='utf-8')
+                ascend.service_host_provider_from_config(config=None, tokenizer=None)
+                self.assertEqual(len(built), 2)                    # new tasks were certified
+                write({'revision': '1'})
+                ascend.service_host_provider_from_config(config=None, tokenizer=None)
+                self.assertEqual(len(built), 3)                    # the policy was updated
+                ascend.service_host_provider_from_config(config=None, tokenizer=None)
+                self.assertEqual(len(built), 3)
+                self.assertEqual(len(ascend._HOST_PROVIDERS), 1)   # old rounds are dropped
         finally:
             ascend._build_service_host_provider = original
             ascend._HOST_PROVIDERS.clear()
-            for key, value in saved.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+            if saved is None:
+                os.environ.pop('RIFT_ASCEND910B3_RUN_MANIFEST', None)
+            else:
+                os.environ['RIFT_ASCEND910B3_RUN_MANIFEST'] = saved
 
 
 class ChatTemplateTests(unittest.TestCase):
