@@ -140,6 +140,36 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(update.run_id, run.run_id_for(0))
 
 
+class X1ConfigTests(unittest.TestCase):
+    def test_shipped_screening_specs_are_valid_and_unique(self):
+        specs = run.parse_task_specs(run.load_json_argument('configs/experiments/x1_screen.json'))
+        self.assertEqual(len({run.spec_key(spec) for spec in specs}), len(specs))
+        seeds = [(spec['seed'], spec['seed'] + spec['instances']) for spec in specs]
+        for index, (low, high) in enumerate(seeds):
+            for other_low, other_high in seeds[index + 1:]:
+                self.assertTrue(high <= other_low or other_high <= low, 'World seed ranges overlap')
+        from usami_v2.runtime.runner import EpisodeBudget
+        EpisodeBudget.model_validate(run.load_json_argument('configs/experiments/x1_budget.json'))
+
+    def test_eval_run_offers_its_initial_checkpoint(self):
+        from types import SimpleNamespace
+        from usami_v2.runtime.runner import EpisodeBudget
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as root:
+            (Path(source) / 'checkpoints').mkdir()
+            (Path(source) / 'checkpoints' / 'initial.json').write_text('{}', encoding='utf-8')
+            expected = Checkpoint('service', '0', 'tok', 'w0')
+            (Path(source) / 'initial-checkpoint.json').write_text(json.dumps(
+                {'policy': 'service', 'revision': '0', 'tokenizer': 'tok', 'weights_digest': 'w0'}),
+                encoding='utf-8')
+            context = run.ExperimentContext(root=root, service_model='m', verl_config_dir='.',
+                episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6))
+            adopted = []
+            context.adopt_manifest = adopted.append
+            context.checkpoint_store = SimpleNamespace(verify=lambda checkpoint: True)
+            self.assertEqual(context.checkpoint_from_run(source), expected)
+            self.assertEqual(adopted, [Path(source) / 'checkpoints' / 'initial.json'])
+
+
 class ChatTemplateTests(unittest.TestCase):
     def test_runs_use_the_non_thinking_template(self):
         self.assertEqual(run.CHAT_TEMPLATE_KWARGS, {'enable_thinking': False})

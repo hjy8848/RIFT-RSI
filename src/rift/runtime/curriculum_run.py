@@ -219,13 +219,23 @@ class ExperimentContext:
         return checkpoint
 
     def checkpoint_from_run(self, run_root):
-        """Load the final checkpoint recorded by a finished ``train`` run."""
+        """Load a finished ``train`` run's final checkpoint, or an earlier run's initial one.
+
+        A run directory without ``final.json`` (an ``eval`` run) offers its starting
+        checkpoint, which saves rewriting the 16 GB base-model checkpoint.
+        """
         from rift.schemas import Checkpoint
-        final = json.loads((Path(run_root) / 'final.json').read_text(encoding='utf-8'))
-        checkpoint = Checkpoint(**final['checkpoint'])
-        self.adopt_manifest(final['manifest'])
+        root = Path(run_root)
+        if (root / 'final.json').exists():
+            final = json.loads((root / 'final.json').read_text(encoding='utf-8'))
+            raw, manifest = final['checkpoint'], final['manifest']
+        else:
+            raw = json.loads((root / 'initial-checkpoint.json').read_text(encoding='utf-8'))
+            manifest = root / 'checkpoints' / 'initial.json'
+        checkpoint = Checkpoint(**raw)
+        self.adopt_manifest(manifest)
         if self.checkpoint_store.verify(checkpoint) is not True:
-            raise ValueError('final checkpoint of the source run failed verification')
+            raise ValueError('checkpoint of the source run failed verification')
         return checkpoint
 
     # -- runtime ----------------------------------------------------------
