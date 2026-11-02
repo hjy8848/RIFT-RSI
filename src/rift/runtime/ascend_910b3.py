@@ -244,6 +244,12 @@ class _UsamiCustomerFactory:
 def service_host_provider_from_config(*, config, tokenizer, processor=None):
     """Construct the native Usami Host provider inside VERL's AgentLoop Ray worker."""
     del config, tokenizer, processor
+    # `kill -USR1 <pid>` makes a stuck AgentLoop worker print every thread's stack
+    # (py-spy cannot attach to Ray workers under this host's ptrace policy).
+    import faulthandler
+    import signal
+    import sys
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
     manifest_path = os.environ.get("RIFT_ASCEND910B3_RUN_MANIFEST")
     checkpoint_raw = os.environ.get("RIFT_ASCEND910B3_ACTIVE_CHECKPOINT")
     if not manifest_path or not checkpoint_raw:

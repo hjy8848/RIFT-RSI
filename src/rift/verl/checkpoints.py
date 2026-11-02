@@ -178,6 +178,9 @@ class FSDPCheckpointStore:
                         and artifact_hash == artifact_digest_expected)
             if verified:
                 self._verified_fingerprints[checkpoint] = cache_entry
+                # VERL builds a fresh AgentLoop (hence a fresh store from the manifest)
+                # per sample; without this every sample rehashed the whole checkpoint.
+                _PROCESS_VERIFICATION_CACHE[cache_key] = cache_entry
             else:
                 self._verified_fingerprints.pop(checkpoint, None)
                 _PROCESS_VERIFICATION_CACHE.pop(cache_key, None)
