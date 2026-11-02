@@ -635,7 +635,8 @@ class Ascend910B3RoleRuntime:
 
     def create_update_backend(self, request, *, output_dir, after_revision,
                               run_id, metric_sink=None, round_index=None,
-                              checkpoint_manifest_path=None, mini_batch_size=None, epochs=None):
+                              checkpoint_manifest_path=None, mini_batch_size=None, epochs=None,
+                              persist=True):
         from rift.verl.actor_backend import VerlServiceRLBackend, VerlDesignerRLBackend
         required = ("rollout_verifier", "run_recorder", "update_verifier")
         if any(name not in self.backend_bindings for name in required):
@@ -659,7 +660,7 @@ class Ascend910B3RoleRuntime:
             epochs=epochs if epochs is not None else self.service_update.get("epochs", 1),
             learning_rate=self.service_update.get('learning_rate', 1e-6),
             metric_sink=metric_sink, round_index=round_index,
-            checkpoint_manifest_path=checkpoint_manifest_path)
+            checkpoint_manifest_path=checkpoint_manifest_path, persist=persist)
         backend_type = VerlServiceRLBackend if self.role == "service" else VerlDesignerRLBackend
         return backend_type(**common)
 

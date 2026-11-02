@@ -138,6 +138,7 @@ class FSDPCheckpointStore:
         self.world_size = world_size
         self.artifact_digests = dict(artifact_digests or {})
         self._verified_fingerprints = {}
+        self.virtual = set()   # versions held only in the live trainer, with no files
         for checkpoint, path in self.paths.items():
             if checkpoint in self.artifact_digests:
                 continue
@@ -173,6 +174,22 @@ class FSDPCheckpointStore:
         self.artifact_digests[checkpoint] = artifact_hash
         self._remember_verified(checkpoint, path)
         return checkpoint
+    def publish_virtual(self, parent, revision, lineage):
+        """Name a policy version that lives only in the trainer's memory.
+
+        Fast experiments update the live runtime every round and write real files only
+        every few rounds. The identity is derived from the parent version and the update
+        (``lineage``), so the update ledger, sync receipts and generation checks work
+        unchanged; it just cannot be reloaded from disk.
+        """
+        material = f'rift-in-memory-v1:{parent.weights_digest}:{revision}:{lineage}'
+        digest = hashlib.sha256(material.encode('utf-8')).hexdigest()
+        checkpoint = Checkpoint(parent.policy, revision, parent.tokenizer, digest)
+        if checkpoint in self.paths or checkpoint in self.virtual:
+            raise ValueError('checkpoint identity already registered')
+        self.artifact_digests[checkpoint] = digest
+        self.virtual.add(checkpoint)
+        return checkpoint
     def _remember_verified(self, checkpoint, path):
         root = Path(path).resolve()
         fingerprint = _artifact_metadata_digest(root)
@@ -182,10 +199,14 @@ class FSDPCheckpointStore:
         cache_key = (checkpoint, str(root), self.world_size)
         _PROCESS_VERIFICATION_CACHE[cache_key] = self._verified_fingerprints[checkpoint]
     def resolve(self, checkpoint):
+        if isinstance(checkpoint, Checkpoint) and checkpoint in self.virtual:
+            raise ValueError('checkpoint exists only in the live trainer and has no files')
         if not isinstance(checkpoint, Checkpoint) or checkpoint not in self.paths:
             raise ValueError('checkpoint is not registered')
         return str(Path(self.paths[checkpoint]).resolve())
     def verify(self, checkpoint):
+        if isinstance(checkpoint, Checkpoint) and checkpoint in self.virtual:
+            return True
         try:
             root = Path(self.resolve(checkpoint))
             if not root.is_dir(): return False
@@ -221,18 +242,26 @@ class FSDPCheckpointStore:
                 # Names, sizes and mtimes of a checkpoint whose contents were just verified.
                 row['stat_digest'] = _artifact_stat_digest(location)
             records.append(row)
+        for cp in sorted(self.virtual, key=lambda item: item.revision):
+            records.append({'checkpoint': asdict(cp), 'virtual': True,
+                            'artifact_digest': self.artifact_digests[cp]})
         with Path(path).open('x', encoding='utf-8') as stream:
             json.dump({'world_size': self.world_size, 'records': records}, stream, sort_keys=True)
     @classmethod
     def load_manifest(cls, path):
         data = json.loads(Path(path).read_text(encoding='utf-8'))
-        paths, digests, stats = {}, {}, {}
+        paths, digests, stats, virtual = {}, {}, {}, set()
         for row in data['records']:
             cp = Checkpoint(**row['checkpoint'])
-            if cp in paths: raise ValueError('duplicate checkpoint identity')
-            paths[cp] = row['path']; digests[cp] = row['artifact_digest']
+            if cp in paths or cp in virtual: raise ValueError('duplicate checkpoint identity')
+            digests[cp] = row['artifact_digest']
+            if row.get('virtual'):
+                virtual.add(cp)
+                continue
+            paths[cp] = row['path']
             stats[cp] = row.get('stat_digest')
         store = cls(paths, world_size=data['world_size'], artifact_digests=digests)
+        store.virtual = virtual
         for cp, location in paths.items():
             try:
                 unchanged = stats[cp] is not None and _artifact_stat_digest(location) == stats[cp]

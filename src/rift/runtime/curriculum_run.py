@@ -145,9 +145,10 @@ class ExperimentContext:
     """Checkpoint/attestation stores shared by every runtime of one run directory."""
     def __init__(self, *, root, service_model, verl_config_dir, episode_budget, update_budget,
                  tool_profile='full9', runtime_factory=None, group_size=4, response_length=8192,
-                 keep_runtime=True):
+                 keep_runtime=True, persist_every=1):
         from rift.verl.checkpoints import FSDPCheckpointStore
         self.keep_runtime = keep_runtime
+        self.persist_every, self.total_rounds = persist_every, None
         self.root, self.service_model = Path(root).resolve(), str(service_model)
         self.verl_config_dir, self.episode_budget = Path(verl_config_dir), episode_budget
         self.update_budget, self.tool_profile, self.group_size = update_budget, tool_profile, group_size
@@ -297,9 +298,17 @@ class ExperimentContext:
                             'epochs': self.update_budget.epochs,
                             'learning_rate': self.update_budget.learning_rate})
 
+    def persists(self, index):
+        """Whether the update of round ``index`` writes real checkpoint files."""
+        every = max(1, self.persist_every)
+        return (index + 1) % every == 0 or (self.total_rounds is not None and index + 1 >= self.total_rounds)
+
     def open_runtime(self, checkpoint):
         """Start one runtime for ``checkpoint``; registries must already hold every task."""
         import time
+        if checkpoint in getattr(self.checkpoint_store, 'virtual', ()):
+            raise ValueError('revision %s exists only in a runtime that has ended; start a new run '
+                             '(or one from the last persisted checkpoint)' % checkpoint.revision)
         self.close_runtime()
         self.world.save()
         started = time.perf_counter()
@@ -366,7 +375,8 @@ class RoundBackend:
                 metric_sink=context.metric_sink,
                 checkpoint_manifest_path=context.root / 'checkpoints' / ('service-step-%d.json' % step),
                 mini_batch_size=context.update_budget.mini_batch_size,
-                epochs=context.update_budget.epochs)
+                epochs=context.update_budget.epochs,
+                persist=context.persists(self.index))
             completed = backend.train(request)
         except BaseException:
             context.close_runtime()    # a half-updated runtime must not serve another round
@@ -422,6 +432,7 @@ def train(context, *, policy_name, arms, bench_specs, rounds, seed, package_conf
     from rift.evolution.curriculum import CurriculumRunner, Selection
     from rift.training.package import FrozenBenchmarkTrainingPool
     from rift.training.task_stats import TaskStatsStore
+    context.total_rounds = rounds
     if init_from_run and not (context.root / 'initial-checkpoint.json').exists():
         initial = context.adopt_initial_from(init_from_run)
     else:
@@ -533,7 +544,7 @@ def _common(parser):
     parser.add_argument('--seed', type=int, default=2000)
 
 
-def _context(args, update_budget, group_size, response_length=8192, keep_runtime=True):
+def _context(args, update_budget, group_size, response_length=8192, keep_runtime=True, persist_every=1):
     from usami_v2.runtime.runner import EpisodeBudget
     from rift.runtime.ascend_910b3 import _default_smoke_episode_budget
     budget = (EpisodeBudget.model_validate(json.loads(Path(args.episode_budget_config).read_text(encoding='utf-8')))
@@ -541,7 +552,7 @@ def _context(args, update_budget, group_size, response_length=8192, keep_runtime
     return ExperimentContext(root=args.run_root, service_model=args.service_model,
         verl_config_dir=args.verl_config_dir, episode_budget=budget,
         update_budget=update_budget, tool_profile=args.tool_profile, group_size=group_size,
-        response_length=response_length, keep_runtime=keep_runtime)
+        response_length=response_length, keep_runtime=keep_runtime, persist_every=persist_every)
 
 
 def main(argv=None):
@@ -563,6 +574,9 @@ def main(argv=None):
     train_parser.add_argument('--learning-rate', type=float, default=1e-6)
     train_parser.add_argument('--response-length', type=int, default=12288,
         help='VERL aborts the whole round when one episode outgrows this')
+    train_parser.add_argument('--persist-every', type=int, default=5,
+        help='write real checkpoint files every N rounds (and after the last); the rounds in '
+             'between update the live runtime only, which is much faster')
     train_parser.add_argument('--init-from-run',
         help='an earlier run directory whose base checkpoint to start from (skips writing a new one)')
     train_parser.add_argument('--restart-each-round', action='store_true',
@@ -586,7 +600,7 @@ def main(argv=None):
         package_config = TrainingPackageConfig(tasks_per_round=args.tasks_per_round,
             sampling_seed=args.seed, group_size=args.group_size)
         context = _context(args, budget, args.group_size, response_length=args.response_length,
-                           keep_runtime=not args.restart_each_round)
+                           keep_runtime=not args.restart_each_round, persist_every=args.persist_every)
         result = train(context, policy_name=args.policy, rounds=args.rounds, seed=args.seed,
             arms=load_json_argument(args.arms) if args.arms else list(DEFAULT_ARMS),
             bench_specs=load_json_argument(args.bench_specs) if args.bench_specs else list(DEFAULT_BENCH),

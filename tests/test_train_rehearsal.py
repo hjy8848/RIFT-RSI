@@ -49,13 +49,19 @@ class FakeBackend:
     def train(self, request):
         context, kwargs = self.context, self.kwargs
         directory = Path(kwargs['output_dir'])
-        directory.mkdir(parents=True)
-        for kind in ('model', 'optim', 'extra_state'):
-            for rank in range(8):
-                (directory / f'{kind}_world_size_8_rank_{rank}.pt').write_bytes(
-                    kwargs['after_revision'].encode() + bytes([rank]) * 64)
-        after = context.checkpoint_store.publish('service', kwargs['after_revision'],
-                                                 request.policy_before.tokenizer, directory)
+        if kwargs.get('persist', True):
+            directory.mkdir(parents=True)
+            for kind in ('model', 'optim', 'extra_state'):
+                for rank in range(8):
+                    (directory / f'{kind}_world_size_8_rank_{rank}.pt').write_bytes(
+                        kwargs['after_revision'].encode() + bytes([rank]) * 64)
+            after = context.checkpoint_store.publish('service', kwargs['after_revision'],
+                                                     request.policy_before.tokenizer, directory)
+        else:
+            from dataclasses import asdict
+            from rift.training.trace import digest
+            after = context.checkpoint_store.publish_virtual(request.policy_before,
+                kwargs['after_revision'], digest(asdict(request)))
         context.checkpoint_store.save_manifest(kwargs['checkpoint_manifest_path'])
         self.runtime._loaded_checkpoint = after
         self.runtime.trained.append(request.policy_before)
@@ -134,12 +140,37 @@ class TrainRehearsal(unittest.TestCase):
             _, again = self._train(root, init_from_run=source)       # resumes from its own manifests
             self.assertEqual(again['final_checkpoint'], result['final_checkpoint'])
 
-    def _train(self, root, init_from_run=None):
+    def test_rounds_between_persist_points_write_no_checkpoint_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._initial(root)
+            context, result = self._train(root, rounds=3, persist_every=2)
+            steps = Path(root) / 'checkpoints' / 'service'
+            self.assertFalse((steps / 'global-step-00000001').exists())   # in memory only
+            self.assertTrue((steps / 'global-step-00000002').exists())
+            self.assertTrue((steps / 'global-step-00000003').exists())    # the last round persists
+            self.assertEqual({cp.revision for cp in context.checkpoint_store.virtual}, {'1'})
+            self.assertEqual(result['final_checkpoint']['revision'], '3')
+            self.assertEqual(len(FakeRuntime.opened), 1)
+            final = json.loads((Path(root) / 'final.json').read_text(encoding='utf-8'))
+            self.assertEqual(final['checkpoint']['revision'], '3')
+
+    def test_a_new_process_cannot_resume_from_an_in_memory_version(self):
+        from rift.schemas import Checkpoint
+        with tempfile.TemporaryDirectory() as root:
+            self._initial(root)
+            context, _ = self._train(root, rounds=3, persist_every=2)
+            virtual = next(iter(context.checkpoint_store.virtual))
+            context.runtime = None
+            with self.assertRaises(ValueError):
+                context.ensure_runtime(virtual)
+
+    def _train(self, root, init_from_run=None, rounds=2, persist_every=1):
         from rift.runtime import evaluator
         FakeRuntime.opened = []
         context = run.ExperimentContext(root=root, service_model='m', verl_config_dir='.',
             episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6),
-            runtime_factory=lambda checkpoint: FakeRuntime(context, checkpoint))
+            runtime_factory=lambda checkpoint: FakeRuntime(context, checkpoint),
+            persist_every=persist_every)
         context._worker_manifest = lambda checkpoint: None
         original = evaluator.ProductionServiceRolloutCollector
         collector = self._collector(context)
@@ -150,7 +181,7 @@ class TrainRehearsal(unittest.TestCase):
                 arms=[{'family_id': 'F1', 'knobs': {}}, {'family_id': 'F4', 'knobs': {'age_days': 20}}],
                 bench_specs=[{'family': 'F1', 'knobs': {}, 'instances': 4, 'seed': 900000},
                              {'family': 'F4', 'knobs': {'age_days': 20}, 'instances': 4, 'seed': 901000}],
-                rounds=2, seed=2000, window=5, init_from_run=init_from_run,
+                rounds=rounds, seed=2000, window=5, init_from_run=init_from_run,
                 package_config=TrainingPackageConfig(tasks_per_round=8, designer_fraction=.5,
                                                      benchmark_fraction=.5, sampling_seed=7, group_size=4))
         finally:

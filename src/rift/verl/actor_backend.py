@@ -56,7 +56,11 @@ class VerlGRPOBackend:
     def __init__(self, role, worker_group, checkpoint_store, rollout_verifier,
                  run_recorder, update_verifier, runtime_verifier, weight_sync, *, output_dir, after_revision,
                  run_id, pad_token_id, mini_batch_size, epochs=1,
-                 metric_sink=None, round_index=None, checkpoint_manifest_path=None, learning_rate=1e-6):
+                 metric_sink=None, round_index=None, checkpoint_manifest_path=None, learning_rate=1e-6,
+                 persist=True):
+        # persist=False skips writing the checkpoint files (23 GB and ~5 minutes for
+        # Qwen3-4B): the update stays in the live trainer under an in-memory version.
+        self.persist = persist
         self.role, self.worker_group = role, worker_group
         self.checkpoint_store, self.rollout_verifier = checkpoint_store, rollout_verifier
         self.run_recorder, self.update_verifier = run_recorder, update_verifier
@@ -177,11 +181,18 @@ class VerlGRPOBackend:
         self._metric(f'{self.role}_backward_seconds', time.perf_counter() - backward_started)
         self._report_gradient_norms(metrics)
         checkpoint_started = time.perf_counter()
-        self.worker_group.save_checkpoint(str(self.output_dir), global_step=after_step)
-        self._metric('checkpoint_save_seconds', time.perf_counter() - checkpoint_started)
         verification_started = time.perf_counter()
-        after = self.checkpoint_store.publish(request.policy_before.policy,
-            self.after_revision, request.policy_before.tokenizer, self.output_dir)
+        if self.persist:
+            self.worker_group.save_checkpoint(str(self.output_dir), global_step=after_step)
+            self._metric('checkpoint_save_seconds', time.perf_counter() - checkpoint_started)
+            verification_started = time.perf_counter()
+            after = self.checkpoint_store.publish(request.policy_before.policy,
+                self.after_revision, request.policy_before.tokenizer, self.output_dir)
+        else:
+            from dataclasses import asdict
+            from rift.training.trace import digest
+            after = self.checkpoint_store.publish_virtual(request.policy_before,
+                self.after_revision, digest(asdict(request)))
         if not self.checkpoint_store.verify(after): raise ValueError('after checkpoint failed verification')
         record_saved = getattr(self.runtime_verifier, 'record_saved_checkpoint', None)
         if callable(record_saved) and record_saved(self.role, self.worker_group, after) is not True:

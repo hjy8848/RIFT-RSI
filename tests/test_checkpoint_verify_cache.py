@@ -8,6 +8,62 @@ sys.path[:0] = ['src', 'third_party/usami']
 from rift.verl import checkpoints
 
 
+class InMemoryVersionTests(unittest.TestCase):
+    def _store(self, root):
+        directory = Path(root) / 'ckpt'
+        directory.mkdir()
+        for kind in ('model', 'optim', 'extra_state'):
+            for rank in range(8):
+                (directory / f'{kind}_world_size_8_rank_{rank}.pt').write_bytes(b'b' * 64 + bytes([rank]))
+        store = checkpoints.FSDPCheckpointStore({}, world_size=8)
+        return store, store.publish('service', '0', 'tok', directory)
+
+    def test_a_virtual_version_verifies_has_no_files_and_chains(self):
+        with tempfile.TemporaryDirectory() as root:
+            store, base = self._store(root)
+            first = store.publish_virtual(base, '1', 'update-1')
+            second = store.publish_virtual(first, '2', 'update-2')
+            self.assertTrue(store.verify(first) and store.verify(second))
+            self.assertNotEqual(first.weights_digest, second.weights_digest)
+            self.assertEqual(first.policy, base.policy)
+            with self.assertRaises(ValueError):
+                store.resolve(first)
+            with self.assertRaises(ValueError):
+                store.publish_virtual(base, '1', 'update-1')          # same identity twice
+
+    def test_virtual_versions_survive_a_manifest_round_trip(self):
+        with tempfile.TemporaryDirectory() as root:
+            store, base = self._store(root)
+            first = store.publish_virtual(base, '1', 'u1')
+            store.save_manifest(Path(root) / 'm.json')
+            loaded = checkpoints.FSDPCheckpointStore.load_manifest(Path(root) / 'm.json')
+            self.assertTrue(loaded.verify(first) and loaded.verify(base))
+            self.assertEqual(loaded.artifact_digests[first], store.artifact_digests[first])
+
+    def test_the_update_ledger_and_sync_receipts_accept_virtual_versions(self):
+        from rift.schemas import Outcome, Tokens
+        from rift.training.contracts import CompletedUpdate, UpdateRequest
+        from rift.training.records import service_rollout
+        from rift.verl.serving import VerlServingAttestor
+        from rift.verl.update_ledger import UpdateLedger
+        with tempfile.TemporaryDirectory() as root:
+            store, base = self._store(root)
+            first = store.publish_virtual(base, '1', 'u1')
+            second = store.publish_virtual(first, '2', 'u2')
+            ledger = UpdateLedger(Path(root) / 'updates', store)
+            rows = tuple(service_rollout(Tokens((1,), (2, index + 3), (True, True)), first, 'task', 'ep%d' % index,
+                                         Outcome.SUCCESS, 'group', response_id='ep%d' % index)
+                         for index in range(2))
+            request = UpdateRequest(first, 'pkg', rows, 'grpo')
+            evidence = ledger.record_update('run-1', request, second, {'ok': 1})
+            self.assertTrue(ledger.verify_update(CompletedUpdate(request, second, 'run-1', evidence)))
+            attestor = VerlServingAttestor(Path(root) / 'serving', store)
+            attestor.activate_after_sync(second, 2, store.artifact_digests[second])
+            self.assertTrue(attestor.verify_serving(second))
+            self.assertTrue(attestor.verify_generation(second, {'global_steps': 2, 'min_global_steps': 2,
+                                                                'max_global_steps': 2}))
+
+
 class ParallelHashTests(unittest.TestCase):
     def test_concurrent_hashing_gives_the_serial_result(self):
         import hashlib
