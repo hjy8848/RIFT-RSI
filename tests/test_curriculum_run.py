@@ -249,6 +249,37 @@ class EvaluateRehearsalTests(unittest.TestCase):
             self.assertTrue(runtimes and all(item.closed for item in runtimes))
 
 
+class HostProviderReuseTests(unittest.TestCase):
+    def test_the_worker_builds_its_provider_once_per_manifest_and_checkpoint(self):
+        import os
+        from rift.runtime import ascend_910b3 as ascend
+        built = []
+        original = ascend._build_service_host_provider
+        ascend._build_service_host_provider = lambda manifest, checkpoint: built.append(
+            (manifest, checkpoint)) or object()
+        ascend._HOST_PROVIDERS.clear()
+        saved = {key: os.environ.get(key) for key in
+                 ('RIFT_ASCEND910B3_RUN_MANIFEST', 'RIFT_ASCEND910B3_ACTIVE_CHECKPOINT')}
+        try:
+            os.environ['RIFT_ASCEND910B3_RUN_MANIFEST'] = 'm1.json'
+            os.environ['RIFT_ASCEND910B3_ACTIVE_CHECKPOINT'] = '{"c": 1}'
+            first = [ascend.service_host_provider_from_config(config=None, tokenizer=None)
+                     for _ in range(44)]
+            self.assertEqual(len(built), 1)
+            self.assertEqual(len({id(item) for item in first}), 1)
+            os.environ['RIFT_ASCEND910B3_ACTIVE_CHECKPOINT'] = '{"c": 2}'
+            ascend.service_host_provider_from_config(config=None, tokenizer=None)
+            self.assertEqual(len(built), 2)      # a different checkpoint is a different provider
+        finally:
+            ascend._build_service_host_provider = original
+            ascend._HOST_PROVIDERS.clear()
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
 class ChatTemplateTests(unittest.TestCase):
     def test_runs_use_the_non_thinking_template(self):
         self.assertEqual(run.CHAT_TEMPLATE_KWARGS, {'enable_thinking': False})

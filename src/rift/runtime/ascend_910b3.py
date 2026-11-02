@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 
 
@@ -241,8 +242,19 @@ class _UsamiCustomerFactory:
         return _UsamiCustomer(seed)
 
 
+_HOST_PROVIDERS = {}
+_HOST_PROVIDER_LOCK = threading.Lock()
+
+
 def service_host_provider_from_config(*, config, tokenizer, processor=None):
-    """Construct the native Usami Host provider inside VERL's AgentLoop Ray worker."""
+    """Return this worker process's native Usami Host provider, building it once.
+
+    VERL creates a new AgentLoop for every sample and each one calls this. Building
+    the provider reloads the certified-task registry and re-verifies every task
+    certificate (replaying witness traces) on the event-loop thread, so 44 samples
+    per worker spent minutes there before any model call. The provider holds no
+    per-sample state; sessions are created in ``open_rollout``.
+    """
     del config, tokenizer, processor
     # `kill -USR1 <pid>` makes a stuck AgentLoop worker print every thread's stack
     # (py-spy cannot attach to Ray workers under this host's ptrace policy).
@@ -254,6 +266,15 @@ def service_host_provider_from_config(*, config, tokenizer, processor=None):
     checkpoint_raw = os.environ.get("RIFT_ASCEND910B3_ACTIVE_CHECKPOINT")
     if not manifest_path or not checkpoint_raw:
         raise RuntimeError("RIFT Ascend run manifest/checkpoint are absent in VERL AgentLoop worker")
+    key = (manifest_path, checkpoint_raw)
+    with _HOST_PROVIDER_LOCK:
+        provider = _HOST_PROVIDERS.get(key)
+        if provider is None:
+            provider = _HOST_PROVIDERS[key] = _build_service_host_provider(manifest_path, checkpoint_raw)
+    return provider
+
+
+def _build_service_host_provider(manifest_path, checkpoint_raw):
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     from rift.runtime.service_protocol import service_profile_descriptor
     selected_profile = manifest.get('tool_profile', 'full9')
