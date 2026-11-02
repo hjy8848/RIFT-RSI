@@ -24,6 +24,27 @@ def service_tool_protocol_reminder(tools):
     )
 
 
+_EPISODE_EXECUTOR = None
+
+
+def episode_executor():
+    """Threads that run native episodes, kept apart from the event loop's default pool.
+
+    Each episode holds one thread for its whole life while it waits for model replies.
+    On the default pool (at most 32 threads) more concurrent episodes than that
+    exhausted it, and the tokenisation jobs the same loop submits to that pool could
+    never run, so no reply was ever produced: a deadlock.
+    """
+    global _EPISODE_EXECUTOR
+    if _EPISODE_EXECUTOR is None:
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+        _EPISODE_EXECUTOR = ThreadPoolExecutor(
+            max_workers=int(os.environ.get('RIFT_EPISODE_THREADS', '512')),
+            thread_name_prefix='rift-episode')
+    return _EPISODE_EXECUTOR
+
+
 class _ParserExecutionFailure(Exception):
     def __init__(self, call, cause):
         super().__init__(str(cause))
@@ -102,7 +123,7 @@ class NativeUsamiSession:
                 asyncio.run_coroutine_threadsafe(self._events.put(('finished', result)), self._loop).result()
             except BaseException as exc:
                 asyncio.run_coroutine_threadsafe(self._events.put(('error', exc)), self._loop).result()
-        self._worker = asyncio.create_task(asyncio.to_thread(run_native))
+        self._worker = self._loop.run_in_executor(episode_executor(), run_native)
         kind, value = await self._events.get()
         if kind != 'prompt':
             await self._worker
