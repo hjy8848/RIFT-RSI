@@ -452,7 +452,7 @@ def build_eval_requests(by_key, checkpoint, *, groups, group_size, seed, label):
     return requests, owners
 
 
-def evaluate(context, *, specs, groups, seed, label, from_run=None, batch_groups=16):
+def evaluate(context, *, specs, groups, seed, label, from_run=None):
     """Sample ``groups`` x group_size episodes per task and report success rates."""
     by_key = context.world.certify_specs(specs)
     context.world.save()
@@ -460,22 +460,20 @@ def evaluate(context, *, specs, groups, seed, label, from_run=None, batch_groups
     requests, owners = build_eval_requests(by_key, checkpoint, groups=groups,
         group_size=context.group_size, seed=seed, label=label)
     rows = []
-    per_call = max(context.group_size, batch_groups * context.group_size)
     try:
-        batch = LazyBatch(context, checkpoint)
-        for start in range(0, len(requests), per_call):
-            chunk = requests[start:start + per_call]
-            outputs = batch.generate(chunk)
-            if len(outputs) != len(chunk):
-                raise ValueError('VERL omitted evaluation requests')
-            for request, output in zip(chunk, outputs):
-                if output.get('rift_request_id') != request['rift_request_id']:
-                    raise ValueError('evaluation output lost its request identity')
-                key, task_ref = owners[request['rift_request_id']]
-                outcome = output.get('rift_outcome')
-                if output.get('rift_replay_verified') is not True:
-                    outcome = 'unknown'
-                rows.append((key, task_ref, outcome))
+        # One generate call only: the runtime puts vLLM to sleep after every call and
+        # nothing wakes it before the next one, so a second call would wait forever.
+        outputs = LazyBatch(context, checkpoint).generate(requests)
+        if len(outputs) != len(requests):
+            raise ValueError('VERL omitted evaluation requests')
+        for request, output in zip(requests, outputs):
+            if output.get('rift_request_id') != request['rift_request_id']:
+                raise ValueError('evaluation output lost its request identity')
+            key, task_ref = owners[request['rift_request_id']]
+            outcome = output.get('rift_outcome')
+            if output.get('rift_replay_verified') is not True:
+                outcome = 'unknown'
+            rows.append((key, task_ref, outcome))
     finally:
         context.close_runtime()
     report = summarize_outcomes(rows)
