@@ -163,6 +163,21 @@ class X1ConfigTests(unittest.TestCase):
         self.assertGreaterEqual(pool_size, config.benchmark_task_count)
         self.assertEqual(config.designer_task_count * config.group_size % 8, 0)   # whole mini-batches
 
+    def test_x2_training_and_held_out_sets_never_share_a_world_seed(self):
+        ranges = {}
+        for name in ('x2_train', 'x2_heldout', 'x1_screen', 'smoke_bench'):
+            specs = run.parse_task_specs(run.load_json_argument('configs/experiments/%s.json' % name))
+            ranges[name] = [(spec['seed'], spec['seed'] + spec['instances']) for spec in specs]
+        names = sorted(ranges)
+        for index, first in enumerate(names):
+            for second in names[index:]:
+                for i, (low, high) in enumerate(ranges[first]):
+                    for j, (other_low, other_high) in enumerate(ranges[second]):
+                        if first == second and i >= j:
+                            continue
+                        self.assertTrue(high <= other_low or other_high <= low,
+                                        '%s and %s share world seeds' % (first, second))
+
     def test_eval_run_offers_its_initial_checkpoint(self):
         from types import SimpleNamespace
         from usami_v2.runtime.runner import EpisodeBudget

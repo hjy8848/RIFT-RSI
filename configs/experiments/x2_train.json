@@ -1,0 +1,4 @@
+[
+  {"family": "F1", "knobs": {"distractor_orders": 3}, "instances": 32, "seed": 4000000},
+  {"family": "F2", "knobs": {"purchased_quantity": 5, "refund_quantity": 2}, "instances": 32, "seed": 4001000}
+]
