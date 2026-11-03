@@ -212,3 +212,23 @@ def verify_refusal_certificate(world, task, customer_scenario, certificate):
                 and certify_refusal(world, task, customer_scenario, certificate.budget) == certificate)
     except (TypeError, ValueError, KeyError, AttributeError):
         return False
+
+
+def minimum_service_decisions(world, task, certificate):
+    """Fewest Service decisions (tool calls and replies) a certified task needs.
+
+    An execution witness supplies its own cost. A refusal additionally needs
+    each refused order to be read; a refusal-only task needs the order list,
+    those reads and one reply.
+    """
+    from .task_certification import certification_cost
+    if isinstance(certificate, TaskCertification):
+        return certification_cost(certificate)['service_decisions']
+    if not isinstance(certificate, RefusalCertificate):
+        raise TypeError('task or refusal certificate required')
+    orders = {world.lines[line_id].order_id for goal in getattr(task, 'refusal_goals', ())
+              for line_id in goal.line_ids}
+    execution = certificate.execution_certificate
+    if execution is not None:
+        return certification_cost(execution)['service_decisions'] + len(orders)
+    return 1 + len(orders) + 1

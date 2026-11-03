@@ -36,6 +36,12 @@ from usami_v2.scenarios.tasks import (
 )
 
 
+# A Customer with limited patience says so once, when this many Service
+# decisions remain, so impatience is observable before the Customer leaves.
+PATIENCE_WARNING_DECISIONS = 2
+PATIENCE_WARNING = "Please be quick, I am running out of patience."
+
+
 class EpisodeBudget(Sealed):
     max_customer_turns: int = Field(default=8, ge=1, le=100, strict=True)
     max_service_decisions: int = Field(default=64, ge=1, le=2000, strict=True)
@@ -74,7 +80,8 @@ class EpisodeRecord(Sealed):
     runtime_initial_world: World
     final_world: World
     status: Literal["customer_finished", "budget_exhausted", "service_protocol_error",
-                    "customer_protocol_error", "agent_error", "runner_error", "cancelled"]
+                    "customer_protocol_error", "agent_error", "runner_error", "cancelled",
+                    "customer_left"]
     terminal_reason: str
     events: Tuple[EpisodeEvent, ...]
     tool_executions: Tuple[ToolExecution, ...]
@@ -500,9 +507,16 @@ def run_episode(initial_world: World, task: Union[TaskSpecV3, TaskSpecV2, TaskSp
     request_counter = customer_turns = service_decisions = tool_count = model_calls = 0
     service_uses_model = bool(getattr(service_agent, "uses_model", True))
     customer_uses_model = bool(getattr(customer_agent, "uses_model", True))
+    # The runner, not the Customer agent, enforces patience so no agent can bypass it.
+    patience = getattr(profile, "patience_service_decisions", None)
+    patience_warned = False
     while service_decisions < budget.max_service_decisions and tool_count < budget.max_service_tool_calls:
         if cancel_check and cancel_check():
             status, terminal_reason = "cancelled", "human_session_cancelled"
+            break
+        if patience is not None and service_decisions >= patience:
+            status, terminal_reason = "customer_left", "customer_patience_exhausted"
+            events = _append(events, "termination", {"status": status, "reason": terminal_reason}, world, world)
             break
         if service_uses_model and model_calls >= budget.max_model_calls:
             terminal_reason = "episode_model_call_budget_exhausted"
@@ -768,6 +782,9 @@ def run_episode(initial_world: World, task: Union[TaskSpecV3, TaskSpecV2, TaskSp
         if transition.event.rejection_reasons:
             conversation.append(AgentMessage(role="user", content=(
                 "A previously recorded Customer consent is still pending execution. Please continue the requested workflow.")))
+        if patience is not None and not patience_warned and patience - service_decisions <= PATIENCE_WARNING_DECISIONS:
+            patience_warned = True
+            conversation.append(AgentMessage(role="user", content=PATIENCE_WARNING))
         current_offer = None
     else:
         terminal_reason = "service_decision_or_tool_call_budget_exhausted"

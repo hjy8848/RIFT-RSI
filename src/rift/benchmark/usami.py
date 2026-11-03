@@ -141,8 +141,13 @@ def _receipt_events(world, task, scenario):
 
 class CommerceHost:
     """Trusted native host with bounded grounding and certified task storage."""
-    def __init__(self, worlds, distribution, scenario_factory, profile_factory, customer_agent, *, registry, identity_factory, proof_budget, episode_budget, grounding_budget=None, task_registry=None, return_receipt_after_days=None, tool_profile=None):
+    def __init__(self, worlds, distribution, scenario_factory, profile_factory, customer_agent, *, registry, identity_factory, proof_budget, episode_budget, grounding_budget=None, task_registry=None, return_receipt_after_days=None, tool_profile=None, patience_slack=None):
         self.worlds = tuple(worlds)
+        # None keeps the unlimited-patience Customer; otherwise the Customer
+        # waits for the certified minimum plus one read per extra order plus this.
+        if patience_slack is not None and (type(patience_slack) is not int or patience_slack < 0):
+            raise ValueError('patience slack must be a non-negative integer')
+        self.patience_slack = patience_slack
         if distribution.split != "train" or any(spec.distribution_hash != distribution.record_hash for _, spec, _ in self.worlds):
             raise ValueError("Host requires a registered training distribution")
         self.distribution = distribution
@@ -224,7 +229,7 @@ class CommerceHost:
             if (not isinstance(identity, Identity) or identity.split is not Split.TRAIN
                     or identity.task != task.record_hash or identity.world != build.world_hash):
                 raise ValueError('training identity must match the certified task and world')
-            profile = self.profile_factory(task, spec, build)
+            profile = self._profile(task, spec, build, native_certificate)
             from rift.verl.task_registry import CertifiedNativeTask
             self.task_registry.register(CertifiedNativeTask(
                 build.world, task, profile, scenario, native_certificate, identity,
@@ -318,7 +323,7 @@ class CommerceHost:
                             or identity.task != task.record_hash or identity.world != build.world_hash
                             or task.partition != 'train'):
                         raise ValueError('Designer task identity must bind this verified TRAIN World')
-                    profile = self.profile_factory(task, spec, build)
+                    profile = self._profile(task, spec, build, native_certificate)
                     from rift.verl.task_registry import CertifiedNativeTask
                     self.task_registry.register(CertifiedNativeTask(
                         build.world, task, profile, scenario, native_certificate, identity,
@@ -361,6 +366,18 @@ class CommerceHost:
         return DesignerTrainingWorld(proposal.proposal_id, self.distribution.record_hash,
             world_ref, spec, build, build_verification, tuple(challenge_results),
             tuple(certifications), tuple(tasks))
+
+    def _profile(self, task, spec, build, certificate):
+        """Bound Customer profile, with patience when this Host configures it."""
+        profile = self.profile_factory(task, spec, build)
+        if self.patience_slack is None:
+            return profile
+        from usami_v2.runtime.customer import with_patience
+        from usami_v2.scenarios.refusal_certification import minimum_service_decisions
+        world = build.world
+        orders = sum(1 for order in world.orders.values() if order.customer_id == task.customer_id)
+        patience = minimum_service_decisions(world, task, certificate) + (orders - 1) + self.patience_slack
+        return with_patience(profile, patience)
 
     def _budget_covers(self, cost):
         """Reject tasks whose certified witness path cannot fit the episode budget."""

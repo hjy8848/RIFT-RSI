@@ -194,6 +194,10 @@ class CertifiedTaskRegistry:
                 or profile.accepts_proposals != scenario.accepts_proposals
                 or profile.decline_line_ids != scenario.decline_line_ids
                 or profile.return_pickup_slot != scenario.return_pickup_slot): return False
+        patience = getattr(profile, 'patience_service_decisions', None)
+        if patience is not None:
+            from usami_v2.scenarios.refusal_certification import minimum_service_decisions
+            if patience < minimum_service_decisions(world, task, cert): return False
         if ((scenario.latest_arrival is None) != (profile.latest_arrival_days is None)
                 or (scenario.latest_arrival is not None
                     and world.clock + timedelta(days=profile.latest_arrival_days) < scenario.latest_arrival)):

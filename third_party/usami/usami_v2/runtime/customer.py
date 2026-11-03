@@ -82,10 +82,14 @@ class CustomerProfileV3(CustomerProfile):
     decline_line_ids: Tuple[str, ...] = ()
     decline_references: Dict[str, str] = Field(default_factory=dict)
     request_references: Dict[str, str] = Field(default_factory=dict)
+    # Service decisions (tool calls and replies) the Customer waits through
+    # before leaving. None keeps the legacy unlimited-patience Customer.
+    patience_service_decisions: Optional[int] = Field(default=None, ge=1, strict=True)
 
     @model_serializer(mode='wrap')
     def _compatible_dump(self, handler):
-        return omit_default_fields(handler(self), self, ('accepts_proposals', 'decline_line_ids', 'decline_references', 'request_references'))
+        return omit_default_fields(handler(self), self, ('accepts_proposals', 'decline_line_ids', 'decline_references',
+                                                         'request_references', 'patience_service_decisions'))
 
     @model_validator(mode='after')
     def valid_decline_scope(self):
@@ -97,6 +101,13 @@ class CustomerProfileV3(CustomerProfile):
                 or any(not value.strip() for value in self.decline_references.values())):
             raise ValueError('decline references must identify exactly the delegated decline lines')
         return self
+
+
+def with_patience(profile: CustomerProfileV3, service_decisions: Optional[int]):
+    """Return the same bound Customer with a patience limit in Service decisions."""
+    data = profile.checked().model_dump(mode="json", exclude={"record_hash"})
+    data["patience_service_decisions"] = service_decisions
+    return CustomerProfileV3.model_validate(data)
 
 
 def bind_customer_profile(profile: CustomerProfile, task: TaskSpecV3, *, accepts_proposals=True,

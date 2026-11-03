@@ -87,7 +87,7 @@ def summarize_outcomes(rows):
 
 class WorldKit:
     """Certified-task and split registries plus the Host factory for family instances."""
-    def __init__(self, root, *, proof_budget=None, episode_budget=None):
+    def __init__(self, root, *, proof_budget=None, episode_budget=None, patience_slack=None):
         from rift.benchmark.families import synthetic_distribution
         from rift.replay.splits import SplitRegistry
         from rift.schemas import INSTANCE_DISJOINT_WITHIN_FAMILY_V1
@@ -110,6 +110,7 @@ class WorldKit:
         self.distribution = synthetic_distribution('train')
         self.proof_budget = proof_budget or ProofBudget()
         self.episode_budget = episode_budget or EpisodeBudget()
+        self.patience_slack = patience_slack
 
     def host(self, instance):
         from rift.benchmark.usami import CommerceHost
@@ -117,7 +118,8 @@ class WorldKit:
             identity_factory=instance.identity, proof_budget=self.proof_budget,
             episode_budget=self.episode_budget, task_registry=self.task_registry,
             return_receipt_after_days=(instance.knobs.get('receipt_delay_days', 1)
-                                       if instance.family_id == 'F9' else None))
+                                       if instance.family_id == 'F9' else None),
+            patience_slack=self.patience_slack)
 
     def certify_specs(self, specs):
         """Certify one single-task World per instance; returns ``{spec_key: [task_ref]}``."""
@@ -145,7 +147,7 @@ class ExperimentContext:
     """Checkpoint/attestation stores shared by every runtime of one run directory."""
     def __init__(self, *, root, service_model, verl_config_dir, episode_budget, update_budget,
                  tool_profile='full9', runtime_factory=None, group_size=4, response_length=8192,
-                 keep_runtime=True, persist_every=1, persist_final=True):
+                 keep_runtime=True, persist_every=1, persist_final=True, patience_slack=None):
         from rift.verl.checkpoints import FSDPCheckpointStore
         self.keep_runtime = keep_runtime
         self.persist_final = persist_final
@@ -157,7 +159,7 @@ class ExperimentContext:
         self.runtime_factory = runtime_factory or self._ascend_runtime
         for name in ('task_registry', 'checkpoints', 'episodes', 'generations', 'serving', 'updates'):
             (self.root / name).mkdir(parents=True, exist_ok=True)
-        self.world = WorldKit(self.root, episode_budget=episode_budget)
+        self.world = WorldKit(self.root, episode_budget=episode_budget, patience_slack=patience_slack)
         self.checkpoint_store = FSDPCheckpointStore({}, world_size=WORLD_SIZE)
         self.runtime = None
         self._wire_stores()
@@ -723,6 +725,9 @@ def _common(parser):
     parser.add_argument('--episode-budget-config')
     parser.add_argument('--tool-profile', default='full9', choices=('full9', 'core4'))
     parser.add_argument('--seed', type=int, default=2000)
+    parser.add_argument('--patience-slack', type=int,
+        help='Customer leaves after the certified minimum Service decisions, plus one per extra '
+             'order, plus this many; omitted (default) keeps unlimited patience')
 
 
 def _context(args, update_budget, group_size, response_length=8192, keep_runtime=True, persist_every=1):
@@ -733,7 +738,8 @@ def _context(args, update_budget, group_size, response_length=8192, keep_runtime
     return ExperimentContext(root=args.run_root, service_model=args.service_model,
         verl_config_dir=args.verl_config_dir, episode_budget=budget,
         update_budget=update_budget, tool_profile=args.tool_profile, group_size=group_size,
-        response_length=response_length, keep_runtime=keep_runtime, persist_every=persist_every)
+        response_length=response_length, keep_runtime=keep_runtime, persist_every=persist_every,
+        patience_slack=getattr(args, 'patience_slack', None))
 
 
 def main(argv=None):
