@@ -1,0 +1,10 @@
+[
+  {"family_id": "F1", "knobs": {}},
+  {"family_id": "F4", "knobs": {"age_days": 20}},
+  {"family_id": "F7", "knobs": {}},
+  {"family_id": "F1", "knobs": {"distractor_orders": 3}},
+  {"family_id": "F2", "knobs": {"purchased_quantity": 5, "refund_quantity": 2}},
+  {"family_id": "F9", "knobs": {}},
+  {"family_id": "F6", "knobs": {"extra_charge_cents": 3000, "customer_limit_cents": 2000, "refusal": true}},
+  {"family_id": "F9", "knobs": {"receipt_delay_days": 7}}
+]

@@ -1,0 +1,10 @@
+[
+  {"family": "F1", "knobs": {"distractor_orders": 3}, "instances": 16, "seed": 5000000},
+  {"family": "F2", "knobs": {"purchased_quantity": 5, "refund_quantity": 2}, "instances": 16, "seed": 5001000},
+  {"family": "F1", "knobs": {}, "instances": 8, "seed": 5100000},
+  {"family": "F4", "knobs": {"age_days": 20}, "instances": 8, "seed": 5101000},
+  {"family": "F7", "knobs": {}, "instances": 8, "seed": 5102000},
+  {"family": "F9", "knobs": {}, "instances": 8, "seed": 5103000},
+  {"family": "F6", "knobs": {"extra_charge_cents": 3000, "customer_limit_cents": 2000, "refusal": true}, "instances": 8, "seed": 5200000},
+  {"family": "F9", "knobs": {"receipt_delay_days": 7}, "instances": 8, "seed": 5201000}
+]

@@ -178,6 +178,25 @@ class X1ConfigTests(unittest.TestCase):
                         self.assertTrue(high <= other_low or other_high <= low,
                                         '%s and %s share world seeds' % (first, second))
 
+    def test_no_training_set_shares_a_world_seed_with_any_held_out_set(self):
+        def ranges(name):
+            return [(spec['seed'], spec['seed'] + spec['instances']) for spec in
+                    run.parse_task_specs(run.load_json_argument('configs/experiments/%s.json' % name))]
+        for train in ('x2_train', 'x5_train', 'smoke_bench'):
+            for heldout in ('x2_heldout', 'x5_heldout'):
+                for low, high in ranges(train):
+                    for other_low, other_high in ranges(heldout):
+                        self.assertTrue(high <= other_low or other_high <= low,
+                                        '%s overlaps %s' % (train, heldout))
+
+    def test_x5_arms_match_their_training_pools(self):
+        from rift.evolution.curriculum import Selection
+        arms = run.load_json_argument('configs/experiments/x5_arms.json')
+        pools = run.parse_task_specs(run.load_json_argument('configs/experiments/x5_train.json'))
+        self.assertEqual({Selection(a['family_id'], a['knobs'], 12).arm_key for a in arms},
+                         {run.spec_key(spec) for spec in pools})
+        self.assertTrue(all(spec['instances'] >= 12 for spec in pools))
+
     def test_eval_run_offers_its_initial_checkpoint(self):
         from types import SimpleNamespace
         from usami_v2.runtime.runner import EpisodeBudget

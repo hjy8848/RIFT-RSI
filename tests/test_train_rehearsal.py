@@ -77,7 +77,15 @@ class FakeRuntime:
     def __init__(self, context, loaded):
         self.context, self.checkpoint, self._loaded_checkpoint = context, loaded, loaded
         self.backend_bindings, self.trained, self.closed = {}, [], False
+        self.service_batch, self.evaluated = self, []
         FakeRuntime.opened.append(self)
+
+    def generate(self, requests):
+        """Stands in for the Agent Loop on the in-place held-out evaluation."""
+        self.evaluated.append((self._loaded_checkpoint, len(requests)))
+        return tuple({'rift_request_id': row['rift_request_id'],
+                      'rift_outcome': 'SUCCESS' if index % 3 else 'FAILURE',
+                      'rift_replay_verified': True} for index, row in enumerate(requests))
 
     def create_update_backend(self, request, **kwargs):
         return FakeBackend(self.context, self, request, kwargs)
@@ -124,8 +132,10 @@ class TrainRehearsal(unittest.TestCase):
                         digits = hashlib.sha256(episode.record_hash.encode()).digest()
                         prompt = hashlib.sha256(group.task_ref.encode()).digest()[0]
                         tokens = Tokens((1 + prompt,), (1 + digits[1], 1 + digits[2]), (True, True))
-                        rows.append(service_rollout(tokens, checkpoint, group.task_ref, episode.record_hash,
-                                                    outcome, group.group_id, response_id=episode.record_hash))
+                        # Scripted failures can record identically; GRPO needs distinct members.
+                        member_id = hashlib.sha256(('%s:%d' % (episode.record_hash, member)).encode()).hexdigest()
+                        rows.append(service_rollout(tokens, checkpoint, group.task_ref, member_id,
+                                                    outcome, group.group_id, response_id=member_id))
                 request = UpdateRequest(checkpoint, package.package_id, tuple(rows), 'grpo')
                 record = getattr(package, 'record_service_request', None)
                 return request, (record(request) if record is not None else None)
@@ -193,6 +203,66 @@ class TrainRehearsal(unittest.TestCase):
             self.assertEqual(rows[0]['rollouts'], 16)               # 4 tasks x 4 samples
             with self.assertRaises(FileExistsError):                # a finished run is not overwritten
                 run.train_pool(context, train_specs=[], rounds=1, tasks_per_round=2, seed=1)
+
+    def _policy_run(self, root, policy_name, seed):
+        from rift.evolution.curriculum import Selection
+        FakeRuntime.opened = []
+        context = run.ExperimentContext(root=root, service_model='m', verl_config_dir='.',
+            episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6),
+            runtime_factory=lambda checkpoint: FakeRuntime(context, checkpoint),
+            persist_every=0, persist_final=False)
+        context._worker_manifest = lambda checkpoint: None
+        collector = self._collector(context)
+        arms = [{'family': 'F1', 'knobs': {'distractor_orders': 3}, 'instances': 6, 'seed': 8100},
+                {'family': 'F2', 'knobs': {'purchased_quantity': 5, 'refund_quantity': 2},
+                 'instances': 6, 'seed': 8200},
+                {'family': 'F4', 'knobs': {'age_days': 20}, 'instances': 6, 'seed': 8300}]
+        selections = tuple(Selection(row['family'], row['knobs'], 4) for row in arms)
+        policy = run.build_policy(policy_name, selections, seed=seed, window=5)
+        result = run.train_pool(context, train_specs=arms, rounds=6, tasks_per_round=4, seed=seed,
+            collector_factory=lambda loaded, index: collector(loaded, index), policy=policy,
+            heldout_specs=[{'family': 'F1', 'knobs': {}, 'instances': 3, 'seed': 8400},
+                           {'family': 'F7', 'knobs': {}, 'instances': 3, 'seed': 8500}],
+            heldout_groups=2)
+        return context, result
+
+    def test_a_curriculum_policy_picks_one_class_per_round_and_evaluates_in_place(self):
+        for policy_name in ('random', 'bandit'):
+            with tempfile.TemporaryDirectory() as root:
+                self._initial(root)
+                context, result = self._policy_run(root, policy_name, seed=5)
+                rows = [json.loads(line) for line in (Path(root) / 'rounds.jsonl').read_text(
+                    encoding='utf-8').splitlines()]
+                self.assertEqual(len(rows), 6)
+                for row in rows:
+                    self.assertEqual(list(row['train_success']), [row['arm']])     # one class per round
+                    self.assertTrue(0 <= row['learnability'] <= 1)
+                self.assertEqual(len(FakeRuntime.opened), 1)
+                steps = Path(root) / 'checkpoints' / 'service'
+                self.assertFalse(steps.exists() and any(steps.iterdir()))          # no checkpoint files
+                final = json.loads((Path(root) / 'final.json').read_text(encoding='utf-8'))
+                self.assertTrue(final['in_memory_only'])
+                runtime = FakeRuntime.opened[0]
+                self.assertEqual(runtime.evaluated, [(runtime._loaded_checkpoint, 2 * 4 * 6)])
+                report = result['heldout']['families']
+                self.assertEqual(sorted(report), ['F1:{}', 'F7:{}'])
+                self.assertEqual(sum(v['success'] + v['failure'] for v in report.values()), 48)
+                self.assertEqual(result['heldout']['checkpoint']['revision'], '6')
+
+    def test_the_bandit_stops_choosing_a_class_that_gives_no_signal(self):
+        """With one class that is always solved, learnability is 0 there and the bandit moves on."""
+        from rift.evolution.curriculum import BanditPolicy, Observation, Selection
+        arms = tuple(Selection(f, {}, 4) for f in ('F1', 'F4', 'F7'))
+        policy = BanditPolicy(arms, seed=3, window=10)
+        history = []
+        picks = []
+        for index in range(60):
+            choice = policy.propose(index, tuple(history))
+            picks.append(choice.family_id)
+            learn = 0.0 if choice.family_id == 'F4' else 0.75        # F4 is saturated: no signal
+            history.append(Observation(choice, 0.9 if learn == 0 else 0.5, learn, 4))
+        self.assertLess(picks[30:].count('F4'), picks[30:].count('F1') + picks[30:].count('F7'))
+        self.assertLess(picks[30:].count('F4'), 8)
 
     def test_a_new_process_cannot_resume_from_an_in_memory_version(self):
         from rift.schemas import Checkpoint

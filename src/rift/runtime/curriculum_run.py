@@ -145,9 +145,10 @@ class ExperimentContext:
     """Checkpoint/attestation stores shared by every runtime of one run directory."""
     def __init__(self, *, root, service_model, verl_config_dir, episode_budget, update_budget,
                  tool_profile='full9', runtime_factory=None, group_size=4, response_length=8192,
-                 keep_runtime=True, persist_every=1):
+                 keep_runtime=True, persist_every=1, persist_final=True):
         from rift.verl.checkpoints import FSDPCheckpointStore
         self.keep_runtime = keep_runtime
+        self.persist_final = persist_final
         self.persist_every, self.total_rounds = persist_every, None
         self.root, self.service_model = Path(root).resolve(), str(service_model)
         self.verl_config_dir, self.episode_budget = Path(verl_config_dir), episode_budget
@@ -302,6 +303,8 @@ class ExperimentContext:
         """Whether the update of round ``index`` writes real checkpoint files."""
         if self.persist_every and (index + 1) % self.persist_every == 0:
             return True
+        if not self.persist_final:
+            return False
         return self.total_rounds is not None and index + 1 >= self.total_rounds   # 0 = last round only
 
     def open_runtime(self, checkpoint):
@@ -542,13 +545,33 @@ def _pool_collector(context, checkpoint, index):
         capture_store=context.capture_store, metric_sink=context.metric_sink, round_index=index)
 
 
-def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from_run=None,
-               collector_factory=None):
-    """Plain GRPO on a fixed pool of certified tasks, a balanced sample of it every round.
+def _pool_stats(request, groups):
+    """Per-group learnability of one round, shaped for the curriculum policies."""
+    from rift.rewards.learnability import LearnabilityStats, TaskLearnability
+    by_id = {group.group_id: group for group in groups}
+    observed = {}
+    for row in request.rollouts:
+        observed.setdefault(row.group_id, []).append(row)
+    tasks = []
+    for group_id, rows in observed.items():
+        group = by_id[group_id]
+        k = sum(int(row.reward) for row in rows)
+        p = k / group.group_size
+        tasks.append(TaskLearnability(group.task_ref, 'designer', k, group.group_size, 4 * p * (1 - p)))
+    return LearnabilityStats(tuple(tasks), sum(t.learnability for t in tasks) / len(tasks), None,
+                             sum(t.informative for t in tasks) / len(tasks), len(tasks), len(groups))
 
-    No curriculum, Designer or training package: the experiment this serves (X2) only asks
-    whether the success rate rises. The checkpoint is written after the last round only
-    (see ``--persist-every``); a crashed run starts again.
+
+def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from_run=None,
+               collector_factory=None, policy=None, heldout_specs=None, heldout_groups=4,
+               heldout_seed=2000, heldout_label='x2base'):
+    """Plain GRPO on a fixed pool of certified tasks.
+
+    Without ``policy`` each round is a balanced sample of every class (X2). With one of the
+    curriculum policies each round is ``tasks_per_round`` tasks of the single class it picks,
+    scored by the learnability of that round's groups (X5). With ``heldout_specs`` the final
+    policy is evaluated on those tasks by the still-running runtime, which also makes a
+    checkpoint file unnecessary. A crashed run starts again.
     """
     import random
     import time
@@ -561,22 +584,33 @@ def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from
     else:
         checkpoint = context.initial_checkpoint()
     by_key = context.world.certify_specs(train_specs)
+    heldout = context.world.certify_specs(heldout_specs) if heldout_specs else None
     context.world.save()
     keys = sorted(by_key)
-    if tasks_per_round % len(keys) or any(len(by_key[key]) < tasks_per_round // len(keys) for key in keys):
-        raise ValueError('tasks per round must split evenly over the classes and fit their pools')
-    per_key = tasks_per_round // len(keys)
+    if policy is None:
+        if tasks_per_round % len(keys) or any(len(by_key[key]) < tasks_per_round // len(keys) for key in keys):
+            raise ValueError('tasks per round must split evenly over the classes and fit their pools')
+        per_key = tasks_per_round // len(keys)
+    else:
+        arm_keys = {arm.arm_key for arm in policy.arms}
+        if (not arm_keys <= set(by_key) or {arm.n_tasks for arm in policy.arms} != {tasks_per_round}
+                or any(len(by_key[key]) < tasks_per_round for key in arm_keys)):
+            raise ValueError('every arm needs a task pool of at least tasks_per_round certified instances')
     make_collector = collector_factory or (lambda loaded, index: _pool_collector(context, loaded, index))
-    history = []
+    history, observations, report = [], [], None
     try:
         for index in range(rounds):
             started = time.perf_counter()
             rng = random.Random(seed + index)
-            groups = []
-            for key in keys:
-                for ref in rng.sample(by_key[key], per_key):
-                    groups.append(PoolGroup(ref, sha256(('rift-pool-group-v1:%d:%s' % (index, ref)).encode()
-                                                        ).hexdigest()[:32], context.group_size, key))
+            selection, groups = None, []
+            if policy is None:
+                chosen = [(key, ref) for key in keys for ref in rng.sample(by_key[key], per_key)]
+            else:
+                selection = policy.propose(index, tuple(observations))
+                chosen = [(selection.arm_key, ref) for ref in rng.sample(by_key[selection.arm_key], tasks_per_round)]
+            for key, ref in chosen:
+                groups.append(PoolGroup(ref, sha256(('rift-pool-group-v1:%d:%s' % (index, ref)).encode()
+                                                    ).hexdigest()[:32], context.group_size, key))
             batch = PoolBatch('pool-%06d-%s' % (index, sha256(
                 '|'.join(group.task_ref for group in groups).encode()).hexdigest()[:12]), groups, seed + index)
             request, _ = make_collector(checkpoint, index).collect(batch, checkpoint)
@@ -586,6 +620,7 @@ def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from
                 rewards.setdefault(source[row.group_id], []).append(row.reward)
             sampled = time.perf_counter()
             collected = len(request.rollouts)
+            stats = _pool_stats(request, groups) if policy is not None else None
             request = fit_request_to_batches(request, context.update_budget.mini_batch_size)
             update = RoundBackend(context, index, checkpoint).train(request)
             checkpoint = update.policy_after
@@ -595,17 +630,29 @@ def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from
                    'rollouts': collected, 'trained_rollouts': len(request.rollouts),
                    'sample_seconds': round(sampled - started, 1),
                    'update_seconds': round(time.perf_counter() - sampled, 1)}
+            if policy is not None:
+                observations.append(policy.observe(selection, stats))
+                row.update(arm=selection.arm_key, learnability=stats.designer_mean,
+                           informative_fraction=stats.designer_informative_fraction)
             history.append(row)
             with rounds_path.open('a', encoding='utf-8') as stream:
                 stream.write(json.dumps(row, sort_keys=True) + '\n')
+        if heldout:
+            report = sample_outcomes(context, heldout, checkpoint, groups=heldout_groups,
+                                     seed=heldout_seed, label=heldout_label)
     finally:
         context.close_runtime()
     manifest = context.latest_manifest()
     (context.root / 'final.json').write_text(json.dumps({
-        'checkpoint': asdict(checkpoint), 'manifest': str(manifest.resolve()), 'rounds': rounds},
-        sort_keys=True), encoding='utf-8')
-    return {'status': 'pool_training_completed', 'rounds': rounds, 'final_checkpoint': asdict(checkpoint),
-            'history': history, 'run_root': str(context.root)}
+        'checkpoint': asdict(checkpoint), 'manifest': str(manifest.resolve()), 'rounds': rounds,
+        'in_memory_only': checkpoint in context.checkpoint_store.virtual}, sort_keys=True), encoding='utf-8')
+    result = {'status': 'pool_training_completed', 'rounds': rounds, 'final_checkpoint': asdict(checkpoint),
+              'history': history, 'run_root': str(context.root)}
+    if report is not None:
+        result['heldout'] = {'status': 'evaluation_completed', 'label': heldout_label, 'seed': heldout_seed,
+                             'groups_per_task': heldout_groups, 'group_size': context.group_size,
+                             'checkpoint': asdict(checkpoint), 'families': report}
+    return result
 
 
 def build_eval_requests(by_key, checkpoint, *, groups, group_size, seed, label):
@@ -633,31 +680,36 @@ def build_eval_requests(by_key, checkpoint, *, groups, group_size, seed, label):
     return requests, owners
 
 
+def sample_outcomes(context, by_key, checkpoint, *, groups, seed, label):
+    """Sample ``groups`` x group_size episodes per task on the live runtime; per-class report."""
+    requests, owners = build_eval_requests(by_key, checkpoint, groups=groups,
+        group_size=context.group_size, seed=seed, label=label)
+    # One generate call only: the runtime puts vLLM to sleep after every call and
+    # nothing wakes it before the next one, so a second call would wait forever.
+    outputs = LazyBatch(context, checkpoint).generate(requests)
+    if len(outputs) != len(requests):
+        raise ValueError('VERL omitted evaluation requests')
+    rows = []
+    for request, output in zip(requests, outputs):
+        if output.get('rift_request_id') != request['rift_request_id']:
+            raise ValueError('evaluation output lost its request identity')
+        key, task_ref = owners[request['rift_request_id']]
+        outcome = output.get('rift_outcome')
+        if output.get('rift_replay_verified') is not True:
+            outcome = 'unknown'
+        rows.append((key, task_ref, outcome))
+    return summarize_outcomes(rows)
+
+
 def evaluate(context, *, specs, groups, seed, label, from_run=None):
     """Sample ``groups`` x group_size episodes per task and report success rates."""
     by_key = context.world.certify_specs(specs)
     context.world.save()
     checkpoint = (context.checkpoint_from_run(from_run) if from_run else context.initial_checkpoint())
-    requests, owners = build_eval_requests(by_key, checkpoint, groups=groups,
-        group_size=context.group_size, seed=seed, label=label)
-    rows = []
     try:
-        # One generate call only: the runtime puts vLLM to sleep after every call and
-        # nothing wakes it before the next one, so a second call would wait forever.
-        outputs = LazyBatch(context, checkpoint).generate(requests)
-        if len(outputs) != len(requests):
-            raise ValueError('VERL omitted evaluation requests')
-        for request, output in zip(requests, outputs):
-            if output.get('rift_request_id') != request['rift_request_id']:
-                raise ValueError('evaluation output lost its request identity')
-            key, task_ref = owners[request['rift_request_id']]
-            outcome = output.get('rift_outcome')
-            if output.get('rift_replay_verified') is not True:
-                outcome = 'unknown'
-            rows.append((key, task_ref, outcome))
+        report = sample_outcomes(context, by_key, checkpoint, groups=groups, seed=seed, label=label)
     finally:
         context.close_runtime()
-    report = summarize_outcomes(rows)
     return {'status': 'evaluation_completed', 'label': label, 'checkpoint': asdict(checkpoint),
             'groups_per_task': groups, 'group_size': context.group_size, 'seed': seed,
             'from_run': None if from_run is None else str(from_run),
@@ -721,6 +773,14 @@ def main(argv=None):
     pool_parser.add_argument('--learning-rate', type=float, default=1e-6)
     pool_parser.add_argument('--response-length', type=int, default=12288)
     pool_parser.add_argument('--persist-every', type=int, default=0)
+    pool_parser.add_argument('--no-final-checkpoint', action='store_true',
+        help='never write checkpoint files; use with --heldout-specs, which evaluates in place')
+    pool_parser.add_argument('--policy', choices=POLICIES,
+        help='pick one class per round with a curriculum policy (X5); default is a balanced mix (X2)')
+    pool_parser.add_argument('--arms', help='JSON list of {family_id, knobs}; inline or file (with --policy)')
+    pool_parser.add_argument('--window', type=int, default=10)
+    pool_parser.add_argument('--heldout-specs', help='evaluate the final policy on these tasks, in place')
+    pool_parser.add_argument('--heldout-groups', type=int, default=4)
     pool_parser.add_argument('--init-from-run')
     pool_parser.add_argument('--restart-each-round', action='store_true')
     eval_parser = sub.add_parser('eval', help='evaluate a frozen checkpoint without updating it')
@@ -749,12 +809,26 @@ def main(argv=None):
             package_config=package_config, window=args.window, fixed_family=args.fixed_family,
             init_from_run=args.init_from_run)
     elif args.command == 'train-pool':
+        from rift.evolution.curriculum import Selection
         budget = UpdateBudget(args.mini_batch_size, args.epochs, args.learning_rate)
         context = _context(args, budget, args.group_size, response_length=args.response_length,
                            keep_runtime=not args.restart_each_round, persist_every=args.persist_every)
+        context.persist_final = not args.no_final_checkpoint
+        policy = None
+        if args.policy:
+            if not args.arms:
+                parser.error('--policy needs --arms')
+            selections = tuple(Selection(row['family_id'], row.get('knobs', {}), args.tasks_per_round)
+                               for row in load_json_argument(args.arms))
+            policy = build_policy(args.policy, selections, seed=args.seed, window=args.window)
         result = train_pool(context, train_specs=load_json_argument(args.train_specs),
             rounds=args.rounds, tasks_per_round=args.tasks_per_round, seed=args.seed,
-            init_from_run=args.init_from_run)
+            init_from_run=args.init_from_run, policy=policy,
+            heldout_specs=load_json_argument(args.heldout_specs) if args.heldout_specs else None,
+            heldout_groups=args.heldout_groups)
+        if 'heldout' in result:
+            (context.root / 'eval-result.json').write_text(
+                json.dumps(result['heldout'], sort_keys=True, indent=2), encoding='utf-8')
     else:
         context = _context(args, UpdateBudget(WORLD_SIZE, 1, 1e-6), args.group_size,
                            response_length=args.response_length)
