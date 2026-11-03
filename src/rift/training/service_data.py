@@ -44,8 +44,9 @@ def prepare_service_trajectory_update(package_id, certified_tasks, episodes, che
     for episode in episodes:
         task_id = episode.task.record_hash
         if task_id not in certified_tasks: raise ValueError('episode is not from a certified package task')
+        # An episode whose replay disagrees (seen once in ~400: a repeated refund) has an
+        # UNKNOWN outcome, so its whole GRPO group is dropped below instead of ending the run.
         verified = replay_episode(episode).verified
-        if not verified: raise ValueError('episode replay failed')
         outcome = public_business_outcome(episode, verified)
         if capture_store.verify_trajectory(episode, checkpoint) is not True:
             raise ValueError('generation-time trajectory evidence failed verification')
