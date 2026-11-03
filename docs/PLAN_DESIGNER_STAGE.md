@@ -127,7 +127,7 @@
 
 ## 4. Usami 本身：世界与任务的生成机制、生成多样性
 
-（2026-11-03 通读 `third_party/usami/usami_v2/scenarios/`、`commerce/transitions.py`、Service 的 9 个工具和 `src/rift/benchmark/families.py` 后整理。只讨论 Usami 能**生成**什么，不讨论固定题库是否多样。）
+（2026-11-03 通读 `third_party/usami/usami_v2/scenarios/`、`commerce/transitions.py`、Service 的 9 个工具和 `src/rift/benchmark/families.py` 后整理。只讨论 Usami 能**生成**什么，不讨论固定题库是否多样。**详细的原因和改法见 [PLAN_USAMI_GENERATION.md](PLAN_USAMI_GENERATION.md)**，那里还记录了一个新发现：请求渲染对“应成功”和“应拒绝”的目标用了不同句式，存在标签泄露。）
 
 ### 4.0 现状：题目实质上只是换名字
 
