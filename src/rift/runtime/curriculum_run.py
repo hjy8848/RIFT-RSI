@@ -31,14 +31,29 @@ def load_json_argument(value):
     return json.loads(Path(value).read_text(encoding='utf-8'))
 
 
+GENERATOR_OPTIONS = ('balanced', 'near_distractors', 'grid_mode')
+
+
 def parse_task_specs(rows):
-    """Validate ``[{family, knobs, instances, seed}]`` certification requests."""
+    """Validate certification requests.
+
+    ``{family, knobs, instances, seed}`` is a fixed F-family instance; ``{generator,
+    instances, seed, balanced?, near_distractors?, grid_mode?}`` is a randomized one from
+    ``rift.benchmark.generator`` (``balanced`` keeps half success and half refusal answers).
+    """
     specs = []
     for row in rows:
-        if (not isinstance(row, dict) or set(row) - {'family', 'knobs', 'instances', 'seed'}
+        generated = isinstance(row, dict) and 'generator' in row
+        allowed = ({'generator', 'instances', 'seed', *GENERATOR_OPTIONS} if generated
+                   else {'family', 'knobs', 'instances', 'seed'})
+        if (not isinstance(row, dict) or set(row) - allowed
                 or type(row.get('instances')) is not int or row['instances'] < 1
                 or type(row.get('seed')) is not int or row['seed'] < 0):
-            raise ValueError('each task spec needs family, instances >= 1 and a non-negative seed')
+            raise ValueError('each task spec needs family or generator, instances >= 1 and a non-negative seed')
+        if generated:
+            specs.append({'generator': row['generator'], 'instances': row['instances'], 'seed': row['seed'],
+                          **{name: row[name] for name in GENERATOR_OPTIONS if name in row}})
+            continue
         knobs = row.get('knobs', {})
         if not isinstance(knobs, dict):
             raise ValueError('task spec knobs must be a mapping')
@@ -50,7 +65,22 @@ def parse_task_specs(rows):
 
 
 def spec_key(spec):
+    if 'generator' in spec:
+        options = {name: spec[name] for name in GENERATOR_OPTIONS if name in spec}
+        return 'gen:' + spec['generator'] + (':' + json.dumps(options, sort_keys=True, separators=(',', ':'))
+                                              if options else '')
     return spec['family'] + ':' + json.dumps(spec['knobs'], sort_keys=True, separators=(',', ':'))
+
+
+def plan_identity(label, metadata):
+    """Identity factory for a certified World from a generator or the Designer."""
+    from rift.schemas import DataPurpose, Identity, Split
+
+    def identity(task, spec, build):
+        detail = dict(metadata, spec_hash=spec.record_hash, world_seed=build.seed)
+        return Identity(build.world_hash, task.record_hash, label,
+                        json.dumps(detail, sort_keys=True, separators=(',', ':')), Split.TRAIN, DataPurpose.TRAIN)
+    return identity
 
 
 def wilson_interval(successes, total, z=1.96):
@@ -121,11 +151,45 @@ class WorldKit:
                                        if instance.family_id == 'F9' else None),
             patience_slack=self.patience_slack)
 
+    def plan_host(self, identity_factory):
+        """Host for World-plus-task plans (generator and Designer); physical returns are received a day later."""
+        from rift.benchmark.usami import CommerceHost
+        return CommerceHost((), self.distribution, None, None, None, registry=self.split_registry,
+            identity_factory=identity_factory, proof_budget=self.proof_budget,
+            episode_budget=self.episode_budget, task_registry=self.task_registry,
+            return_receipt_after_days=1, patience_slack=self.patience_slack)
+
+    def certify_plan(self, proposal, world_seed, identity_factory):
+        """Certify one World plan; returns the native result (tasks, reasons, build)."""
+        return self.plan_host(identity_factory).certify_training_plan(proposal, world_seed=world_seed)
+
+    def certify_generated(self, spec):
+        from rift.benchmark.generator import balanced_seeds, draft_instance
+        from rift.tasks import Proposal
+        options = {name: spec[name] for name in ('near_distractors', 'grid_mode') if name in spec}
+        seeds = (balanced_seeds(spec['generator'], spec['instances'], spec['seed'], **options)
+                 if spec.get('balanced') else range(spec['seed'], spec['seed'] + spec['instances']))
+        refs = []
+        for seed in seeds:
+            data, task = draft_instance(spec['generator'], seed, **options)
+            proposal = Proposal(f"gen-{spec['generator']}-{seed}", f"generated {spec['generator']}",
+                                world_draft=data, challenges=(task,))
+            identity = plan_identity('gen:' + spec['generator'], {'generator': spec['generator'], **options})
+            result = self.certify_plan(proposal, seed, identity)
+            if len(result.tasks) != 1:
+                raise RuntimeError('generator %s seed %d did not certify: %s %s'
+                                   % (spec['generator'], seed, result.build.status, result.challenge_results))
+            refs.append(result.tasks[0].record_hash)
+        return refs
+
     def certify_specs(self, specs):
         """Certify one single-task World per instance; returns ``{spec_key: [task_ref]}``."""
         from rift.benchmark.families import FAMILIES
         refs = {}
         for spec in parse_task_specs(specs):
+            if 'generator' in spec:
+                refs.setdefault(spec_key(spec), []).extend(self.certify_generated(spec))
+                continue
             family = FAMILIES[spec['family']]
             for offset in range(spec['instances']):
                 seed = spec['seed'] + offset
@@ -564,9 +628,21 @@ def _pool_stats(request, groups):
                              sum(t.informative for t in tasks) / len(tasks), len(tasks), len(groups))
 
 
+def designer_round(rng, designer_refs, mix_pairs, tasks_per_round, mix_fraction):
+    """One stage-1 round: Designer tasks plus a fixed share of balanced generator tasks.
+
+    The share guards against the Service drifting toward whatever the Designer over-produces.
+    """
+    n_mix = round(tasks_per_round * mix_fraction) if mix_pairs else 0
+    n_designer = tasks_per_round - n_mix
+    pick = lambda pool, n: rng.sample(pool, n) if len(pool) >= n else rng.choices(pool, k=n)
+    return ([('designer', ref) for ref in pick(list(designer_refs), n_designer)]
+            + (pick(list(mix_pairs), n_mix) if n_mix else []))
+
+
 def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from_run=None,
                collector_factory=None, policy=None, heldout_specs=None, heldout_groups=4,
-               heldout_seed=2000, heldout_label='x2base'):
+               heldout_seed=2000, heldout_label='x2base', designer_plans=None, mix_fraction=0.25):
     """Plain GRPO on a fixed pool of certified tasks.
 
     Without ``policy`` each round is a balanced sample of every class (X2). With one of the
@@ -585,15 +661,29 @@ def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from
         checkpoint = context.adopt_initial_from(init_from_run)
     else:
         checkpoint = context.initial_checkpoint()
-    by_key = context.world.certify_specs(train_specs)
+    designer_refs = mix_pairs = None
+    if designer_plans:
+        # Stage 1: train on certified stage-0 Designer tasks; train_specs, if any, are the mix-in.
+        from rift.designer.stage0 import certify_saved_plans
+        if policy is not None or not 0 <= mix_fraction < 1:
+            raise ValueError('Designer training takes no curriculum policy and a mix fraction in [0, 1)')
+        designer_refs = certify_saved_plans(context.world, designer_plans)
+        if not designer_refs:
+            raise ValueError('the stage-0 file has no certified Designer task')
+        by_key = context.world.certify_specs(train_specs) if train_specs else {}
+        mix_pairs = [(key, ref) for key in sorted(by_key) for ref in by_key[key]]
+        if mix_fraction and not mix_pairs:
+            raise ValueError('a mix fraction needs balanced generator --train-specs to mix in')
+    else:
+        by_key = context.world.certify_specs(train_specs)
     heldout = context.world.certify_specs(heldout_specs) if heldout_specs else None
     context.world.save()
     keys = sorted(by_key)
-    if policy is None:
+    if designer_refs is None and policy is None:
         if tasks_per_round % len(keys) or any(len(by_key[key]) < tasks_per_round // len(keys) for key in keys):
             raise ValueError('tasks per round must split evenly over the classes and fit their pools')
         per_key = tasks_per_round // len(keys)
-    else:
+    elif designer_refs is None:
         arm_keys = {arm.arm_key for arm in policy.arms}
         if (not arm_keys <= set(by_key) or {arm.n_tasks for arm in policy.arms} != {tasks_per_round}
                 or any(len(by_key[key]) < tasks_per_round for key in arm_keys)):
@@ -605,7 +695,9 @@ def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from
             started = time.perf_counter()
             rng = random.Random(seed + index)
             selection, groups = None, []
-            if policy is None:
+            if designer_refs is not None:
+                chosen = designer_round(rng, designer_refs, mix_pairs, tasks_per_round, mix_fraction)
+            elif policy is None:
                 chosen = [(key, ref) for key in keys for ref in rng.sample(by_key[key], per_key)]
             else:
                 selection = policy.propose(index, tuple(observations))
@@ -682,8 +774,11 @@ def build_eval_requests(by_key, checkpoint, *, groups, group_size, seed, label):
     return requests, owners
 
 
-def sample_outcomes(context, by_key, checkpoint, *, groups, seed, label):
-    """Sample ``groups`` x group_size episodes per task on the live runtime; per-class report."""
+def sample_rows(context, by_key, checkpoint, *, groups, seed, label):
+    """Sample ``groups`` x group_size episodes per task on the live runtime.
+
+    Returns ``{key, task_ref, outcome, episode_id}`` per episode; outcome is lower case.
+    """
     requests, owners = build_eval_requests(by_key, checkpoint, groups=groups,
         group_size=context.group_size, seed=seed, label=label)
     # One generate call only: the runtime puts vLLM to sleep after every call and
@@ -696,11 +791,40 @@ def sample_outcomes(context, by_key, checkpoint, *, groups, seed, label):
         if output.get('rift_request_id') != request['rift_request_id']:
             raise ValueError('evaluation output lost its request identity')
         key, task_ref = owners[request['rift_request_id']]
-        outcome = output.get('rift_outcome')
-        if output.get('rift_replay_verified') is not True:
+        outcome = str(output.get('rift_outcome')).lower()
+        if output.get('rift_replay_verified') is not True or outcome not in ('success', 'failure'):
             outcome = 'unknown'
-        rows.append((key, task_ref, outcome))
-    return summarize_outcomes(rows)
+        rows.append({'key': key, 'task_ref': task_ref, 'outcome': outcome,
+                     'episode_id': output.get('rift_episode_id')})
+    return rows
+
+
+def sample_outcomes(context, by_key, checkpoint, *, groups, seed, label):
+    """Sample ``groups`` x group_size episodes per task on the live runtime; per-class report."""
+    rows = sample_rows(context, by_key, checkpoint, groups=groups, seed=seed, label=label)
+    return summarize_outcomes([(row['key'], row['task_ref'], row['outcome']) for row in rows])
+
+
+def collect_failures(context, *, specs, groups, seed, max_cases, from_run=None):
+    """Sample the Service on training tasks and write the Designer's failure context.
+
+    Writes ``failures.json`` (cases with hidden goals; training split only) next to the report.
+    """
+    from rift.designer.failures import failure_cases
+    by_key = context.world.certify_specs(specs)
+    context.world.save()
+    checkpoint = (context.checkpoint_from_run(from_run) if from_run else context.initial_checkpoint())
+    try:
+        rows = sample_rows(context, by_key, checkpoint, groups=groups, seed=seed, label='failures')
+    finally:
+        context.close_runtime()
+    cases = failure_cases(rows, context.world.task_registry, context.capture_store, max_cases=max_cases)
+    report = summarize_outcomes([(row['key'], row['task_ref'], row['outcome']) for row in rows])
+    (context.root / 'failures.json').write_text(json.dumps(
+        {'checkpoint': asdict(checkpoint), 'cases': cases, 'families': report},
+        ensure_ascii=False, indent=2, sort_keys=True), encoding='utf-8')
+    return {'status': 'failures_collected', 'cases': len(cases), 'families': report,
+            'failures': str(context.root / 'failures.json'), 'run_root': str(context.root)}
 
 
 def evaluate(context, *, specs, groups, seed, label, from_run=None):
@@ -770,7 +894,11 @@ def main(argv=None):
         help='tear the NPU runtime down after every update (slow; the default keeps it up)')
     pool_parser = sub.add_parser('train-pool', help='plain GRPO on a fixed pool of tasks (X2)')
     _common(pool_parser)
-    pool_parser.add_argument('--train-specs', required=True, help='JSON list of task specs; inline or file')
+    pool_parser.add_argument('--train-specs', help='JSON list of task specs; inline or file. With '
+        '--designer-plans these are the balanced generator tasks mixed into every round')
+    pool_parser.add_argument('--designer-plans', help='stage-0 designer-plans.jsonl: train on its certified tasks')
+    pool_parser.add_argument('--mix-fraction', type=float, default=0.25,
+        help='with --designer-plans: share of each round drawn from --train-specs')
     pool_parser.add_argument('--rounds', type=int, required=True)
     pool_parser.add_argument('--tasks-per-round', type=int, default=16)
     pool_parser.add_argument('--group-size', type=int, default=4)
@@ -789,6 +917,15 @@ def main(argv=None):
     pool_parser.add_argument('--heldout-groups', type=int, default=4)
     pool_parser.add_argument('--init-from-run')
     pool_parser.add_argument('--restart-each-round', action='store_true')
+    failures_parser = sub.add_parser('collect-failures',
+        help='sample the Service on training tasks and write failures.json for the Designer')
+    _common(failures_parser)
+    failures_parser.add_argument('--specs', required=True, help='JSON list of training task specs; inline or file')
+    failures_parser.add_argument('--groups', type=int, default=2)
+    failures_parser.add_argument('--group-size', type=int, default=4)
+    failures_parser.add_argument('--max-cases', type=int, default=8)
+    failures_parser.add_argument('--from-run', help='train run directory whose final.json supplies the checkpoint')
+    failures_parser.add_argument('--response-length', type=int, default=20480)
     eval_parser = sub.add_parser('eval', help='evaluate a frozen checkpoint without updating it')
     _common(eval_parser)
     eval_parser.add_argument('--specs', help='JSON list of {family, knobs, instances, seed}; inline or file')
@@ -827,14 +964,23 @@ def main(argv=None):
             selections = tuple(Selection(row['family_id'], row.get('knobs', {}), args.tasks_per_round)
                                for row in load_json_argument(args.arms))
             policy = build_policy(args.policy, selections, seed=args.seed, window=args.window)
-        result = train_pool(context, train_specs=load_json_argument(args.train_specs),
+        if not args.train_specs and not args.designer_plans:
+            parser.error('train-pool needs --train-specs or --designer-plans')
+        result = train_pool(context,
+            train_specs=load_json_argument(args.train_specs) if args.train_specs else None,
             rounds=args.rounds, tasks_per_round=args.tasks_per_round, seed=args.seed,
             init_from_run=args.init_from_run, policy=policy,
             heldout_specs=load_json_argument(args.heldout_specs) if args.heldout_specs else None,
-            heldout_groups=args.heldout_groups)
+            heldout_groups=args.heldout_groups, designer_plans=args.designer_plans,
+            mix_fraction=args.mix_fraction)
         if 'heldout' in result:
             (context.root / 'eval-result.json').write_text(
                 json.dumps(result['heldout'], sort_keys=True, indent=2), encoding='utf-8')
+    elif args.command == 'collect-failures':
+        context = _context(args, UpdateBudget(WORLD_SIZE, 1, 1e-6), args.group_size,
+                           response_length=args.response_length)
+        result = collect_failures(context, specs=load_json_argument(args.specs), groups=args.groups,
+                                  seed=args.seed, max_cases=args.max_cases, from_run=args.from_run)
     else:
         context = _context(args, UpdateBudget(WORLD_SIZE, 1, 1e-6), args.group_size,
                            response_length=args.response_length)

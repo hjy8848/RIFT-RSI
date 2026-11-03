@@ -213,6 +213,31 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     return config
 
 
+def _proposed_lines(message, references):
+    """Requested lines a Service message is about.
+
+    A line ID names its line outright. Otherwise a line is meant when the message uses
+    the words that tell its description apart from the other requests (for example
+    "watch" and "12" in "smart watch delivered about 12 days ago"); the line using
+    most of them wins, and a tie is ambiguous.
+    """
+    import re
+    text = message.casefold()
+    named = [line_id for line_id in references if line_id.casefold() in text]
+    if named:
+        return named
+    words = set(re.findall(r'[a-z0-9]+(?:\.[0-9]+)?', text))
+    tokens = {line_id: set(re.findall(r'[a-z0-9]+(?:\.[0-9]+)?', reference.casefold()))
+              for line_id, reference in references.items()}
+    scores = {}
+    for line_id, own in tokens.items():
+        others = set().union(*(value for key, value in tokens.items() if key != line_id))
+        distinct = own - others
+        scores[line_id] = len(distinct & words)
+    best = max(scores.values(), default=0)
+    return [line_id for line_id, score in scores.items() if best and score == best]
+
+
 class _UsamiCustomer:
     """Private native Usami customer simulator; its profile never enters Service input."""
     uses_model = False
@@ -230,21 +255,14 @@ class _UsamiCustomer:
                                     declines_proposal=True, finish=True)
         scoped = getattr(profile, 'decline_line_ids', ())
         if scoped:
-            import re
-            message = prompt.last_service_message.casefold()
-            words = set(re.findall(r'[a-z0-9]+', message))
-            matches = []
-            for line_id, reference in profile.request_references.items():
-                terms = {word for word in re.findall(r'[a-z0-9]+', reference.casefold())
-                         if word not in {'the', 'in', 'of', 'my', 'item', 'order'}}
-                if line_id.casefold() in message or (terms and terms.issubset(words)):
-                    matches.append(line_id)
+            matches = _proposed_lines(prompt.last_service_message, profile.request_references)
             if len(matches) == 1:
                 if matches[0] in scoped:
                     return CustomerDecision(message='No, please do not proceed with that item.',
                                             declines_proposal=True, declined_line_id=matches[0])
                 return CustomerDecision(message='Yes, please go ahead with that item.')
-            if '?' in message or any(word in words for word in ('confirm', 'proceed', 'agree')):
+            message = prompt.last_service_message.casefold()
+            if '?' in message or any(word in message for word in ('confirm', 'proceed', 'agree')):
                 return CustomerDecision(message='Which item are you asking about?')
         if self.turns == 1:
             # A neutral confirmation works for all supported remedy types.

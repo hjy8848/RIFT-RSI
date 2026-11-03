@@ -58,17 +58,17 @@ class GeneratedTask:
     distribution: object
 
 
-def generate_instance(family_id, seed, *, split='train', near_distractors=0, grid_mode=None):
-    """Generate and certify one reproducible F-family task without model calls."""
-    from usami_v2.scenarios.builder import build_world
-    from usami_v2.scenarios.designer import (RequestDraft, ScenarioDraft, TaskDraft,
-                                             compile_task, task_design_capabilities)
+def draft_instance(family_id, seed, *, near_distractors=0, grid_mode=None):
+    """World draft data and Customer requests of one F-family instance, uncompiled."""
+    from usami_v2.scenarios.designer import RequestDraft
     if (family_id not in FAMILIES or type(seed) is not int or seed < 0
             or type(near_distractors) is not int or not 0 <= near_distractors <= 3
             or grid_mode not in (None, 'one', 'none', 'multiple')
             or (grid_mode is not None and family_id not in ('F6', 'F7'))):
         raise ValueError('known family and nonnegative integer seed required')
-    rng = random.Random(seed)
+    # The family name is part of the seed: families sharing a skeleton must not
+    # draw identical numbers for the same seed.
+    rng = random.Random(f'{family_id}:{seed}')
     base = FAMILIES[family_id].instance({}, seed)
     data = _unseal(base.draft.model_dump(mode='json'))
     data['scenario_id'] = f'generated-{family_id}-{seed}'
@@ -93,7 +93,6 @@ def generate_instance(family_id, seed, *, split='train', near_distractors=0, gri
             sku['return_days'] = return_days
     requests = []
     challenge = base.challenges[0]
-    shared_credit = _sample(rng, 'approval_cents', limit) if family_id == 'F11' else None
     for order in data['orders']:
         order['delivered_days_ago'] = _fixed(
             _sample(rng, 'return_days', return_days) if family_id == 'F4' else rng.randint(0, return_days))
@@ -107,9 +106,9 @@ def generate_instance(family_id, seed, *, split='train', near_distractors=0, gri
             requested = rng.randint(1, quantity)
             if family_id == 'F5':
                 requested = quantity
-            # Refund amount is unit credit times requested quantity.
-            credit = (shared_credit if shared_credit is not None else
-                      _sample(rng, 'approval_cents', limit) if family_id in ('F1', 'F2', 'F3', 'F9', 'F10')
+            # Refund amount is unit credit times requested quantity. F11 lines are
+            # sampled independently so one may be refundable while another is not.
+            credit = (_sample(rng, 'approval_cents', limit) if family_id in ('F1', 'F2', 'F3', 'F9', 'F10', 'F11')
                       else rng.randint(1000, max(1000, limit // 2)))
             credit = max(requested, credit)
             unit, remainder = divmod(credit, requested)
@@ -285,15 +284,53 @@ def generate_instance(family_id, seed, *, split='train', near_distractors=0, gri
                 other_order['delivered_days_ago'] = _fixed(0 if target_order['delivered_days_ago']['low'] else 1)
                 data.setdefault('history', []).append({'operation': 'return_delivered_order_items',
                                                        'line_alias': other_line['alias'], 'quantity': 1})
+    task = {'task_id': f'generated-{family_id}-{seed}', 'customer_alias': 'customer',
+            'requests': [_unseal(row.model_dump(mode='json')) for row in requests], 'style_seed': seed}
+    return data, task
+
+
+def generate_instance(family_id, seed, *, split='train', near_distractors=0, grid_mode=None):
+    """Generate and certify one reproducible F-family task without model calls."""
+    from usami_v2.scenarios.builder import build_world
+    from usami_v2.scenarios.designer import ScenarioDraft, TaskDraft, compile_task, task_design_capabilities
+    data, task_data = draft_instance(family_id, seed, near_distractors=near_distractors, grid_mode=grid_mode)
     distribution = synthetic_distribution(split)
     spec = ScenarioDraft.model_validate(data).compile(distribution)
     build = build_world(spec, seed)
     if build.status != 'SAT':
         raise ValueError('generated world was not constructed: ' + build.reason)
     capabilities = task_design_capabilities(spec, build, return_receipt_event_configured=family_id == 'F9')
-    task = compile_task(TaskDraft(task_id=f'generated-{family_id}-{seed}', customer_alias='customer',
-        requests=tuple(requests), style_seed=seed), spec, build, distribution, capabilities=capabilities)
+    task = compile_task(TaskDraft.model_validate(task_data), spec, build, distribution,
+                        capabilities=capabilities)
     return GeneratedTask(family_id, seed, spec, build, task, distribution)
+
+
+def task_outcome(task):
+    """'success' when every goal should be carried out, else 'refusal'."""
+    return 'refusal' if getattr(task, 'refusal_goals', ()) else 'success'
+
+
+def balanced_seeds(family_id, count, seed, *, max_scan=None, **options):
+    """``count`` seeds from ``seed`` upward whose derived answers are half 'success', half 'refusal'.
+
+    The answer is derived by Usami for each candidate; seeds are scanned in order and kept
+    while their answer's quota is open, so the result is deterministic.
+    """
+    if type(count) is not int or count < 1:
+        raise ValueError('a positive instance count is required')
+    quota = {'success': (count + 1) // 2, 'refusal': count // 2}
+    kept, candidate = [], seed
+    limit = seed + (max_scan or 50 * count)
+    while len(kept) < count:
+        if candidate >= limit:
+            raise ValueError(f'{family_id}: could not balance {count} instances within {limit - seed} seeds '
+                             f'(still open: {quota})')
+        outcome = task_outcome(generate_instance(family_id, candidate, **options).task)
+        if quota[outcome]:
+            quota[outcome] -= 1
+            kept.append(candidate)
+        candidate += 1
+    return tuple(kept)
 
 
 def generate_composite(seed, *, count=None, coupling='none', with_history=False, split='train'):

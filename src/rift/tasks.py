@@ -35,7 +35,7 @@ class Proposal:
         # Store JSON-compatible forms of the pinned Usami contracts. This keeps
         # capture files inert and portable while still validating the exact
         # native schemas at the Designer boundary.
-        from usami_v2.scenarios.designer import ScenarioDraft
+        from usami_v2.scenarios.designer import ScenarioDraft, TaskDraft
         from usami_v2.scenarios.grounding import AbstractChallenge
 
         def payload(value):
@@ -48,8 +48,10 @@ class Proposal:
             return value
 
         world = ScenarioDraft.model_validate(payload(self.world_draft)).checked()
-        challenges = tuple(AbstractChallenge.model_validate(payload(row)).checked()
-                           for row in self.challenges)
+        # A challenge with line selectors is grounded against the World; one
+        # without names the World's own line aliases directly (a TaskDraft).
+        challenges = tuple((AbstractChallenge if 'line_selectors' in payload(row) else TaskDraft)
+                           .model_validate(payload(row)).checked() for row in self.challenges)
         task_ids = [row.task_id for row in challenges]
         if len(set(task_ids)) != len(task_ids):
             raise ValueError("training-plan challenges need distinct native task IDs")

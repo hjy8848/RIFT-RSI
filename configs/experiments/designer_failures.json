@@ -1,0 +1,14 @@
+[
+  {"generator": "F1", "instances": 4, "seed": 8500000, "balanced": true},
+  {"generator": "F2", "instances": 4, "seed": 8501000, "balanced": true},
+  {"generator": "F3", "instances": 4, "seed": 8502000, "balanced": true},
+  {"generator": "F4", "instances": 4, "seed": 8503000, "balanced": true},
+  {"generator": "F5", "instances": 4, "seed": 8504000, "balanced": true},
+  {"generator": "F6", "instances": 4, "seed": 8505000, "balanced": true},
+  {"generator": "F7", "instances": 4, "seed": 8506000, "balanced": true},
+  {"generator": "F8", "instances": 4, "seed": 8507000, "balanced": true},
+  {"generator": "F9", "instances": 4, "seed": 8508000, "balanced": true},
+  {"generator": "F10", "instances": 4, "seed": 8509000, "balanced": true},
+  {"generator": "F11", "instances": 4, "seed": 8510000, "balanced": true},
+  {"generator": "F1", "instances": 4, "seed": 8511000, "balanced": true, "near_distractors": 2}
+]

@@ -110,7 +110,7 @@ class TrainRehearsal(unittest.TestCase):
             {'policy': 'service', 'revision': '0', 'tokenizer': 'tok',
              'weights_digest': checkpoint.weights_digest}), encoding='utf-8')
 
-    def _collector(self, context):
+    def _collector(self, context, skilled=True):
         class Collector:
             def __init__(self, checkpoint, index):
                 self.checkpoint, self.index = checkpoint, index
@@ -121,7 +121,7 @@ class TrainRehearsal(unittest.TestCase):
                 rows = []
                 for group in package.task_groups:
                     record = registry.resolve_record(group.task_ref)
-                    skill = int(hashlib.sha256(group.task_ref.encode()).hexdigest(), 16) % 5
+                    skill = int(hashlib.sha256(group.task_ref.encode()).hexdigest(), 16) % 5 if skilled else 0
                     for member in range(group.group_size):
                         episode = run_episode(record.world, record.task, record.profile, YesCustomer(1),
                             ScriptedService(_script(member < skill, member)),
@@ -203,6 +203,31 @@ class TrainRehearsal(unittest.TestCase):
             self.assertEqual(rows[0]['rollouts'], 16)               # 4 tasks x 4 samples
             with self.assertRaises(FileExistsError):                # a finished run is not overwritten
                 run.train_pool(context, train_specs=[], rounds=1, tasks_per_round=2, seed=1)
+
+    def test_stage1_trains_on_designer_plans_with_a_balanced_mix(self):
+        from rift.designer.stage0 import dry_run_generate, run as stage0
+        with tempfile.TemporaryDirectory() as plans_root, tempfile.TemporaryDirectory() as root:
+            stage0(run.WorldKit(plans_root), lambda prompts: dry_run_generate(prompts, seed=21), [],
+                   samples=6, seed=21, out_dir=plans_root, signatures=False)
+            self._initial(root)
+            FakeRuntime.opened = []
+            context = run.ExperimentContext(root=root, service_model='m', verl_config_dir='.',
+                episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6),
+                runtime_factory=lambda checkpoint: FakeRuntime(context, checkpoint), persist_every=0,
+                patience_slack=2)
+            context._worker_manifest = lambda checkpoint: None
+            collector = self._collector(context, skilled=False)
+            result = run.train_pool(context,
+                train_specs=[{'generator': 'F5', 'instances': 4, 'seed': 0, 'balanced': True}],
+                rounds=2, tasks_per_round=4, seed=3, designer_plans=Path(plans_root) / 'designer-plans.jsonl',
+                mix_fraction=0.25, heldout_specs=[{'generator': 'F4', 'instances': 2, 'seed': 50, 'balanced': True}],
+                collector_factory=lambda loaded, index: collector(loaded, index))
+            rows = [json.loads(line) for line in (Path(root) / 'rounds.jsonl').read_text(
+                encoding='utf-8').splitlines()]
+            self.assertEqual(result['rounds'], 2)
+            self.assertEqual(sorted(rows[0]['train_success']), ['designer', 'gen:F5:{"balanced":true}'])
+            self.assertEqual(rows[0]['rollouts'], 16)
+            self.assertIn('gen:F4:{"balanced":true}', result['heldout']['families'])
 
     def _policy_run(self, root, policy_name, seed):
         from rift.evolution.curriculum import Selection

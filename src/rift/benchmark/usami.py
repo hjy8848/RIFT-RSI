@@ -183,6 +183,12 @@ class CommerceHost:
         if self.task_registry.split_registry is not registry:
             raise ValueError('certified task registry must use the Host split registry')
     def _compile(self, candidate, spec, build, allowed_training_hashes=None):
+        from usami_v2.scenarios.designer import TaskDraft, compile_task, task_design_capabilities
+        if isinstance(candidate, TaskDraft):
+            # A direct draft already names this World's aliases; nothing to ground.
+            capabilities = task_design_capabilities(spec, build, **(self.capability_options or {}))
+            return compile_task(candidate, spec, build, self.distribution, allowed_training_hashes or (),
+                                capabilities=capabilities)
         args = (candidate, spec, build, self.distribution)
         if allowed_training_hashes is not None:
             args += (allowed_training_hashes,)
@@ -253,7 +259,7 @@ class CommerceHost:
             raise ValueError('bounded World construction seed and challenge budget required')
 
         from usami_v2.scenarios.builder import build_world, verify_build
-        from usami_v2.scenarios.designer import ScenarioDraft, TaskCapabilityUnsupported
+        from usami_v2.scenarios.designer import ScenarioDraft, TaskCapabilityUnsupported, TaskDraft
         from usami_v2.scenarios.grounding import AbstractChallenge, ground_challenge
 
         draft = ScenarioDraft.model_validate(proposal.world_draft).checked()
@@ -273,17 +279,30 @@ class CommerceHost:
         challenge_results, certifications, tasks = [], [], []
         for raw_challenge in proposal.challenges:
             certification_started = time.perf_counter()
-            challenge = AbstractChallenge.model_validate(raw_challenge).checked()
-            grounding = ground_challenge(challenge, worlds, self.grounding_budget)
+            if 'line_selectors' in raw_challenge:
+                challenge = AbstractChallenge.model_validate(raw_challenge).checked()
+                grounding = ground_challenge(challenge, worlds, self.grounding_budget)
+                candidates, grounding_status = grounding.candidates, grounding.status
+                search_truncated = grounding.search_truncated
+            else:
+                challenge = TaskDraft.model_validate(raw_challenge).checked()
+                candidates, grounding_status, search_truncated = (challenge,), 'DIRECT', False
             attempts, selected_task = [], None
-            if grounding.candidates:
-                for index, candidate in enumerate(grounding.candidates):
+            if candidates:
+                for index, candidate in enumerate(candidates):
                     try:
                         task = self._compile(candidate, spec, build, allowed_training_hashes)
                     except TaskCapabilityUnsupported as exc:
                         attempts.append({'candidate_index':index, 'task_ref':None,
                             'status':'UNKNOWN', 'native_status':'UNSUPPORTED',
                             'reason':str(exc), 'reason_code':exc.code})
+                        continue
+                    except ValueError as exc:
+                        # A Designer draft can be structurally valid yet name a line it
+                        # does not own or ask for more units than were bought.
+                        attempts.append({'candidate_index':index, 'task_ref':None,
+                            'status':'REJECTED', 'native_status':'INVALID',
+                            'reason':str(exc), 'reason_code':'INVALID_TASK'})
                         continue
                     scenario = self.scenario_factory(task, spec, build)
                     native_certificate = certify_native(
@@ -340,9 +359,9 @@ class CommerceHost:
             if selected_task is not None:
                 status = 'CERTIFIED'
                 reasons = []
-            elif not grounding.candidates:
-                status = grounding.status
-                reasons = [grounding.status]
+            elif not candidates:
+                status = grounding_status
+                reasons = [grounding_status]
             else:
                 native_statuses = {row['native_status'] for row in attempts}
                 status = ('UNKNOWN' if 'UNKNOWN' in native_statuses or 'UNSUPPORTED' in native_statuses
@@ -351,9 +370,9 @@ class CommerceHost:
                            for row in attempts]
             challenge_results.append({
                 'challenge_id':challenge.task_id,
-                'grounding_status':grounding.status,
-                'search_truncated':grounding.search_truncated,
-                'candidate_count':len(grounding.candidates),
+                'grounding_status':grounding_status,
+                'search_truncated':search_truncated,
+                'candidate_count':len(candidates),
                 'attempts':attempts,
                 'status':status,
                 'reasons':reasons,
