@@ -50,6 +50,21 @@ def test_renderer_varies_sentence_style_across_seeds():
     assert len(counts) >= 12
 
 
+def test_exchange_and_reship_wording_never_overlaps():
+    from usami_v2.scenarios.tasks import CustomerRequestIntent, render_customer_request_v2
+    world, task = compile_refund(20000)
+    line_id = task.request_bundle.requests[0].line_id
+
+    def texts(action):
+        intent = CustomerRequestIntent(goal_id='g', line_id=line_id, action=action, quantity=1)
+        return {render_customer_request_v2(world, task.customer_id, (intent,), seed).split('\n')[1]
+                for seed in range(200)}
+    exchange, reship = texts('exchange'), texts('reship')
+    assert all('different variant' in text and 'same product' not in text for text in exchange)
+    assert all('same product' in text and 'different variant' not in text for text in reship)
+    assert not any('replace' in text.casefold() for text in exchange | reship)
+
+
 def test_new_requests_are_exclusive_with_legacy_goals():
     from usami_v2.scenarios.designer import RemedyDraft
     with pytest.raises(ValueError, match='cannot be combined'):

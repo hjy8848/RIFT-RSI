@@ -585,10 +585,14 @@ def render_customer_request_v2(world, customer_id, requests, style_seed=0, seque
     rng = random.Random(style_seed)
     openings = ("Please help me with these requests:", "I need help with my order:",
                 "Could you help me with the following?")
+    # Exchange (a different SKU) and reship (the same SKU) must never share
+    # wording such as "replace"/"replacement": a request that fits both is not
+    # identifiable from public text. Each also states its target explicitly.
     verbs = {"refund": ("refund", "return for a refund", "get my money back for"),
-             "exchange": ("exchange", "swap", "replace"),
-             "reship": ("reship", "send another of", "send a replacement for"),
+             "exchange": ("exchange", "swap", "switch"),
+             "reship": ("reship", "resend", "send again"),
              "cancel": ("cancel my order containing", "cancel the order containing", "stop the order containing")}
+    targets = {"exchange": " for a different variant", "reship": " with the same product"}
     opening = ('Please process these requests in the order listed:' if sequential else rng.choice(openings))
     numbered = bool(rng.randrange(2))
     clauses = []
@@ -605,6 +609,7 @@ def render_customer_request_v2(world, customer_id, requests, style_seed=0, seque
             text = f"{prefix}Please {verb} {request.quantity} {unit} of the {subject}"
         else:
             text = f"{prefix}Please {verb} {request.quantity} {unit} of the {subject} in my order"
+        text += targets.get(request.action, "")
         details = []
         if request.required_attributes:
             details.append("with " + ", ".join(f"{_display_name(row.value)} {_display_name(row.name)}"
