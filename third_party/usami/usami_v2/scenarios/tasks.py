@@ -724,7 +724,10 @@ def evaluate_state_goals(initial, final, task: TaskSpec, *, tool_executions=(), 
     task = _validate_run_states(initial, final, task)
     rows = []
     for goal in task.remedy_goals:
-        settlements = [row for key, row in final.settlements.items()
+        # Stored records re-sort their dictionaries, so the evidence order must not depend on
+        # insertion order: two settlements on one line made replay disagree with the live run.
+        settlements = [row for key, row in sorted(final.settlements.items(),
+                                                  key=lambda item: (tuple(item[1].unit_indices), item[0]))
                        if row.line_id == goal.line_id and key not in initial.settlements]
         quantity = sum(len(row.unit_indices) for row in settlements)
         ok = quantity == goal.quantity and all(row.remedy in goal.allowed_remedies for row in settlements)
@@ -789,7 +792,8 @@ def evaluate_state_goals(initial, final, task: TaskSpec, *, tool_executions=(), 
         ok, refs = True, []
         for line_id in goal.line_ids:
             line = initial.lines[line_id]
-            settlements = [row for key, row in final.settlements.items()
+            settlements = [row for key, row in sorted(final.settlements.items(),
+                                                      key=lambda item: (tuple(item[1].unit_indices), item[0]))
                            if row.line_id == line_id and key not in initial.settlements]
             units = sorted(unit for row in settlements for unit in row.unit_indices)
             if units != list(range(line.quantity)) or any(row.remedy != "cancel" for row in settlements):
