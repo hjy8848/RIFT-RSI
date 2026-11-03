@@ -499,6 +499,35 @@ class PoolBatch:
         return tuple(group.task_ref for group in self.task_groups)
 
 
+def fit_request_to_batches(request, mini_batch_size, world_size=WORLD_SIZE):
+    """Drop whole GRPO groups until the rollout count divides into complete mini-batches.
+
+    A group whose rollouts are all right or all wrong has zero advantage, so those go first;
+    informative groups are only dropped when nothing else is left to drop.
+    """
+    from dataclasses import replace
+    unit = mini_batch_size * world_size // math.gcd(mini_batch_size, world_size)
+    groups = {}
+    for row in request.rollouts:
+        groups.setdefault(row.group_id, []).append(row)
+    sizes = {len(rows) for rows in groups.values()}
+    if len(sizes) != 1:
+        raise ValueError('groups of different sizes cannot be balanced into mini-batches')
+    per_group = sizes.pop()
+    keep = (len(groups) * per_group // unit) * unit // per_group      # groups that fit whole batches
+    if keep == len(groups):
+        return request
+    if keep < 1:
+        raise ValueError('fewer than one mini-batch of complete groups is left (%d rollouts)'
+                         % len(request.rollouts))
+    order = {group_id: index for index, group_id in enumerate(groups)}
+    informative = lambda rows: len({row.reward for row in rows}) > 1
+    ranked = sorted(groups, key=lambda group_id: (not informative(groups[group_id]), order[group_id]))
+    kept = set(ranked[:keep])
+    rows = tuple(row for row in request.rollouts if row.group_id in kept)
+    return replace(request, rollouts=rows)
+
+
 def _pool_collector(context, checkpoint, index):
     from rift.runtime.evaluator import ProductionServiceRolloutCollector
     from rift.training.service_data import prepare_service_trajectory_update
@@ -556,12 +585,15 @@ def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from
             for row in request.rollouts:
                 rewards.setdefault(source[row.group_id], []).append(row.reward)
             sampled = time.perf_counter()
+            collected = len(request.rollouts)
+            request = fit_request_to_batches(request, context.update_budget.mini_batch_size)
             update = RoundBackend(context, index, checkpoint).train(request)
             checkpoint = update.policy_after
             row = {'round': index, 'revision': checkpoint.revision,
                    'train_success': {key: sum(values) / len(values) for key, values in sorted(rewards.items())},
                    'train_success_all': sum(sum(v) for v in rewards.values()) / sum(len(v) for v in rewards.values()),
-                   'rollouts': len(request.rollouts), 'sample_seconds': round(sampled - started, 1),
+                   'rollouts': collected, 'trained_rollouts': len(request.rollouts),
+                   'sample_seconds': round(sampled - started, 1),
                    'update_seconds': round(time.perf_counter() - sampled, 1)}
             history.append(row)
             with rounds_path.open('a', encoding='utf-8') as stream:
