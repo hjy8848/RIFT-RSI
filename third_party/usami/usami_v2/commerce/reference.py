@@ -30,6 +30,19 @@ def _expected_query(world, actor, op):
             row = line.model_dump(mode="json")
             sku = world.skus.get(line.sku_id)
             row["sku"] = public_sku(sku) if sku is not None else None
+            units = set()
+            for settlement in world.settlements.values():
+                if settlement.line_id == line.id:
+                    units.update(settlement.unit_indices)
+            if world.observation_protocol == 'commerce-observation-v2' and units:
+                row['settled_quantity'] = len(units)
+            statuses = set()
+            for ret in world.returns.values():
+                case = world.cases.get(ret.case_id)
+                if case is not None and case.line_id == line.id:
+                    statuses.add(ret.status)
+            if world.observation_protocol == 'commerce-observation-v2' and statuses:
+                row['return_status'] = sorted(statuses)
             rows.append(row)
         return {"order": world.orders[key].model_dump(mode="json"), "lines": rows}
     if op.name == "search_catalog":

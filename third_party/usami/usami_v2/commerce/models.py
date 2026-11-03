@@ -76,15 +76,18 @@ class Order(Model):
     # Phase 3: only an unshipped order can still be cancelled. The default keeps
     # every pre-Phase-3 order (and its hash) a delivered order.
     fulfillment_status: Literal["unshipped", "shipped", "delivered"] = "delivered"
+    ordered_at: Optional[datetime] = None
 
     @model_validator(mode="after")
     def timezone(self):
         aware(self.delivered_at)
+        if self.ordered_at is not None:
+            aware(self.ordered_at)
         return self
 
     @model_serializer(mode="wrap")
     def _compatible_dump(self, handler):
-        return omit_default_fields(handler(self), self, ("fulfillment_status",))
+        return omit_default_fields(handler(self), self, ("fulfillment_status", "ordered_at"))
 
 
 class OrderLine(Model):
@@ -272,6 +275,11 @@ class World(WorldBase):
     fulfillments: Dict[str, Fulfillment] = Field(default_factory=dict)
     external_events: Dict[str, ExternalEvent] = Field(default_factory=dict)
     applied_events: Tuple[str, ...] = ()
+    observation_protocol: Literal['commerce-observation-v1', 'commerce-observation-v2'] = 'commerce-observation-v1'
+
+    @model_serializer(mode='wrap')
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ('observation_protocol',))
 
 
 class OpenCaseInput(Model):

@@ -31,7 +31,7 @@ from usami_v2.runtime.customer import (
     CustomerRuntime, OfferPresentation, render_offer,
 )
 from usami_v2.scenarios.tasks import (
-    TaskSpec, TaskSpecV2, TaskSpecV3, check_task_scope, delegated_line_ids, evaluate_state_goals,
+    TaskSpec, TaskSpecV2, TaskSpecV3, TaskSpecV4, check_task_scope, delegated_line_ids, evaluate_state_goals,
     evaluate_task_compliance, evaluate_task_communication,
 )
 
@@ -65,7 +65,7 @@ class ToolExecution(Sealed):
 
 class EpisodeRecord(Sealed):
     protocol: Literal["commerce-episode-v1"] = "commerce-episode-v1"
-    task: Union[TaskSpecV3, TaskSpecV2, TaskSpec]
+    task: Union[TaskSpecV4, TaskSpecV3, TaskSpecV2, TaskSpec]
     profile: Union[HumanCustomerProfileV2, CustomerProfileV3, CustomerProfileV2, CustomerProfile]
     budget: EpisodeBudget
     mode: Literal["reference", "sandbox"]
@@ -457,7 +457,7 @@ def run_episode(initial_world: World, task: Union[TaskSpecV3, TaskSpecV2, TaskSp
             if (goal.line_id not in profile.delegated_line_ids
                     or profile_span not in (goal.public_request_span, goal.subject_mention)):
                 raise ValueError("Customer delegation must match the goal's public request span or subject wording")
-    elif task.protocol == "commerce-task-v3":
+    elif task.protocol in ("commerce-task-v3", "commerce-task-v4"):
         if profile.protocol != "commerce-customer-profile-v3":
             raise ValueError("TaskSpecV3 requires a structured CustomerProfileV3 binding")
         expected_delegations = delegated_line_ids(task)

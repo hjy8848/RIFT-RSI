@@ -18,6 +18,14 @@ def _public_line_rows(world, order_key):
         row = line.model_dump(mode="json")
         sku = world.skus.get(line.sku_id)
         row["sku"] = public_sku(sku) if sku is not None else None
+        settled = {unit for settlement in world.settlements.values() if settlement.line_id == line.id
+                   for unit in settlement.unit_indices}
+        if world.observation_protocol == 'commerce-observation-v2' and settled:
+            row['settled_quantity'] = len(settled)
+        case_ids = {case.id for case in world.cases.values() if case.line_id == line.id}
+        returns = sorted({ret.status for ret in world.returns.values() if ret.case_id in case_ids})
+        if world.observation_protocol == 'commerce-observation-v2' and returns:
+            row['return_status'] = returns
         rows.append(row)
     return rows
 

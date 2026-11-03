@@ -61,8 +61,19 @@ def compile_candidate(candidate, spec, build, distribution, allowed_training_has
 
 def _customer_limits(task, build):
     """Build Customer bounds from structured remedy goals, if any."""
-    if task.protocol != 'commerce-task-v3':
+    if task.protocol not in ('commerce-task-v3', 'commerce-task-v4'):
         raise ValueError('default Customer requires a structured commerce-task-v3 task')
+    bundle = task.request_bundle
+    if bundle.renderer_version == 'commerce-request-renderer-v2':
+        from datetime import timedelta
+        requests = [row for row in bundle.requests if row.action != 'cancel']
+        allowed = tuple(sorted({row.action for row in requests}))
+        limits = [row.maximum_extra_charge_cents for row in requests]
+        maximum = (max(limits) if limits and all(value is not None for value in limits) else 10**18)
+        deadlines = [row.latest_arrival_within_days for row in requests]
+        days = max(deadlines) if deadlines and all(value is not None for value in deadlines) else None
+        latest = build.world.clock + timedelta(days=days) if days is not None else None
+        return allowed, maximum, latest, days
     refusals = getattr(task, 'refusal_goals', ())
     if not task.remedy_goals and refusals:
         allowed = {goal.requested_action for goal in refusals if goal.requested_action != 'cancel'}
@@ -90,12 +101,16 @@ def default_customer_scenario(task, spec, build, *, return_received_after_days=N
     allowed, maximum, latest, _ = _customer_limits(task, build)
     returns = any(build.world.skus[build.world.lines[g.line_id].sku_id].return_required
                   for g in task.remedy_goals)
+    declined = tuple(sorted({line for goal in getattr(task, 'refusal_goals', ())
+                             if goal.reason_code == 'CUSTOMER_DECLINED' for line in goal.line_ids}))
+    mixed_decline = bool(declined and (task.remedy_goals or task.cancellation_goals)
+                         and task.request_bundle.renderer_version == 'commerce-request-renderer-v2')
     return CustomerScenario(customer_id=task.customer_id,
         delegated_line_ids=delegated_line_ids(task),
         accepted_remedies=allowed, maximum_extra_charge_cents=maximum, latest_arrival=latest,
         return_received_after_days=return_received_after_days if returns else None,
-        accepts_proposals=not any(goal.reason_code == 'CUSTOMER_DECLINED'
-                                  for goal in getattr(task, 'refusal_goals', ())))
+        accepts_proposals=not declined or mixed_decline,
+        decline_line_ids=declined if mixed_decline else ())
 
 def default_customer_profile(task, spec, build, *, delegation_lifetime_hours=24):
     from usami_v2.runtime.customer import CustomerProfile, bind_customer_profile
@@ -103,9 +118,21 @@ def default_customer_profile(task, spec, build, *, delegation_lifetime_hours=24)
     profile = CustomerProfile(customer_id=task.customer_id,
         accepted_remedies=allowed, maximum_extra_charge_cents=maximum, latest_arrival_days=days,
         delegation_lifetime_hours=delegation_lifetime_hours)
-    return bind_customer_profile(profile, task,
-        accepts_proposals=not any(goal.reason_code == 'CUSTOMER_DECLINED'
-                                  for goal in getattr(task, 'refusal_goals', ())))
+    declined = tuple(sorted({line for goal in getattr(task, 'refusal_goals', ())
+                             if goal.reason_code == 'CUSTOMER_DECLINED' for line in goal.line_ids}))
+    mixed_decline = bool(declined and (task.remedy_goals or task.cancellation_goals)
+                         and task.request_bundle.renderer_version == 'commerce-request-renderer-v2')
+    references, all_references = {}, {}
+    if mixed_decline:
+        from usami_v2.scenarios.tasks import _referenced_line_description
+        intents = {row.line_id: row for row in task.request_bundle.requests}
+        references = {line: _referenced_line_description(build.world, line, intents[line].reference)
+                      for line in declined}
+        all_references = {line: _referenced_line_description(build.world, line, intent.reference)
+                          for line, intent in intents.items()}
+    return bind_customer_profile(profile, task, accepts_proposals=not declined or mixed_decline,
+        decline_line_ids=declined if mixed_decline else (), decline_references=references,
+        request_references=all_references)
 
 def _receipt_events(world, task, scenario):
     """Frozen receipt events the certified witness relied on; the rollout must schedule them."""

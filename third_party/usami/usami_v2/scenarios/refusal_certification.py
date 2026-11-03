@@ -42,7 +42,7 @@ class RefusalCertificate(Sealed):
                 and not self.blockers and execution_complete)
 
 
-def _operations(world, goal):
+def _operations(world, goal, *, quantity=1, required_attributes=()):
     operations = []
     seen_orders = set()
     for line_id in goal.line_ids:
@@ -56,17 +56,18 @@ def _operations(world, goal):
         elif goal.requested_action == 'refund':
             physical = world.skus[line.sku_id].return_required
             name = 'request_item_return' if physical else 'return_delivered_order_items'
-            operations.append(Operation(name=name, scope_id=scope, resource_id=line_id, params={'quantity': 1}))
+            operations.append(Operation(name=name, scope_id=scope, resource_id=line_id, params={'quantity': quantity}))
         elif goal.requested_action == 'reship':
             operations.append(Operation(name='reship_order_items', scope_id=scope,
-                                        resource_id=line_id, params={'quantity': 1}))
+                                        resource_id=line_id, params={'quantity': quantity}))
         else:
             source = world.skus[line.sku_id]
             for sku in sorted(world.skus.values(), key=lambda row: row.id):
                 if (sku.id != source.id and sku.merchant_id == scope
-                        and sku.product_family == source.product_family):
+                        and sku.product_family == source.product_family
+                        and all(sku.attributes.get(row.name) == row.value for row in required_attributes)):
                     operations.append(Operation(name='exchange_delivered_order_items', scope_id=scope,
-                        resource_id=line_id, params={'quantity': 1, 'target_sku_id': sku.id}))
+                        resource_id=line_id, params={'quantity': quantity, 'target_sku_id': sku.id}))
     return tuple(operations)
 
 
@@ -87,27 +88,92 @@ def certify_refusal(world, task, customer_scenario, budget=None):
             blockers.append('execution_goals_not_certified')
     if task.information_goals:
         blockers.append('interaction_goals_not_certified')
+    bundle = getattr(task, 'request_bundle', None)
     state, _ = _customer_delegation(world, task, scenario)
+    goal_states = {}
+    if getattr(bundle, 'sequential', False) and execution_certificate is not None:
+        from usami_v2.commerce.models import World
+        witness = next((row for row in execution_certificate.attempts if row.status == 'WITNESS'), None)
+        operations = [step for step in witness.steps if step.kind == 'operation'] if witness else []
+        segments = []
+        for step in operations:
+            name = step.evidence['request']['operation']['name']
+            if name == 'list_customer_orders':
+                segments.append([])
+            if segments:
+                segments[-1].append(step)
+        if not witness or len(segments) != len(witness.candidates):
+            blockers.append('ordered_execution_witness_unavailable')
+        else:
+            successful_states = {candidate.goal_id: World.model_validate(segment[-1].evidence['trace']['final_state'])
+                                 for candidate, segment in zip(witness.candidates, segments)}
+            refusal_ids = {goal.goal_id for goal in goals}
+            current = state
+            for intent in bundle.requests:
+                if intent.goal_id in refusal_ids:
+                    goal_states[intent.goal_id] = current
+                else:
+                    current = successful_states[intent.goal_id]
     candidates, constructive = [], 0
     for goal in goals:
+        goal_state = goal_states.get(goal.goal_id, state)
         if goal.reason_code == 'CUSTOMER_DECLINED':
-            if scenario.accepts_proposals:
+            if scenario.accepts_proposals and not set(goal.line_ids).issubset(scenario.decline_line_ids):
                 blockers.append('customer_scenario_does_not_decline:' + goal.goal_id)
             else:
-                # The bound Customer runtime enforces this policy. The actual
-                # Episode must additionally contain a structured decline turn.
-                attempts.append({'goal_id': goal.goal_id, 'kind': 'customer_declines',
-                                 'scenario_hash': scenario.record_hash, 'verified': True})
-                constructive += 1
+                bundle = getattr(task, 'request_bundle', None)
+                intent = next((row for row in getattr(bundle, 'requests', ()) if row.goal_id == goal.goal_id), None)
+                verified = True
+                if intent is not None:
+                    # V2 binds customer limits as public intent. Re-run the native
+                    # positive search, independently of the outcome derivation.
+                    from datetime import timedelta
+                    from .outcomes import _temporary_task
+                    from .tasks import RemedyGoal
+                    proof_world = goal_state.clone()
+                    proof_world.delegations.clear()
+                    proof_world.consents.clear()
+                    positive = RemedyGoal(goal_id=intent.goal_id, line_id=intent.line_id,
+                        quantity=intent.quantity, allowed_remedies=(intent.action,),
+                        required_attributes=intent.required_attributes,
+                        maximum_extra_charge_cents=intent.maximum_extra_charge_cents,
+                        latest_arrival=(proof_world.clock + timedelta(days=intent.latest_arrival_within_days)
+                            if intent.latest_arrival_within_days is not None else None))
+                    proof_task = _temporary_task(proof_world, task.customer_id, positive)
+                    scenario_data = scenario.model_dump(mode='json', exclude={'record_hash'})
+                    scenario_data.update(delegated_line_ids=(intent.line_id,),
+                        accepted_remedies=(intent.action,),
+                        maximum_extra_charge_cents=(intent.maximum_extra_charge_cents
+                            if intent.maximum_extra_charge_cents is not None else 10**18),
+                        latest_arrival=positive.latest_arrival, accepts_proposals=True, decline_line_ids=())
+                    proof_scenario = type(scenario).model_validate(scenario_data)
+                    proof = certify_task(proof_world, proof_task, proof_scenario, budget)
+                    reasons = {row.reason for row in proof.attempts}
+                    decline_reasons = {'customer_extra_charge_limit', 'customer_delivery_deadline'}
+                    verified = (proof.search_complete and not proof.blockers and not proof.witness_hashes
+                                and bool(reasons & decline_reasons))
+                    attempts.append({'goal_id': goal.goal_id, 'kind': 'customer_declines',
+                                     'proof_hash': proof.record_hash, 'verified': verified})
+                else:
+                    # Preserve the legacy v1 certificate transcript exactly.
+                    attempts.append({'goal_id': goal.goal_id, 'kind': 'customer_declines',
+                                     'scenario_hash': scenario.record_hash, 'verified': True})
+                if verified:
+                    constructive += 1
+                else:
+                    blockers.append('customer_decline_not_proven:' + goal.goal_id)
             continue
-        operations = _operations(state, goal)
+        bundle = getattr(task, 'request_bundle', None)
+        intent = next((row for row in getattr(bundle, 'requests', ()) if row.goal_id == goal.goal_id), None)
+        operations = _operations(goal_state, goal, quantity=intent.quantity if intent else 1,
+                                 required_attributes=intent.required_attributes if intent else ())
         if not operations:
             blockers.append('no_requested_action_candidates:' + goal.goal_id)
-        candidates.extend((goal, operation) for operation in operations)
+        candidates.extend((goal, operation, goal_state) for operation in operations)
     exhausted = len(candidates) <= budget.max_plan_candidates and len(candidates) <= budget.max_operation_steps
     if not exhausted:
         blockers.append('candidate_budget_exhausted')
-    for index, (goal, operation) in enumerate(candidates[:min(budget.max_plan_candidates, budget.max_operation_steps)]):
+    for index, (goal, operation, state) in enumerate(candidates[:min(budget.max_plan_candidates, budget.max_operation_steps)]):
         request = Request(id='refusal-' + digest([task.record_hash, goal.goal_id, index])[:24],
                           identity=task.customer_id, operation=operation.model_dump(mode='json'), granted=True)
         reference = adapter.decide(state, task.customer_id, operation)

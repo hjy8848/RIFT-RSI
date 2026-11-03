@@ -65,3 +65,18 @@ def fingerprint_distance(left, right):
         return inf
     return max((abs(a - b) for x, y in zip(left.numeric, right.numeric)
                 for a, b in zip(x, y)), default=0)
+
+
+def decision_fingerprint(spec, build, task, *, return_receipt_event_configured=False):
+    """Exact judgement signature; the existing binned fingerprint stays unchanged."""
+    from usami_v2.scenarios.signature import decision_signature
+    return decision_signature(spec, build, task,
+                              return_receipt_event_configured=return_receipt_event_configured)
+
+
+def same_decision(left, right):
+    """Use only fully derived signatures for exact decision deduplication."""
+    from usami_v2.scenarios.signature import DecisionSignature
+    if not isinstance(left, DecisionSignature) or not isinstance(right, DecisionSignature):
+        raise TypeError('DecisionSignature required')
+    return left.checked() == right.checked()

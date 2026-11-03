@@ -228,6 +228,24 @@ class _UsamiCustomer:
         if not getattr(profile, 'accepts_proposals', True):
             return CustomerDecision(message='No, please do not proceed.',
                                     declines_proposal=True, finish=True)
+        scoped = getattr(profile, 'decline_line_ids', ())
+        if scoped:
+            import re
+            message = prompt.last_service_message.casefold()
+            words = set(re.findall(r'[a-z0-9]+', message))
+            matches = []
+            for line_id, reference in profile.request_references.items():
+                terms = {word for word in re.findall(r'[a-z0-9]+', reference.casefold())
+                         if word not in {'the', 'in', 'of', 'my', 'item', 'order'}}
+                if line_id.casefold() in message or (terms and terms.issubset(words)):
+                    matches.append(line_id)
+            if len(matches) == 1:
+                if matches[0] in scoped:
+                    return CustomerDecision(message='No, please do not proceed with that item.',
+                                            declines_proposal=True, declined_line_id=matches[0])
+                return CustomerDecision(message='Yes, please go ahead with that item.')
+            if '?' in message or any(word in words for word in ('confirm', 'proceed', 'agree')):
+                return CustomerDecision(message='Which item are you asking about?')
         if self.turns == 1:
             # A neutral confirmation works for all supported remedy types.
             return CustomerDecision(

@@ -330,7 +330,7 @@ class RefusalGoal(Sealed):
     line_ids: Tuple[str, ...] = Field(min_length=1)
     reason_code: Literal['RETURN_WINDOW_EXPIRED', 'ORDER_NOT_CANCELLABLE',
                          'APPROVAL_REQUIRED', 'INSUFFICIENT_STOCK', 'ORDER_NOT_DELIVERED',
-                         'CUSTOMER_DECLINED', 'RESHIP_NOT_ELIGIBLE']
+                         'CUSTOMER_DECLINED', 'RESHIP_NOT_ELIGIBLE', 'PURCHASED_QUANTITY_UNAVAILABLE']
     # The same rule code can reject several operations; certification must know
     # exactly what the Customer requested. Omitted on legacy/default records.
     requested_action: Literal['refund', 'exchange', 'reship', 'cancel'] = 'refund'
@@ -395,18 +395,29 @@ class TaskSpec(Sealed):
         rows = self.remedy_goals + self.information_goals + self.cancellation_goals + getattr(self, 'refusal_goals', ())
         if not rows or len({row.goal_id for row in rows}) != len(rows):
             raise ValueError("task needs unique business/information objectives")
-        if self.cancellation_goals and self.protocol != "commerce-task-v3":
+        if self.cancellation_goals and self.protocol not in ("commerce-task-v3", "commerce-task-v4"):
             raise ValueError("order cancellation goals require the structured v3 task protocol")
         lines = delegated_line_ids(self)
-        if len(set(lines)) != len(lines):
+        if self.protocol != 'commerce-task-v4' and len(set(lines)) != len(lines):
             raise ValueError("one order line cannot carry several business objectives")
+        if self.protocol == 'commerce-task-v4':
+            by_line = {}
+            for goal in self.remedy_goals:
+                existing = by_line.setdefault(goal.line_id, set())
+                if existing.intersection(goal.allowed_remedies):
+                    raise ValueError('same-line goals must have disjoint remedies')
+                existing.update(goal.allowed_remedies)
+            other_lines = [line for goal in self.cancellation_goals + getattr(self, 'refusal_goals', ())
+                           for line in goal.line_ids]
+            if len(set(other_lines)) != len(other_lines) or set(other_lines).intersection(by_line):
+                raise ValueError('cancellation or refusal cannot overlap another business goal')
         normalized_request = " ".join(self.customer_request.casefold().split())
         if self.protocol == "commerce-task-v1":
             for goal in self.information_goals:
                 span = " ".join(goal.public_request.casefold().split())
                 if span not in normalized_request:
                     raise ValueError("information objective must be grounded in the public Customer request")
-        if len({row.line_id for row in self.remedy_goals}) != len(self.remedy_goals):
+        if self.protocol != 'commerce-task-v4' and len({row.line_id for row in self.remedy_goals}) != len(self.remedy_goals):
             raise ValueError("combine acceptable remedies for one line rather than ambiguous duplicated goals")
         if self.partition == "heldout" and self.parent_training_evidence_hashes:
             raise ValueError("final evaluation tasks cannot be conditioned on training weakness evidence")
@@ -449,28 +460,71 @@ class StructuredInformationObjective(Sealed):
     fact_kind: FactKind
 
 
+class CustomerRequestIntent(Sealed):
+    """Customer's public request, independent of its derived outcome."""
+
+    goal_id: str
+    line_id: str
+    action: Literal["refund", "exchange", "reship", "cancel"]
+    quantity: int = Field(ge=1, strict=True)
+    required_attributes: Tuple[Attribute, ...] = ()
+    maximum_extra_charge_cents: Optional[int] = Field(default=None, ge=0, strict=True)
+    latest_arrival_within_days: Optional[int] = Field(default=None, ge=0, strict=True)
+    reference: Literal['attributes', 'delivery_age', 'price', 'order_date'] = 'attributes'
+
+    @model_serializer(mode='wrap')
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ('reference',))
+
+    @model_validator(mode="after")
+    def valid_request(self):
+        if self.action in ("refund", "cancel") and (self.required_attributes
+                or self.maximum_extra_charge_cents is not None or self.latest_arrival_within_days is not None):
+            raise ValueError("refund and cancellation requests cannot constrain a replacement")
+        if len({row.name for row in self.required_attributes}) != len(self.required_attributes):
+            raise ValueError("duplicate requested attribute")
+        return self
+
+
 class CustomerRequestBundle(Sealed):
     """Provenance binding between structured Customer intent and rendered text."""
 
     protocol: Literal["commerce-request-bundle-v1"] = "commerce-request-bundle-v1"
     customer_id: str
     goal_ids: Tuple[str, ...]
-    renderer_version: Literal["commerce-request-renderer-v1"] = "commerce-request-renderer-v1"
+    renderer_version: Literal["commerce-request-renderer-v1", "commerce-request-renderer-v2"] = "commerce-request-renderer-v1"
     intent_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     request_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    requests: Tuple[CustomerRequestIntent, ...] = ()
+    style_seed: int = Field(default=0, strict=True)
+    sequential: bool = False
+
+    @model_serializer(mode="wrap")
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ("requests", "style_seed", "sequential"))
 
     @model_validator(mode="after")
     def unique_goals(self):
         if not self.goal_ids or len(set(self.goal_ids)) != len(self.goal_ids):
             raise ValueError("request bundle requires unique structured goal references")
+        if self.renderer_version == "commerce-request-renderer-v1" and (self.requests or self.style_seed or self.sequential):
+            raise ValueError("v1 renderer cannot carry v2 request intent")
+        if self.renderer_version == "commerce-request-renderer-v2":
+            if not self.requests or len({row.goal_id for row in self.requests}) != len(self.requests):
+                raise ValueError("v2 renderer requires unique customer requests")
+            if set(row.goal_id for row in self.requests) != set(self.goal_ids):
+                raise ValueError("v2 requests must match the task goals")
+            if self.sequential and len(self.requests) < 2:
+                raise ValueError('ordered processing requires multiple requests')
         return self
 
 
 def delegated_line_ids(task):
     """Lines the Customer authorizes: remedy lines, then every line of a cancelled order."""
-    return tuple(goal.line_id for goal in task.remedy_goals) + tuple(
+    lines = tuple(goal.line_id for goal in task.remedy_goals) + tuple(
         line_id for goal in task.cancellation_goals for line_id in goal.line_ids) + tuple(
         line_id for goal in getattr(task, 'refusal_goals', ()) for line_id in goal.line_ids)
+    return tuple(dict.fromkeys(lines)) if task.protocol == 'commerce-task-v4' else lines
 
 
 def _display_name(value):
@@ -487,6 +541,90 @@ def _line_description(world, line_id):
                  if name != "variant" and sku.attributes[name])
     parts.append(_display_name(sku.product_family))
     return " ".join(dict.fromkeys(parts))
+
+
+def _referenced_line_description(world, line_id, reference):
+    line = world.lines[line_id]
+    order, sku = world.orders[line.order_id], world.skus[line.sku_id]
+    family = _display_name(sku.product_family)
+    if reference == 'attributes':
+        return _line_description(world, line_id)
+    if reference == 'delivery_age':
+        if order.fulfillment_status != 'delivered':
+            raise ValueError('delivery age is unavailable before delivery')
+        age = (world.clock - order.delivered_at).days
+        if age < 0:
+            raise ValueError('delivery age cannot be negative')
+        return f'{family} delivered about {age} day{"" if age == 1 else "s"} ago'
+    if reference == 'price':
+        return f'{family} priced at CNY {sku.price_cents / 100:.2f} each'
+    if reference == 'order_date':
+        if order.ordered_at is None:
+            raise ValueError('order date is unavailable')
+        return f'{family} in the order placed on {order.ordered_at.date().isoformat()}'
+    raise ValueError('unknown public reference')
+
+
+def _check_unique_reference(world, customer_id, intent):
+    expected = _referenced_line_description(world, intent.line_id, intent.reference)
+    matches = 0
+    for line in world.lines.values():
+        if world.orders[line.order_id].customer_id != customer_id:
+            continue
+        try:
+            matches += _referenced_line_description(world, line.id, intent.reference) == expected
+        except ValueError:
+            continue  # This fact is not available for that line.
+    if matches != 1:
+        raise ValueError('AMBIGUOUS_TARGET: public line description is not unique')
+
+
+def render_customer_request_v2(world, customer_id, requests, style_seed=0, sequential=False):
+    """Render only public intent; success and refusal use the identical wording."""
+    import random
+    rng = random.Random(style_seed)
+    openings = ("Please help me with these requests:", "I need help with my order:",
+                "Could you help me with the following?")
+    verbs = {"refund": ("refund", "return for a refund", "get my money back for"),
+             "exchange": ("exchange", "swap", "replace"),
+             "reship": ("reship", "send another of", "send a replacement for"),
+             "cancel": ("cancel my order containing", "cancel the order containing", "stop the order containing")}
+    opening = ('Please process these requests in the order listed:' if sequential else rng.choice(openings))
+    numbered = bool(rng.randrange(2))
+    clauses = []
+    for index, request in enumerate(requests, 1):
+        line = world.lines.get(request.line_id)
+        if line is None or world.orders[line.order_id].customer_id != customer_id:
+            raise ValueError("request renderer cannot describe another Customer's line")
+        prefix = f"{index}. " if numbered else "- "
+        _check_unique_reference(world, customer_id, request)
+        subject = _referenced_line_description(world, line.id, request.reference)
+        unit = 'item' if request.quantity == 1 else 'items'
+        verb = rng.choice(verbs[request.action])
+        if request.action == 'cancel':
+            text = f"{prefix}Please {verb} {request.quantity} {unit} of the {subject}"
+        else:
+            text = f"{prefix}Please {verb} {request.quantity} {unit} of the {subject} in my order"
+        details = []
+        if request.required_attributes:
+            details.append("with " + ", ".join(f"{_display_name(row.value)} {_display_name(row.name)}"
+                                               for row in request.required_attributes))
+        if request.maximum_extra_charge_cents is not None:
+            details.append("with no more than CNY {:.2f} in extra charges".format(request.maximum_extra_charge_cents / 100))
+        if request.latest_arrival_within_days is not None:
+            details.append(f"within {request.latest_arrival_within_days} days")
+        rng.shuffle(details)
+        clauses.append(text + (" " + " ".join(details) if details else "") + ".")
+    if not clauses:
+        raise ValueError("cannot render an empty Customer request")
+    if not sequential and len(clauses) > 1 and rng.randrange(2):
+        # Renumber after shuffling so the visible list remains coherent.
+        rng.shuffle(clauses)
+        if numbered:
+            clauses = [f'{index}. ' + clause.split('. ', 1)[1] for index, clause in enumerate(clauses, 1)]
+    background = rng.choice(('', '', 'Thank you for looking into this.',
+                             'Please let me know if you need more information.'))
+    return opening + "\n" + "\n".join(clauses) + ('\n' + background if background else '')
 
 
 def render_customer_request(world, customer_id, remedy_goals, information_goals, cancellation_goals=(), refusal_goals=()):
@@ -615,6 +753,11 @@ class TaskSpecV3(TaskSpec):
         return self
 
 
+class TaskSpecV4(TaskSpecV3):
+    """Structured requests with disjoint remedies sharing purchased units."""
+    protocol: Literal['commerce-task-v4'] = 'commerce-task-v4'
+
+
 def parse_task_spec(value):
     """Parse a saved task by its immutable protocol version."""
     protocol = value.get("protocol") if isinstance(value, dict) else None
@@ -622,6 +765,7 @@ def parse_task_spec(value):
         "commerce-task-v1": TaskSpec,
         "commerce-task-v2": TaskSpecV2,
         "commerce-task-v3": TaskSpecV3,
+        "commerce-task-v4": TaskSpecV4,
     }
     model = models.get(protocol)
     if model is None:
@@ -639,12 +783,43 @@ def check_task_scope(world, task: TaskSpec):
     owned_orders = {row.id for row in world.orders.values() if row.customer_id == task.customer_id}
     owned_lines = {row.id for row in world.lines.values() if row.order_id in owned_orders}
 
-    if task.protocol == "commerce-task-v3":
+    if task.protocol in ("commerce-task-v3", "commerce-task-v4"):
         if not isinstance(task, TaskSpecV3):
             raise ValueError("commerce-task-v3 requires its structured task contract")
-        expected_request = render_customer_request(
-            world, task.customer_id, task.remedy_goals, task.information_goals, task.cancellation_goals,
-            task.refusal_goals)
+        bundle = task.request_bundle
+        if bundle.renderer_version == "commerce-request-renderer-v2":
+            from datetime import timedelta
+            goals = {goal.goal_id: goal for goal in task.remedy_goals + task.cancellation_goals + task.refusal_goals}
+            if task.information_goals:
+                raise ValueError("v2 request renderer does not support information objectives")
+            for intent in bundle.requests:
+                goal = goals[intent.goal_id]
+                if isinstance(goal, RemedyGoal):
+                    deadline = (world.clock + timedelta(days=intent.latest_arrival_within_days)
+                                if intent.latest_arrival_within_days is not None else None)
+                    if (intent.line_id != goal.line_id or (intent.action,) != goal.allowed_remedies
+                            or intent.quantity != goal.quantity or intent.required_attributes != goal.required_attributes
+                            or intent.maximum_extra_charge_cents != goal.maximum_extra_charge_cents
+                            or deadline != goal.latest_arrival):
+                        raise ValueError("customer request differs from derived remedy goal")
+                elif isinstance(goal, OrderCancellationGoal):
+                    if intent.action != "cancel" or intent.line_id not in goal.line_ids:
+                        raise ValueError("customer request differs from cancellation goal")
+                elif (intent.line_id not in goal.line_ids or intent.action != goal.requested_action
+                      or intent.maximum_extra_charge_cents != goal.maximum_extra_charge_cents):
+                    raise ValueError("customer request differs from refusal goal")
+            if bundle.sequential:
+                requested_successes = [intent.goal_id for intent in bundle.requests
+                                       if not isinstance(goals[intent.goal_id], RefusalGoal)]
+                proof_order = [goal.goal_id for goal in task.remedy_goals + task.cancellation_goals]
+                if requested_successes != proof_order:
+                    raise ValueError('ordered successes differ from native witness order')
+            expected_request = render_customer_request_v2(world, task.customer_id, bundle.requests,
+                                                          bundle.style_seed, bundle.sequential)
+        else:
+            expected_request = render_customer_request(
+                world, task.customer_id, task.remedy_goals, task.information_goals, task.cancellation_goals,
+                task.refusal_goals)
         if task.customer_request != expected_request:
             raise ValueError("public Customer request was not rendered from its registered structured intent")
         if task.request_bundle.request_hash != digest(expected_request):
@@ -664,8 +839,33 @@ def check_task_scope(world, task: TaskSpec):
                     for unit in row.unit_indices}
         settled = {unit for row in world.settlements.values() if row.line_id == goal.line_id
                    for unit in row.unit_indices}
+        if 'refund' in goal.allowed_remedies and world.skus[line.sku_id].return_required:
+            eligible = {unit for case in world.cases.values() if case.line_id == line.id
+                        and case.status in ('awaiting_return', 'ready')
+                        and any(ret.case_id == case.id and ret.status in ('scheduled', 'received')
+                                for ret in world.returns.values()) for unit in case.unit_indices}
+            occupied -= eligible
         if goal.quantity > line.quantity - len(occupied | settled):
             raise ValueError("task exceeds the uncommitted purchased quantity")
+
+    if task.protocol == 'commerce-task-v4':
+        for line_id in {goal.line_id for goal in task.remedy_goals}:
+            line = world.lines[line_id]
+            occupied = {unit for row in world.cases.values()
+                        if row.line_id == line_id and row.status not in ('resolved', 'cancelled')
+                        for unit in row.unit_indices}
+            occupied.update(unit for row in world.settlements.values() if row.line_id == line_id
+                            for unit in row.unit_indices)
+            if any('refund' in goal.allowed_remedies for goal in task.remedy_goals if goal.line_id == line_id):
+                pending = {unit for case in world.cases.values() if case.line_id == line_id
+                           and case.status in ('awaiting_return', 'ready')
+                           and any(ret.case_id == case.id and ret.status in ('scheduled', 'received')
+                                   for ret in world.returns.values()) for unit in case.unit_indices}
+                settled = {unit for row in world.settlements.values() if row.line_id == line_id
+                           for unit in row.unit_indices}
+                occupied -= pending - settled
+            if sum(goal.quantity for goal in task.remedy_goals if goal.line_id == line_id) > line.quantity - len(occupied):
+                raise ValueError('same-line goals exceed uncommitted purchased quantity')
 
     for goal in task.cancellation_goals:
         order = world.orders.get(goal.order_id)
@@ -706,12 +906,88 @@ def _validate_run_states(initial, final, task):
         raise ValueError("final state belongs to a different business instance")
     if invariants(final):
         raise ValueError("final state violates native business invariants")
-    immutable = ("customers", "merchants", "skus", "warehouses", "orders", "lines", "evidence")
+    immutable = ("customers", "merchants", "skus", "warehouses", "orders", "lines", "evidence", "observation_protocol")
     if any(getattr(initial, name) != getattr(final, name) for name in immutable):
         raise ValueError("final state changed frozen source business facts")
     if final.clock < initial.clock:
         raise ValueError("final business clock moved backwards")
     return task
+
+
+def _ordered_refusal_observed(task, goal, tool_executions):
+    """Bind an ordered refusal to public observations at the correct point in time."""
+    from usami_v2.commerce import adapter
+    from usami_v2.commerce.models import World
+    from .refusal_certification import _operations
+    requests = task.request_bundle.requests
+    position = next(index for index, request in enumerate(requests) if request.goal_id == goal.goal_id)
+    goals = {item.goal_id: item for item in task.remedy_goals + task.cancellation_goals}
+    action_names = {'refund': 'return_delivered_order_items', 'exchange': 'exchange_delivered_order_items',
+                    'reship': 'reship_order_items', 'cancel': 'cancel_order'}
+
+    def completion(request):
+        target = goals.get(request.goal_id)
+        if target is None:
+            return None
+        resource = target.order_id if isinstance(target, OrderCancellationGoal) else target.line_id
+        return next((index for index, execution in enumerate(tool_executions)
+                     if execution.operation.get('name') == action_names[request.action]
+                     and execution.operation.get('resource_id') == resource
+                     and execution.result.get('success') is True), None)
+
+    earlier = [completion(request) for request in requests[:position] if request.goal_id in goals]
+    if any(value is None for value in earlier):
+        return False
+    later = [value for request in requests[position + 1:] if request.goal_id in goals
+             if (value := completion(request)) is not None]
+    lower, upper = max(earlier, default=-1), min(later, default=len(tool_executions))
+    intent = requests[position]
+    for index, execution in enumerate(tool_executions):
+        if (not lower < index < upper or execution.operation.get('name') != 'get_order_details'
+                or execution.result.get('success') is not True):
+            continue
+        try:
+            state = World.model_validate(execution.engine_trace['initial_state'])
+            if execution.operation.get('resource_id') not in {state.lines[line].order_id for line in goal.line_ids}:
+                continue
+            operations = _operations(state, goal, quantity=intent.quantity,
+                                     required_attributes=intent.required_attributes)
+            decisions = [adapter.decide(state, task.customer_id, operation) for operation in operations]
+            if decisions and all(not decision.allowed and decision.error_code == goal.reason_code
+                                 for decision in decisions):
+                return True
+        except (KeyError, ValueError):
+            continue
+    return False
+
+
+def _ordered_decline_observed(task, goal, events):
+    requests = task.request_bundle.requests
+    position = next(index for index, request in enumerate(requests) if request.goal_id == goal.goal_id)
+    goals = {item.goal_id: item for item in task.remedy_goals + task.cancellation_goals}
+    names = {'refund': 'return_delivered_order_items', 'exchange': 'exchange_delivered_order_items',
+             'reship': 'reship_order_items', 'cancel': 'cancel_order'}
+
+    def completion(request):
+        target = goals.get(request.goal_id)
+        if target is None:
+            return None
+        resource = target.order_id if isinstance(target, OrderCancellationGoal) else target.line_id
+        return next((index for index, event in enumerate(events) if event.kind == 'service_tool'
+                     and event.payload.get('operation', {}).get('name') == names[request.action]
+                     and event.payload.get('operation', {}).get('resource_id') == resource
+                     and event.payload.get('result', {}).get('success') is True), None)
+    earlier = [completion(request) for request in requests[:position] if request.goal_id in goals]
+    if any(value is None for value in earlier):
+        return False
+    later = [value for request in requests[position + 1:] if request.goal_id in goals
+             if (value := completion(request)) is not None]
+    lower, upper = max(earlier, default=-1), min(later, default=len(events))
+    return any(lower < index < upper and event.kind == 'customer_transition'
+               and event.payload.get('transition_kind') == 'decision'
+               and event.payload.get('decision', {}).get('declines_proposal') is True
+               and event.payload.get('decision', {}).get('declined_line_id') in goal.line_ids
+               for index, event in enumerate(events))
 
 
 def evaluate_state_goals(initial, final, task: TaskSpec, *, tool_executions=(), episode_status=None,
@@ -729,8 +1005,14 @@ def evaluate_state_goals(initial, final, task: TaskSpec, *, tool_executions=(), 
         settlements = [row for key, row in sorted(final.settlements.items(),
                                                   key=lambda item: (tuple(item[1].unit_indices), item[0]))
                        if row.line_id == goal.line_id and key not in initial.settlements]
+        unmatched = False
+        if task.protocol == 'commerce-task-v4':
+            siblings = [item for item in task.remedy_goals if item.line_id == goal.line_id]
+            unmatched = any(not any(row.remedy in item.allowed_remedies for item in siblings)
+                            for row in settlements)
+            settlements = [row for row in settlements if row.remedy in goal.allowed_remedies]
         quantity = sum(len(row.unit_indices) for row in settlements)
-        ok = quantity == goal.quantity and all(row.remedy in goal.allowed_remedies for row in settlements)
+        ok = not unmatched and quantity == goal.quantity and all(row.remedy in goal.allowed_remedies for row in settlements)
         requested_units = set()
         for settlement in settlements:
             if requested_units.intersection(settlement.unit_indices):
@@ -741,6 +1023,9 @@ def evaluate_state_goals(initial, final, task: TaskSpec, *, tool_executions=(), 
                                for unit in row.unit_indices}
             previously_used.update(unit for row in initial.cases.values()
                                    if row.line_id == goal.line_id and row.status not in ("resolved", "cancelled")
+                                   and not (settlement.remedy == 'refund' and row.status in ('awaiting_return', 'ready')
+                                            and any(ret.case_id == row.id and ret.status in ('scheduled', 'received')
+                                                    for ret in initial.returns.values()))
                                    for unit in row.unit_indices)
             if any(unit in previously_used for unit in settlement.unit_indices):
                 ok = False
@@ -824,12 +1109,21 @@ def evaluate_state_goals(initial, final, task: TaskSpec, *, tool_executions=(), 
                             if key not in initial.fulfillments and row.quote_id in quote_ids]
         unexpected_settlements = [row for key, row in final.settlements.items()
                                   if key not in initial.settlements and row.line_id not in allowed_lines]
+        scoped_decline = (getattr(getattr(task, 'request_bundle', None), 'renderer_version', None)
+                          == 'commerce-request-renderer-v2' and bool(task.remedy_goals or task.cancellation_goals))
         declined = (goal.reason_code != 'CUSTOMER_DECLINED' or any(
             event.kind == 'customer_transition' and event.payload.get('transition_kind') == 'decision'
-            and event.payload.get('decision', {}).get('declines_proposal') is True for event in events))
+            and event.payload.get('decision', {}).get('declines_proposal') is True
+            and (not scoped_decline or event.payload.get('decision', {}).get('declined_line_id') in lines)
+            for event in events))
         ok = (not new_settlements and not new_ledger and not new_fulfillments
               and not unexpected_settlements and orders.issubset(read_orders)
               and episode_status == 'customer_finished' and declined)
+        bundle = getattr(task, 'request_bundle', None)
+        if getattr(bundle, 'sequential', False) and goal.reason_code != 'CUSTOMER_DECLINED':
+            ok = ok and _ordered_refusal_observed(task, goal, tuple(tool_executions))
+        elif getattr(bundle, 'sequential', False) and scoped_decline:
+            ok = ok and _ordered_decline_observed(task, goal, tuple(events))
         rows.append(GoalResult(goal_id=goal.goal_id, status='PASS' if ok else 'FAIL', evidence_refs=()))
     return tuple(rows)
 
@@ -853,7 +1147,7 @@ def evaluate_task_communication(initial, task: TaskSpec, *, facts=(), messages=(
             end_event_index = max((row.event_index for row in messages), default=0)
         obligations = []
         for goal in task.information_goals:
-            if task.protocol == "commerce-task-v3":
+            if task.protocol in ("commerce-task-v3", "commerce-task-v4"):
                 public_text = task.customer_request
                 request_hash = task.request_bundle.record_hash
             else:

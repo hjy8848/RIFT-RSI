@@ -121,6 +121,57 @@ def test_complete_small_search_can_prove_combined_constraints_unsat():
     assert partial.status == "UNKNOWN"
 
 
+def test_propagation_finds_tight_solution_and_preserves_sample_serialization():
+    spec = scene()
+    skus = [replace(row, price_cents=IntegerRange(low=1, high=1000000).model_dump(mode="json"))
+            if row.alias == "original" else row for row in spec.skus]
+    required = RelationConstraint(constraint_id="needle_price",
+                                  left=expression(term("original", "price_cents")),
+                                  operator="eq", right=expression(constant=777777))
+    spec = replace(spec, skus=[row.model_dump(mode="json") for row in skus],
+                   constraints=[required.model_dump(mode="json")])
+    assert "strategy" not in BuildBudget().model_dump(mode="json")
+    assert build_world(spec, 1, BuildBudget(max_nodes=1)).status == "UNKNOWN"
+    result = build_world(spec, 1, BuildBudget(max_nodes=1, strategy="propagate"))
+    assert result.status == "SAT"
+    assert dict(((a, b, c), value) for a, b, c, value in result.assignment)[("original", "price_cents", "")] == 777777
+    assert verify_build(spec, result)["verified"]
+
+
+def test_propagation_proves_contradiction_and_reports_constraint():
+    spec = scene()
+    skus = [replace(row, price_cents=IntegerRange(low=1, high=2).model_dump(mode="json"))
+            if row.alias in ("original", "wrong") else row for row in spec.skus]
+    relations = tuple(RelationConstraint(
+        constraint_id=left + "_less_" + right, left=expression(term(left, "price_cents")),
+        operator="lt", right=expression(term(right, "price_cents")))
+        for left, right in (("original", "wrong"), ("wrong", "original")))
+    spec = replace(spec, skus=[row.model_dump(mode="json") for row in skus],
+                   constraints=[row.model_dump(mode="json") for row in relations])
+    result = build_world(spec, 1, BuildBudget(max_nodes=10, strategy="propagate"))
+    assert result.status == "UNSAT"
+    assert "rejected constraints:" in result.reason
+    assert verify_build(spec, result)["verified"]
+
+
+def test_propagation_matches_exhaustive_linear_search():
+    from usami_v2.scenarios.solver import PropagationSearch, relation_satisfied
+    keys = (("x", "price_cents", ""), ("y", "price_cents", ""))
+    ranges = {key: IntegerRange(low=1, high=5) for key in keys}
+    for operator in ("eq", "ne", "lt", "le", "gt", "ge"):
+        for coefficient in (-2, 1, 2):
+            relation = RelationConstraint(
+                constraint_id="test", left=expression(term("x", "price_cents", coefficient),
+                                                       term("y", "price_cents", -1)),
+                operator=operator, right=expression(constant=1))
+            search = PropagationSearch(ranges, (relation,), 1000)
+            actual = {tuple(row[key] for key in keys) for row in search}
+            expected = {(x, y) for x in range(1, 6) for y in range(1, 6)
+                        if relation_satisfied(relation, dict(zip(keys, (x, y))))}
+            assert actual == expected
+            assert not search.exhausted
+
+
 def test_independent_world_inspector_detects_a_broken_constructor(monkeypatch):
     import usami_v2.scenarios.builder as builder
     original = builder._construct

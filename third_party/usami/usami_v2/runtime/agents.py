@@ -281,6 +281,10 @@ class OpenAICustomerAgent:
         if not getattr(profile, 'accepts_proposals', True):
             system += ("\nYour private choice is to decline the proposed action. "
                        "Reply no and set declines_proposal=true in customer_turn.")
+        elif getattr(profile, 'decline_line_ids', ()):
+            system += ("\nOnly the listed decline_references are declined; other requests may be accepted. "
+                       "When declining, set declines_proposal=true and declined_line_id to its matching ID. "
+                       "If the proposed item is unclear, ask which item is being discussed.")
         messages = [{"role": "system", "content": system},
                     {"role": "user", "content": json.dumps({
                         "public_request": prompt.public_request,
@@ -289,12 +293,15 @@ class OpenAICustomerAgent:
                         "conversation": [row.model_dump(mode="json") for row in prompt.conversation],
                     }, ensure_ascii=False)}]
         customer_tools = CUSTOMER_TOOLS
-        if not getattr(profile, 'accepts_proposals', True):
+        if not getattr(profile, 'accepts_proposals', True) or getattr(profile, 'decline_line_ids', ()):
             from copy import deepcopy
             customer_tools = deepcopy(CUSTOMER_TOOLS)
             properties = customer_tools[0]['function']['parameters']['properties']
             properties['declines_proposal'] = {'type': 'boolean'}
             customer_tools[0]['function']['parameters']['required'].append('declines_proposal')
+            if getattr(profile, 'decline_line_ids', ()):
+                properties['declined_line_id'] = {'anyOf': [{'type': 'string'}, {'type': 'null'}]}
+                customer_tools[0]['function']['parameters']['required'].append('declined_line_id')
         request = self.settings.request(messages, customer_tools)
         request["tool_choice"] = {"type": "function", "function": {"name": "customer_turn"}}
         try:

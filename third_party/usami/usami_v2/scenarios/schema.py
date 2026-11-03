@@ -84,12 +84,15 @@ class OrderVariable(Sealed):
     fulfillment_status: Literal["unshipped", "shipped", "delivered"] = Field(
         default="delivered",
         description="Only an unshipped order can be cancelled; its lines reserve stock in the first stocked warehouse.")
+    ordered_days_ago: Optional[int] = Field(default=None, ge=0, strict=True)
 
     @model_serializer(mode="wrap")
     def _compatible_dump(self, handler):
         data = handler(self)
         if self.fulfillment_status == "delivered":
             data.pop("fulfillment_status", None)
+        if self.ordered_days_ago is None:
+            data.pop("ordered_days_ago", None)
         return data
 
     @model_validator(mode="after")
@@ -143,6 +146,26 @@ class RelationConstraint(Sealed):
     right: LinearExpression
 
 
+class HistoryStep(Sealed):
+    operation: Literal['return_delivered_order_items', 'cancel_order', 'exchange_delivered_order_items',
+                       'reship_order_items', 'request_item_return', 'return_received']
+    line_alias: Optional[str] = None
+    order_alias: Optional[str] = None
+    quantity: int = Field(default=1, ge=1, strict=True)
+    target_sku_alias: Optional[str] = None
+
+    @model_validator(mode='after')
+    def valid_target(self):
+        if self.operation == 'cancel_order':
+            if not self.order_alias or self.line_alias:
+                raise ValueError('cancellation history requires an order alias')
+        elif not self.line_alias or self.order_alias:
+            raise ValueError('history operation requires a line alias')
+        if (self.operation == 'exchange_delivered_order_items') != bool(self.target_sku_alias):
+            raise ValueError('exchange history alone requires a target SKU alias')
+        return self
+
+
 class ScenarioSpec(Sealed):
     protocol: Literal["commerce-scenario-v1"] = "commerce-scenario-v1"
     scenario_id: str
@@ -157,6 +180,14 @@ class ScenarioSpec(Sealed):
     constraints: Tuple[RelationConstraint, ...] = ()
     provenance_kind: Literal["synthetic_reference", "designer_exploration", "offline_fixture"]
     distribution_hash: Optional[str] = None
+    history: Tuple[HistoryStep, ...] = ()
+
+    @model_serializer(mode='wrap')
+    def _compatible_dump(self, handler):
+        data = handler(self)
+        if not self.history:
+            data.pop('history', None)
+        return data
 
     @model_validator(mode="after")
     def references_and_capabilities(self):
@@ -184,6 +215,13 @@ class ScenarioSpec(Sealed):
                     raise ValueError("constraint references an unavailable business variable/field")
         if len({row.constraint_id for row in self.constraints}) != len(self.constraints):
             raise ValueError("duplicate scene constraint IDs")
+        line_ids = {line.alias for order in self.orders for line in order.lines}
+        order_ids = {order.alias for order in self.orders}
+        for step in self.history:
+            if ((step.line_alias and step.line_alias not in line_ids)
+                    or (step.order_alias and step.order_alias not in order_ids)
+                    or (step.target_sku_alias and step.target_sku_alias not in sku_ids)):
+                raise ValueError('history references an unknown scene alias')
         if self.provenance_kind != "offline_fixture" and not self.distribution_hash:
             raise ValueError("reference/exploration scenes require distribution provenance")
         return self
@@ -191,3 +229,11 @@ class ScenarioSpec(Sealed):
 
 class BuildBudget(Sealed):
     max_nodes: int = Field(default=256, ge=1, le=100000, strict=True)
+    strategy: Literal["sample", "propagate"] = "sample"
+
+    @model_serializer(mode="wrap")
+    def _compatible_dump(self, handler):
+        data = handler(self)
+        if self.strategy == "sample":
+            data.pop("strategy", None)
+        return data

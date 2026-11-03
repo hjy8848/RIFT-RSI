@@ -183,7 +183,7 @@ class CertifiedTaskRegistry:
                 or scenario.customer_id != task.customer_id or cert.task_hash != task.record_hash
                 or cert.world_hash != world.state_hash or cert.status != 'CERTIFIED'
                 or not cert.full_task_reachability_certified): return False
-        if task.protocol != 'commerce-task-v3' or profile.protocol != 'commerce-customer-profile-v3': return False
+        if task.protocol not in ('commerce-task-v3', 'commerce-task-v4') or profile.protocol != 'commerce-customer-profile-v3': return False
         from usami_v2.scenarios.tasks import delegated_line_ids
         lines = delegated_line_ids(task)
         if (profile.delegated_line_ids != lines or scenario.delegated_line_ids != lines
@@ -192,6 +192,7 @@ class CertifiedTaskRegistry:
                 or profile.accepted_remedies != scenario.accepted_remedies
                 or profile.maximum_extra_charge_cents != scenario.maximum_extra_charge_cents
                 or profile.accepts_proposals != scenario.accepts_proposals
+                or profile.decline_line_ids != scenario.decline_line_ids
                 or profile.return_pickup_slot != scenario.return_pickup_slot): return False
         if ((scenario.latest_arrival is None) != (profile.latest_arrival_days is None)
                 or (scenario.latest_arrival is not None

@@ -37,6 +37,31 @@ def verify_world_constraints(spec, result):
     if (set(aliases) != expected_aliases or len(aliases) != len(result.private_aliases)
             or len(set(aliases.values())) != len(aliases)):
         raise ValueError("scene aliases are missing, duplicated or not one-to-one")
+    if spec.history:
+        from .builder import BuildResult, _construct
+        from .history import apply_history
+        from .schema import ScenarioSpec
+        data = spec.model_dump(mode='json', exclude={'record_hash'})
+        data.pop('history', None)
+        base_spec = ScenarioSpec.model_validate(data)
+        values = {(a, b, c): value for a, b, c, value in result.assignment}
+        base_world, base_aliases = _construct(base_spec, result.seed, values)
+        if base_aliases != result.private_aliases:
+            raise ValueError('history base aliases differ')
+        base_result = BuildResult(status='SAT', scenario_hash=base_spec.record_hash, seed=result.seed,
+            budget=result.budget, reason='history base verification', world=base_world,
+            world_hash=base_world.state_hash, private_aliases=base_aliases,
+            assignment=result.assignment, proofs=result.proofs)
+        base_certificate = verify_world_constraints(base_spec, base_result)
+        if apply_history(base_world, aliases, spec.history) != world:
+            raise ValueError('world differs from independently replayed history')
+        if world.delegations or world.consents:
+            raise ValueError('initial scene contains historical authority')
+        return WorldCertification(scenario_hash=spec.record_hash, world_hash=world.state_hash,
+            build_hash=result.record_hash, actual_assignment=base_certificate.actual_assignment,
+            constraint_ids=base_certificate.constraint_ids)
+    if world.observation_protocol != 'commerce-observation-v1':
+        raise ValueError('history observations require registered history')
     if world.seed != result.seed or world.clock != datetime(2026, 1, 15, 12, tzinfo=timezone.utc):
         raise ValueError("initial world seed or virtual business time differs")
     merchant = aliases[spec.merchant_alias]
@@ -104,6 +129,10 @@ def verify_world_constraints(spec, result):
             raise ValueError("order Customer, merchant or payment binding differs")
         if order.fulfillment_status != order_spec.fulfillment_status:
             raise ValueError("order fulfillment status differs from the scene")
+        ordered = ((world.clock - order.ordered_at).total_seconds() / 86400
+                   if order.ordered_at is not None else None)
+        if ordered != order_spec.ordered_days_ago:
+            raise ValueError("order date differs from the scene")
         delivered = order.fulfillment_status == "delivered"
         seconds = (world.clock - order.delivered_at).total_seconds() * (1 if delivered else -1)
         if seconds % 86400:

@@ -46,10 +46,11 @@ class CustomerScenario(Sealed):
     second_refund_consent: bool = True
     reviews: Tuple[ReviewPlan, ...] = ()
     accepts_proposals: bool = True
+    decline_line_ids: Tuple[str, ...] = ()
 
     @model_serializer(mode='wrap')
     def _compatible_dump(self, handler):
-        return omit_default_fields(handler(self), self, ('accepts_proposals',))
+        return omit_default_fields(handler(self), self, ('accepts_proposals', 'decline_line_ids'))
 
     @model_validator(mode="after")
     def unique_policy(self):
@@ -61,6 +62,8 @@ class CustomerScenario(Sealed):
             raise ValueError("CustomerScenario contains an unregistered preparation")
         if len(set(self.accepted_remedies)) != len(self.accepted_remedies):
             raise ValueError("CustomerScenario repeats remedies")
+        if len(set(self.decline_line_ids)) != len(self.decline_line_ids) or not set(self.decline_line_ids).issubset(self.delegated_line_ids):
+            raise ValueError('CustomerScenario decline scope differs from delegated lines')
         if len({row.line_id for row in self.reviews}) != len(self.reviews):
             raise ValueError("CustomerScenario has multiple review outcomes for one line")
         if self.latest_arrival is not None:
@@ -186,15 +189,20 @@ def _bind_scenario(world: World, task: TaskSpec, scenario: CustomerScenario):
     scenario = scenario.checked()
     if scenario.customer_id != task.customer_id:
         raise ValueError("CustomerScenario identity differs from task")
+    bundle = getattr(task, 'request_bundle', None)
+    declined = {line for goal in getattr(task, 'refusal_goals', ()) if goal.reason_code == 'CUSTOMER_DECLINED'
+                for line in goal.line_ids}
+    if (getattr(bundle, 'renderer_version', None) == 'commerce-request-renderer-v2'
+            and declined and (task.remedy_goals or task.cancellation_goals)
+            and (not scenario.accepts_proposals or set(scenario.decline_line_ids) != declined)):
+        raise ValueError('mixed Customer declines must be scoped to their requested lines')
     goal_lines = set(delegated_line_ids(task))
     if not goal_lines.issubset(set(scenario.delegated_line_ids)):
         raise ValueError("CustomerScenario does not delegate every requested remedy line")
     if any(row.line_id not in goal_lines for row in scenario.reviews):
         raise ValueError("review event plan targets a line outside the task")
-    if any(getattr(world, name) for name in ("cases", "quotes", "delegations", "consents", "returns",
-                                               "ledger", "settlements", "fulfillments", "external_events",
-                                               "applied_events")):
-        raise ValueError("task proof requires a frozen world without prior transactions or authority")
+    if world.delegations or world.consents:
+        raise ValueError("task proof requires a frozen world without prior authority")
     return task, scenario
 
 
@@ -207,6 +215,20 @@ def _free_goal_units(world, line):
     return tuple(unit for unit in range(line.quantity) if unit not in occupied)
 
 
+def _available_goal_units(world, goal):
+    line = world.lines[goal.line_id]
+    free = _free_goal_units(world, line)
+    if 'refund' not in goal.allowed_remedies or not world.skus[line.sku_id].return_required:
+        return free
+    settled = {unit for row in world.settlements.values() if row.line_id == line.id for unit in row.unit_indices}
+    pending = {unit for case in world.cases.values() if case.line_id == line.id
+               and case.status in ('awaiting_return', 'ready')
+               and any(ret.case_id == case.id and ret.status in ('scheduled', 'received')
+                       for ret in world.returns.values())
+               for unit in case.unit_indices if unit not in settled}
+    return tuple(sorted(pending)) + tuple(unit for unit in free if unit not in pending)
+
+
 def _base_candidate_options(world: World, goal: RemedyGoal, scenario: CustomerScenario, blockers):
     """Candidate grammar over the public atomic business tools.
 
@@ -216,7 +238,7 @@ def _base_candidate_options(world: World, goal: RemedyGoal, scenario: CustomerSc
     """
     line = world.lines[goal.line_id]
     original = world.skus[line.sku_id]
-    available = _free_goal_units(world, line)
+    available = _available_goal_units(world, goal)
     if len(available) < goal.quantity:
         return ()
     credit = unit_credit(line, available[:goal.quantity])
@@ -238,7 +260,10 @@ def _base_candidate_options(world: World, goal: RemedyGoal, scenario: CustomerSc
             if credit > limit:
                 blockers.append("refund_exceeds_approval_limit_without_review_path_in_phase_1")
                 continue
-            if original.return_required and scenario.return_received_after_days is None:
+            received = any(case.line_id == line.id and len(case.unit_indices) == goal.quantity
+                           and any(ret.case_id == case.id and ret.status == 'received'
+                                   for ret in world.returns.values()) for case in world.cases.values())
+            if original.return_required and not received and scenario.return_received_after_days is None:
                 # Receipt is an external fact; without a frozen receipt event
                 # the bounded proof cannot show the refund is reachable.
                 blockers.append("return_receipt_event_not_configured")
@@ -266,17 +291,40 @@ def return_receipt_event(world: World, task: TaskSpec, scenario: CustomerScenari
     if (not world.skus[line.sku_id].return_required or "refund" not in goal.allowed_remedies
             or scenario.return_received_after_days is None):
         return None
+    pending = [case for case in world.cases.values() if case.line_id == line.id
+               and len(case.unit_indices) == goal.quantity
+               and any(ret.case_id == case.id and ret.status == 'scheduled' for ret in world.returns.values())]
+    received = [case for case in world.cases.values() if case.line_id == line.id
+                and len(case.unit_indices) == goal.quantity
+                and any(ret.case_id == case.id and ret.status == 'received' for ret in world.returns.values())]
+    if received:
+        return None
     units = _free_goal_units(world, line)[:goal.quantity]
     return ExternalEvent(
         id="return-receipt-" + digest([task.record_hash, scenario.record_hash, goal.goal_id])[:20],
-        kind="return_received", target_id=case_id(line.id, units),
+        kind="return_received", target_id=pending[0].id if len(pending) == 1 else case_id(line.id, units),
         at=world.clock + timedelta(days=scenario.return_received_after_days))
 
 
 def return_receipt_events(world: World, task: TaskSpec, scenario: CustomerScenario):
     """Events the runtime must schedule so the certified return path stays reachable."""
-    events = (return_receipt_event(world, task, scenario, goal) for goal in task.remedy_goals)
-    return tuple(event for event in events if event is not None)
+    if task.protocol != 'commerce-task-v4':
+        events = (return_receipt_event(world, task, scenario, goal) for goal in task.remedy_goals)
+        return tuple(event for event in events if event is not None)
+    free = {goal.line_id: list(_free_goal_units(world, world.lines[goal.line_id])) for goal in task.remedy_goals}
+    events = []
+    for goal in task.remedy_goals:
+        event = return_receipt_event(world, task, scenario, goal)
+        units = tuple(free[goal.line_id][:goal.quantity])
+        del free[goal.line_id][:goal.quantity]
+        if event is not None:
+            # New physical return cases are keyed by the units remaining when
+            # this goal executes, not the first units in the initial world.
+            known_case = event.target_id in world.cases
+            if not known_case:
+                event = event.model_copy(update={'target_id': case_id(goal.line_id, units)})
+            events.append(event)
+    return tuple(events)
 
 def _step(kind, before, after, **evidence):
     return ProofStep(kind=kind, before_state_hash=before.state_hash,
@@ -390,9 +438,8 @@ def _run_candidate(world, task, scenario, candidates, attempt_id, max_steps):
         steps.append(step)
         return error, ((step.evidence.get("result") if step is not None else None) or {})
 
-    def receive_return(goal):
+    def receive_return(event):
         nonlocal state
-        event = return_receipt_event(world, task, scenario, goal)
         state, event_steps = _apply_event(state, event)
         steps.extend(event_steps)
 
@@ -424,10 +471,21 @@ def _run_candidate(world, task, scenario, candidates, attempt_id, max_steps):
         if candidate.remedy == "refund":
             if world.skus[world.lines[goal.line_id].sku_id].return_required:
                 # Accepted -> received (frozen external event) -> refunded.
-                error, _ = act("request_item_return", line_id, {"quantity": quantity})
-                if error:
-                    return error
-                receive_return(goal)
+                already_received = any(case.line_id == line_id and len(case.unit_indices) == quantity
+                    and any(ret.case_id == case.id and ret.status == 'received' for ret in state.returns.values())
+                    for case in state.cases.values())
+                scheduled = any(case.line_id == line_id and len(case.unit_indices) == quantity
+                    and any(ret.case_id == case.id and ret.status == 'scheduled' for ret in state.returns.values())
+                    for case in state.cases.values())
+                if not already_received:
+                    event = return_receipt_event(state, task, scenario, goal)
+                    if event is None:
+                        return 'return_receipt_event_not_configured'
+                    if not scheduled:
+                        error, _ = act("request_item_return", line_id, {"quantity": quantity})
+                        if error:
+                            return error
+                    receive_return(event)
             error, _ = act("return_delivered_order_items", line_id,
                            {"quantity": quantity, "payment_method": "original"})
             return error

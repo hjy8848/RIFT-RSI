@@ -11,11 +11,11 @@ from usami_v2.scenarios.builder import BuildResult
 from usami_v2.scenarios.distribution import DistributionSpec
 from usami_v2.scenarios.schema import (
     Attribute, IntegerRange, LineVariable, OrderVariable, RelationConstraint,
-    SKUVariable, StockConstraint, WarehouseVariable, ScenarioSpec,
+    SKUVariable, StockConstraint, WarehouseVariable, ScenarioSpec, HistoryStep,
 )
 from usami_v2.scenarios.task_certification import CustomerTaskScope, TaskDesignCapabilities
 from usami_v2.scenarios.tasks import (
-    CustomerRequestBundle, OrderCancellationGoal, RefusalGoal, RemedyGoal, StructuredInformationObjective, TaskSpecV3,
+    CustomerRequestBundle, OrderCancellationGoal, RefusalGoal, RemedyGoal, StructuredInformationObjective, TaskSpecV3, TaskSpecV4,
     check_task_scope, render_customer_request, request_intent_hash,
 )
 class ScenarioDraft(Sealed):
@@ -29,6 +29,11 @@ class ScenarioDraft(Sealed):
     default_stock: IntegerRange = IntegerRange(low=0, high=5)
     refund_approval_limit_cents: int = Field(default=50000, ge=0, strict=True)
     constraints: Tuple[RelationConstraint, ...] = ()
+    history: Tuple[HistoryStep, ...] = ()
+
+    @model_serializer(mode='wrap')
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ('history',))
 
     def compile(self, distribution: DistributionSpec):
         return ScenarioSpec(
@@ -36,7 +41,7 @@ class ScenarioDraft(Sealed):
             customer_aliases=self.customer_aliases, skus=self.skus, warehouses=self.warehouses,
             orders=self.orders, stock=self.stock, default_stock=self.default_stock,
             refund_approval_limit_cents=self.refund_approval_limit_cents,
-            constraints=self.constraints, provenance_kind="designer_exploration",
+            constraints=self.constraints, history=self.history, provenance_kind="designer_exploration",
             distribution_hash=distribution.record_hash)
 
 
@@ -79,7 +84,7 @@ class RefusalDraft(Sealed):
     line_alias: str
     reason_code: Literal['RETURN_WINDOW_EXPIRED', 'ORDER_NOT_CANCELLABLE',
                          'APPROVAL_REQUIRED', 'INSUFFICIENT_STOCK', 'ORDER_NOT_DELIVERED',
-                         'CUSTOMER_DECLINED', 'RESHIP_NOT_ELIGIBLE']
+                         'CUSTOMER_DECLINED', 'RESHIP_NOT_ELIGIBLE', 'PURCHASED_QUANTITY_UNAVAILABLE']
     requested_action: Literal['refund', 'exchange', 'reship', 'cancel'] = 'refund'
     maximum_extra_charge_cents: Optional[int] = Field(default=None, ge=0, strict=True)
 
@@ -101,6 +106,30 @@ class InformationDraft(Sealed):
 
 
 
+class RequestDraft(Sealed):
+    goal_id: str
+    line_alias: str
+    action: Literal["refund", "exchange", "reship", "cancel"]
+    quantity: int = Field(ge=1, strict=True)
+    required_attributes: Tuple[Attribute, ...] = ()
+    maximum_extra_charge_cents: Optional[int] = Field(default=None, ge=0, strict=True)
+    latest_arrival_within_days: Optional[int] = Field(default=None, ge=0, strict=True)
+    reference: Literal['attributes', 'delivery_age', 'price', 'order_date'] = 'attributes'
+
+    @model_serializer(mode='wrap')
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ('reference',))
+
+    @model_validator(mode="after")
+    def valid_public_intent(self):
+        from .tasks import CustomerRequestIntent
+        CustomerRequestIntent(goal_id=self.goal_id, line_id=self.line_alias, action=self.action,
+                              quantity=self.quantity, required_attributes=self.required_attributes,
+                              maximum_extra_charge_cents=self.maximum_extra_charge_cents,
+                              latest_arrival_within_days=self.latest_arrival_within_days, reference=self.reference)
+        return self
+
+
 class TaskDraft(Sealed):
     task_id: str
     customer_alias: str
@@ -114,14 +143,24 @@ class TaskDraft(Sealed):
     cancellation_goals: Tuple[CancellationDraft, ...] = Field(
         default=(), description="Whole-order cancellations of unshipped orders, one goal per order.")
     refusal_goals: Tuple[RefusalDraft, ...] = ()
+    requests: Tuple[RequestDraft, ...] = ()
+    style_seed: int = Field(default=0, strict=True)
+    sequential: bool = False
 
     @model_serializer(mode="wrap")
     def _compatible_dump(self, handler):
-        return omit_default_fields(handler(self), self, ("cancellation_goals", "refusal_goals"))
+        return omit_default_fields(handler(self), self, ("cancellation_goals", "refusal_goals", "requests", "style_seed", "sequential"))
 
     @model_validator(mode="after")
     def unique_goal_ids(self):
-        rows = self.remedy_goals + self.information_goals + self.cancellation_goals + self.refusal_goals
+        legacy = self.remedy_goals + self.information_goals + self.cancellation_goals + self.refusal_goals
+        if self.requests and legacy:
+            raise ValueError("customer requests cannot be combined with declared goals")
+        if not self.requests and self.style_seed:
+            raise ValueError("style seed requires customer requests")
+        if self.sequential and len(self.requests) < 2:
+            raise ValueError('ordered processing requires multiple customer requests')
+        rows = legacy + self.requests
         if not rows or len({row.goal_id for row in rows}) != len(rows):
             raise ValueError("TaskDraft needs unique business or information goals")
         if any(len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value)
@@ -216,7 +255,8 @@ def compile_task(draft: TaskDraft, spec: ScenarioSpec, build: BuildResult,
                  interaction_certifier_available: Optional[bool] = None,
                  information_goals_certifiable: Optional[bool] = None,
                  delivery_confirmation_available: Optional[bool] = None,
-                 capabilities: Optional[TaskDesignCapabilities] = None):
+                 capabilities: Optional[TaskDesignCapabilities] = None,
+                 _skip_legacy_uniqueness: bool = False, _use_v4: bool = False):
     draft, spec, build, distribution = draft.checked(), spec.checked(), build.checked(), distribution.checked()
     if build.status != "SAT" or not build.world:
         raise ValueError("a SAT frozen world is required before task design")
@@ -245,6 +285,90 @@ def compile_task(draft: TaskDraft, spec: ScenarioSpec, build: BuildResult,
         raise ValueError("TaskDraft references a Customer alias outside the frozen world")
     if not set(draft.parent_training_evidence_hashes).issubset(set(allowed_training_hashes)):
         raise ValueError("TaskDraft references training evidence outside the authorized input set")
+    if draft.requests:
+        from .outcomes import OutcomeUnsupported, derive_outcomes
+        from .tasks import CustomerRequestIntent, render_customer_request_v2
+        intents = []
+        for request in draft.requests:
+            if request.line_alias not in customer_scope.line_aliases:
+                raise ValueError("customer request references an unknown order-line alias")
+            intents.append(CustomerRequestIntent(
+                goal_id=request.goal_id, line_id=aliases[request.line_alias], action=request.action,
+                quantity=request.quantity, required_attributes=request.required_attributes,
+                maximum_extra_charge_cents=request.maximum_extra_charge_cents,
+                latest_arrival_within_days=request.latest_arrival_within_days, reference=request.reference))
+        intents = tuple(intents)
+        try:
+            outcomes = derive_outcomes(build.world, aliases[draft.customer_alias], intents,
+                return_receipt_event_configured=capabilities.return_receipt_event_configured,
+                sequential=draft.sequential)
+        except OutcomeUnsupported as exc:
+            raise TaskCapabilityUnsupported(exc.code, str(exc)) from exc
+        request_by_id = {row.goal_id: row for row in draft.requests}
+        remedies, cancellations, refusals = [], [], []
+        for goal in outcomes:
+            request = request_by_id[goal.goal_id]
+            if isinstance(goal, RemedyGoal):
+                remedies.append(RemedyDraft(goal_id=goal.goal_id, line_alias=request.line_alias,
+                    quantity=request.quantity, allowed_remedies=(request.action,),
+                    required_attributes=request.required_attributes,
+                    maximum_extra_charge_cents=request.maximum_extra_charge_cents,
+                    latest_arrival_within_days=request.latest_arrival_within_days))
+            elif isinstance(goal, OrderCancellationGoal):
+                cancellations.append(CancellationDraft(goal_id=goal.goal_id, line_alias=request.line_alias))
+            else:
+                refusals.append(RefusalDraft(goal_id=goal.goal_id, line_alias=request.line_alias,
+                    reason_code=goal.reason_code, requested_action=request.action,
+                    maximum_extra_charge_cents=request.maximum_extra_charge_cents))
+        v4 = len({row.line_id for row in intents}) < len(intents)
+        compiled = compile_task(TaskDraft(task_id=draft.task_id, customer_alias=draft.customer_alias,
+            remedy_goals=tuple(remedies), cancellation_goals=tuple(cancellations),
+            refusal_goals=tuple(refusals), parent_training_evidence_hashes=draft.parent_training_evidence_hashes),
+            spec, build, distribution, allowed_training_hashes, capabilities=capabilities,
+            _skip_legacy_uniqueness=True, _use_v4=v4)
+        if draft.sequential:
+            expected_order = [goal.goal_id for goal in outcomes if not isinstance(goal, RefusalGoal)]
+            proof_order = [goal.goal_id for goal in compiled.remedy_goals + compiled.cancellation_goals]
+            if expected_order != proof_order:
+                raise TaskCapabilityUnsupported('UNSUPPORTED_OUTCOME:ORDERED_ACTION_ORDER',
+                                                'native witness cannot preserve this action order')
+        text = render_customer_request_v2(build.world, compiled.customer_id, intents, draft.style_seed, draft.sequential)
+        bundle = CustomerRequestBundle(customer_id=compiled.customer_id,
+            goal_ids=compiled.request_bundle.goal_ids, renderer_version="commerce-request-renderer-v2",
+            intent_hash=compiled.request_bundle.intent_hash, request_hash=digest(text),
+            requests=intents, style_seed=draft.style_seed, sequential=draft.sequential)
+        data = compiled.model_dump(mode="json", exclude={"record_hash"})
+        data.update(customer_request=text, request_bundle=bundle.model_dump(mode="json"))
+        task_type = TaskSpecV4 if v4 else TaskSpecV3
+        task = check_task_scope(build.world, task_type.model_validate(data))
+        from .task_certification import CustomerScenario, certify_task
+        from .tasks import delegated_line_ids
+        declined_lines = tuple(sorted({line for goal in task.refusal_goals if goal.reason_code == 'CUSTOMER_DECLINED'
+                                       for line in goal.line_ids}))
+        mixed_decline = bool(declined_lines and (task.remedy_goals or task.cancellation_goals))
+        scenario = CustomerScenario(customer_id=task.customer_id,
+            delegated_line_ids=tuple(sorted(set(delegated_line_ids(task)))),
+            accepted_remedies=tuple(sorted({row.action for row in intents if row.action != 'cancel'})),
+            maximum_extra_charge_cents=max((row.maximum_extra_charge_cents
+                if row.maximum_extra_charge_cents is not None else 10**18 for row in intents), default=0),
+            latest_arrival=None,
+            return_received_after_days=0 if capabilities.return_receipt_event_configured else None,
+            accepts_proposals=not declined_lines or mixed_decline,
+            decline_line_ids=declined_lines if mixed_decline else ())
+        if task.refusal_goals:
+            from .refusal_certification import certify_refusal
+            certificate = certify_refusal(build.world, task, scenario)
+            certified = certificate.full_task_reachability_certified
+            execution = certificate.execution_certificate
+            conflict = bool(execution and execution.status == 'UNSAT' and execution.search_complete)
+        else:
+            certificate = certify_task(build.world, task, scenario)
+            certified = certificate.status == "CERTIFIED" and certificate.business_reachability_certified
+            conflict = certificate.status == 'UNSAT' and certificate.search_complete
+        if not certified:
+            code = 'GOALS_CONFLICT' if conflict else 'TASK_CERTIFICATION_INCOMPLETE'
+            raise TaskCapabilityUnsupported(code, "derived goals could not be jointly certified")
+        return task
     if draft.information_goals and not capabilities.information_goals_certifiable:
         raise TaskCapabilityUnsupported("INFORMATION_CERTIFIER_UNAVAILABLE",
             "information goals require an explicitly enabled natural-runtime interaction certification capability"
@@ -271,12 +395,18 @@ def compile_task(draft: TaskDraft, spec: ScenarioSpec, build: BuildResult,
         original_sku = build.world.skus[line.sku_id]
         if row.quantity > line.quantity:
             raise ValueError("TaskDraft quantity exceeds the purchased line quantity")
-        if (original_sku.return_required and not capabilities.return_receipt_event_configured):
+        already_received = any(case.line_id == line.id and len(case.unit_indices) == row.quantity
+            and any(ret.case_id == case.id and ret.status == 'received' for ret in build.world.returns.values())
+            for case in build.world.cases.values())
+        if (original_sku.return_required and not already_received and not capabilities.return_receipt_event_configured):
             raise TaskCapabilityUnsupported(
                 "RETURN_RECEIPT_UNAVAILABLE",
                 "this task requires a return-receipt event that is not configured for certification")
         if "refund" in row.allowed_remedies:
-            credit = unit_credit(line, tuple(range(row.quantity)))
+            from .task_certification import _available_goal_units
+            probe = RemedyGoal(goal_id=row.goal_id, line_id=line.id, quantity=row.quantity,
+                               allowed_remedies=row.allowed_remedies)
+            credit = unit_credit(line, _available_goal_units(build.world, probe)[:row.quantity])
             merchant_id = build.world.orders[line.order_id].merchant_id
             approval_limit = build.world.merchants[merchant_id].refund_approval_limit_cents
             if credit > approval_limit and not capabilities.policy_review_event_configured:
@@ -334,11 +464,11 @@ def compile_task(draft: TaskDraft, spec: ScenarioSpec, build: BuildResult,
                    if world.orders[line.order_id].customer_id == customer_id]
     line_targets = [goal.line_id for goal in remedies]
     line_targets += [line_id for goal in refusals if goal.requested_action != 'cancel' for line_id in goal.line_ids]
-    for line_id in line_targets:
+    for line_id in (() if _skip_legacy_uniqueness else line_targets):
         description = _line_description(world, line_id)
         if sum(_line_description(world, line.id) == description for line in owned_lines) != 1:
             raise TaskCapabilityUnsupported("AMBIGUOUS_TARGET", "public line description is not unique")
-    for goal in cancellations + tuple(goal for goal in refusals if goal.requested_action == 'cancel'):
+    for goal in (() if _skip_legacy_uniqueness else cancellations + tuple(goal for goal in refusals if goal.requested_action == 'cancel')):
         descriptions = sorted(_line_description(world, line_id) for line_id in goal.line_ids)
         matching_orders = 0
         for order in world.orders.values():
@@ -354,7 +484,8 @@ def compile_task(draft: TaskDraft, spec: ScenarioSpec, build: BuildResult,
         goal_ids=tuple(row.goal_id for row in remedies + cancellations + refusals + information),
         intent_hash=request_intent_hash(customer_id, remedies, information, cancellations, refusals),
         request_hash=digest(customer_request))
-    task = TaskSpecV3(
+    task_type = TaskSpecV4 if _use_v4 else TaskSpecV3
+    task = task_type(
         task_id=draft.task_id, world_hash=build.world_hash, customer_id=aliases[draft.customer_alias],
         customer_request=customer_request, remedy_goals=remedies,
         information_goals=information, cancellation_goals=cancellations, refusal_goals=refusals,

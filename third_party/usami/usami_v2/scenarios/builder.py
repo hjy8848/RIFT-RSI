@@ -11,7 +11,8 @@ from usami_v2.commerce.models import (
     Customer, DeliveryRoute, Evidence, Inventory, Merchant, Order, OrderLine, SKU, Warehouse, World,
 )
 from .schema import BuildBudget, ScenarioSpec
-from .solver import assignments, expression_value, impossible_by_interval, relation_satisfied, variable_ranges
+from .solver import (PropagationSearch, assignments, expression_value, impossible_by_interval,
+                     relation_satisfied, variable_ranges)
 
 
 class ConstraintProof(Sealed):
@@ -119,7 +120,9 @@ def _construct(spec, seed, values):
             paid_cents=sum(lines[aliases[row.alias]].allocated_paid_cents for row in order.lines),
             payment_channel="original-card",
             delivered_at=clock - offset if order.fulfillment_status == "delivered" else clock + offset,
-            fulfillment_status=order.fulfillment_status)
+            fulfillment_status=order.fulfillment_status,
+            ordered_at=(clock - timedelta(days=order.ordered_days_ago)
+                        if order.ordered_days_ago is not None else None))
     return World(
         seed=seed, clock=clock,
         customers={aliases[name]: Customer(id=aliases[name], name="Customer " + str(index + 1))
@@ -140,16 +143,33 @@ def build_world(spec: ScenarioSpec, seed: int, budget: Optional[BuildBudget] = N
     ranges = variable_ranges(spec)
     impossible = [row.constraint_id for row in spec.constraints if impossible_by_interval(row, ranges)]
     if impossible:
+        reason = "interval contradiction:" + ",".join(impossible)
+        if budget.strategy == 'propagate':
+            reason += '; rejected constraints: ' + ', '.join(f'{key}=1' for key in sorted(impossible)[:3])
         return BuildResult(status="UNSAT", scenario_hash=spec.record_hash, seed=seed, budget=budget,
-                           reason="interval contradiction:" + ",".join(impossible))
+                           reason=reason)
     trace = []
+    history_failure = None
     complete = False
-    for node, (values, complete) in enumerate(assignments(ranges, seed, budget.max_nodes)):
+    search = (PropagationSearch(ranges, spec.constraints, budget.max_nodes)
+              if budget.strategy == "propagate" else None)
+    candidates = (((values, False) for values in search) if search is not None
+                  else assignments(ranges, seed, budget.max_nodes))
+    for node, (values, complete) in enumerate(candidates):
         rejected = tuple(row.constraint_id for row in spec.constraints if not relation_satisfied(row, values))
         if rejected:
             trace.append(BuildAttempt(node=node, assignment_hash=_assignment_hash(values), rejected_constraints=rejected))
             continue
         world, aliases = _construct(spec, seed, values)
+        if spec.history:
+            from .history import HistoryStepFailed, apply_history
+            try:
+                world = apply_history(world, dict(aliases), spec.history)
+            except HistoryStepFailed as exc:
+                history_failure = str(exc)
+                trace.append(BuildAttempt(node=node, assignment_hash=_assignment_hash(values),
+                                          rejected_constraints=(), world_invariant_errors=(history_failure,)))
+                continue
         errors = invariants(world)
         trace.append(BuildAttempt(node=node, assignment_hash=_assignment_hash(values), rejected_constraints=(),
                                   world_invariant_errors=tuple(row["code"] for row in errors)))
@@ -168,9 +188,19 @@ def build_world(spec: ScenarioSpec, seed: int, budget: Optional[BuildBudget] = N
         # An implementation defect is an error, not a fabricated SAT or UNSAT.
         verify_world_constraints(spec, result)
         return result
+    if search is not None:
+        complete = not search.exhausted
+        reason = "complete propagated search found no world" if complete else "construction node budget exhausted"
+        if search.rejections:
+            counts = sorted(search.rejections.items(), key=lambda item: (-item[1], item[0]))[:3]
+            reason += "; rejected constraints: " + ", ".join(f"{key}={count}" for key, count in counts)
+    else:
+        reason = "complete finite enumeration found no world" if complete else "construction node budget exhausted"
+    if history_failure:
+        reason += '; ' + history_failure
     return BuildResult(status="UNSAT" if complete else "UNKNOWN",
                        scenario_hash=spec.record_hash, seed=seed, budget=budget,
-                       reason="complete finite enumeration found no world" if complete else "construction node budget exhausted",
+                       reason=reason,
                        attempts=tuple(trace))
 
 

@@ -79,13 +79,28 @@ class CustomerProfileV3(CustomerProfile):
     protocol: Literal["commerce-customer-profile-v3"] = "commerce-customer-profile-v3"
     intent_bundle_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     accepts_proposals: bool = True
+    decline_line_ids: Tuple[str, ...] = ()
+    decline_references: Dict[str, str] = Field(default_factory=dict)
+    request_references: Dict[str, str] = Field(default_factory=dict)
 
     @model_serializer(mode='wrap')
     def _compatible_dump(self, handler):
-        return omit_default_fields(handler(self), self, ('accepts_proposals',))
+        return omit_default_fields(handler(self), self, ('accepts_proposals', 'decline_line_ids', 'decline_references', 'request_references'))
+
+    @model_validator(mode='after')
+    def valid_decline_scope(self):
+        if (len(set(self.decline_line_ids)) != len(self.decline_line_ids)
+                or not set(self.decline_line_ids).issubset(self.delegated_line_ids)
+                or set(self.decline_references) != set(self.decline_line_ids)
+                or not set(self.request_references).issubset(self.delegated_line_ids)
+                or not set(self.decline_line_ids).issubset(self.request_references)
+                or any(not value.strip() for value in self.decline_references.values())):
+            raise ValueError('decline references must identify exactly the delegated decline lines')
+        return self
 
 
-def bind_customer_profile(profile: CustomerProfile, task: TaskSpecV3, *, accepts_proposals=True):
+def bind_customer_profile(profile: CustomerProfile, task: TaskSpecV3, *, accepts_proposals=True,
+                          decline_line_ids=(), decline_references=None, request_references=None):
     """Bind an existing fixed Customer policy to the compiler-issued task intent."""
     profile, task = profile.checked(), task.checked()
     if profile.customer_id != task.customer_id:
@@ -101,7 +116,9 @@ def bind_customer_profile(profile: CustomerProfile, task: TaskSpecV3, *, accepts
         disclose_fact_ids=profile.disclose_fact_ids, private_facts=profile.private_facts,
         delegation_lifetime_hours=profile.delegation_lifetime_hours,
         consent_lifetime_hours=profile.consent_lifetime_hours,
-        intent_bundle_hash=task.request_bundle.record_hash, accepts_proposals=accepts_proposals)
+        intent_bundle_hash=task.request_bundle.record_hash, accepts_proposals=accepts_proposals,
+        decline_line_ids=tuple(decline_line_ids), decline_references=decline_references or {},
+        request_references=request_references or {})
 
 
 class HumanCustomerProfileV2(CustomerProfileV2):
@@ -142,10 +159,11 @@ class CustomerDecision(Sealed):
     disclose_fact_ids: Tuple[str, ...] = ()
     finish: bool = False
     declines_proposal: bool = False
+    declined_line_id: Optional[str] = None
 
     @model_serializer(mode='wrap')
     def _compatible_dump(self, handler):
-        return omit_default_fields(handler(self), self, ('declines_proposal',))
+        return omit_default_fields(handler(self), self, ('declines_proposal', 'declined_line_id'))
 
     @model_validator(mode="after")
     def coherent_decision(self):
@@ -153,6 +171,8 @@ class CustomerDecision(Sealed):
             raise ValueError("a Customer cannot accept and reject offers in one turn")
         if self.declines_proposal and self.accept_quote_id:
             raise ValueError('a Customer cannot decline and accept the same proposal')
+        if self.declined_line_id is not None and not self.declines_proposal:
+            raise ValueError('a declined line requires a decline decision')
         if self.accept_quote_id is None and self.accept_operation is not None:
             raise ValueError("consent operation requires an accepted quote")
         if self.accept_quote_id is not None and self.accept_operation is None:
@@ -277,12 +297,30 @@ class CustomerRuntime:
             expected_lines = delegated_line_ids(self.task)
             if self.profile.customer_id != self.task.customer_id or self.profile.delegated_line_ids != expected_lines:
                 raise ValueError("Customer profile scope differs from structured task intent")
+            if self.profile.decline_line_ids:
+                if self.task.request_bundle.renderer_version != 'commerce-request-renderer-v2':
+                    raise ValueError('scoped Customer declines require v2 request intent')
+                expected_declines = {line for goal in self.task.refusal_goals if goal.reason_code == 'CUSTOMER_DECLINED'
+                                     for line in goal.line_ids}
+                if set(self.profile.decline_line_ids) != expected_declines:
+                    raise ValueError('Customer decline scope differs from certified requests')
 
     def initialize(self, world: World, public_request: str, *, event_index: int = 0) -> CustomerTransition:
         if not public_request.strip():
             raise ValueError("the public Customer request is required")
         if self.profile.customer_id not in world.customers:
             raise ValueError("fixed Customer identity is absent from the frozen world")
+        if getattr(self.profile, 'decline_line_ids', ()):
+            from usami_v2.scenarios.tasks import _referenced_line_description
+            intents = {row.line_id: row for row in self.task.request_bundle.requests}
+            expected = {line: _referenced_line_description(world, line, intents[line].reference)
+                        for line in self.profile.decline_line_ids}
+            if self.profile.decline_references != expected:
+                raise ValueError('Customer decline descriptions differ from the public request')
+            all_references = {line: _referenced_line_description(world, line, intent.reference)
+                              for line, intent in intents.items()}
+            if self.profile.request_references != all_references:
+                raise ValueError('Customer request descriptions differ from the public request')
         owned_orders = {row.id for row in world.orders.values()
                         if row.customer_id == self.profile.customer_id}
         owned_subjects = {self.profile.customer_id, *owned_orders}
@@ -352,8 +390,18 @@ class CustomerRuntime:
         decision, profile = decision.checked(), self.profile
         if not getattr(profile, 'accepts_proposals', True) and decision.accept_quote_id:
             raise ValueError('Customer profile does not accept proposals')
-        if decision.declines_proposal and getattr(profile, 'accepts_proposals', True):
+        scoped_declines = getattr(profile, 'decline_line_ids', ())
+        if decision.declined_line_id is not None and not scoped_declines:
+            raise ValueError('Customer profile does not declare a scoped decline')
+        if decision.declines_proposal and scoped_declines:
+            if decision.declined_line_id not in scoped_declines:
+                raise ValueError('Customer decline must identify a configured request line')
+        elif decision.declines_proposal and getattr(profile, 'accepts_proposals', True):
             raise ValueError('Customer profile does not declare proposal refusal')
+        if decision.accept_quote_id and scoped_declines:
+            quote = world.quotes.get(decision.accept_quote_id)
+            if quote is not None and world.cases[quote.case_id].line_id in scoped_declines:
+                raise ValueError('Customer cannot accept an offer for a declined request')
         if decision.delegate_line_ids and not set(decision.delegate_line_ids).issubset(profile.delegated_line_ids):
             raise ValueError("Customer attempted to delegate a line outside its private profile")
         if decision.allowed_preparations and not set(decision.allowed_preparations).issubset(profile.allowed_preparations):

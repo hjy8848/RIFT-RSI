@@ -83,6 +83,7 @@ class AbstractChallenge(TaskDraft):
         targets.update(row.subject_alias for row in self.information_goals)
         targets.update(row.line_alias for row in self.cancellation_goals)
         targets.update(row.line_alias for row in self.refusal_goals)
+        targets.update(row.line_alias for row in self.requests)
         if targets != names:
             raise ValueError("every goal must target a declared selector and every selector needs a goal")
         if any(row.left not in names or row.right not in names or row.left == row.right
@@ -173,6 +174,9 @@ def ground_challenge(challenge, worlds, budget=None):
                 for goal in data.get("refusal_goals", ()):
                     goal.pop("record_hash", None)
                     goal["line_alias"] = binding[goal["line_alias"]]
+                for request in data.get("requests", ()):
+                    request.pop("record_hash", None)
+                    request["line_alias"] = binding[request["line_alias"]]
                 draft = TaskDraft.model_validate(data)
                 candidates.append(GroundedCandidate(world_ref=world_ref, world_hash=build.world_hash,
                     customer_alias=customer, line_binding=tuple(sorted(binding.items())), draft=draft))
