@@ -73,6 +73,21 @@ def _forward_worker_environment(runtime_env, keys, environ=None):
     return runtime_env
 
 
+def _forward_cuda_worker_environment(runtime_env, environ=None):
+    """CUDA workers also inherit the launcher's NCCL settings.
+
+    A host can advertise GPU peer-to-peer and then hang on the first collective (zju-47's
+    A6000s do); the launcher then sets ``NCCL_P2P_DISABLE=1`` and every worker must see it.
+    """
+    source = os.environ if environ is None else environ
+    _forward_worker_environment(runtime_env, CUDA_WORKER_ENV_KEYS, source)
+    worker_env = runtime_env.setdefault("env_vars", {})
+    for key, value in source.items():
+        if key.startswith("NCCL_") and value:
+            worker_env[key] = value
+    return runtime_env
+
+
 def _forward_ascend_worker_environment(runtime_env, environ=None):
     """Pass the sourced CANN library paths into Ray and vLLM child workers."""
     source = os.environ if environ is None else environ
@@ -449,7 +464,7 @@ def _start_ray(config, run_root, *, worker_manifest_path=None, checkpoint=None):
         _forward_ascend_worker_environment(runtime_env)
         _require_cann_atb_library()
     else:
-        _forward_worker_environment(runtime_env, CUDA_WORKER_ENV_KEYS)
+        _forward_cuda_worker_environment(runtime_env)
     if worker_manifest_path is not None:
         from dataclasses import asdict
         runtime_env["env_vars"]["RIFT_ASCEND910B3_RUN_MANIFEST"] = str(

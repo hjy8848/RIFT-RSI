@@ -42,6 +42,8 @@ def test_worker_environment_forwarding_is_explicit():
            'SECRET_TOKEN': 'x', 'LD_LIBRARY_PATH': ''}
     cuda = runtime._forward_worker_environment({}, runtime.CUDA_WORKER_ENV_KEYS, env)['env_vars']
     assert cuda == {'PATH': '/bin', 'PYTHONPATH': '/src'}              # nothing else leaks, empty values dropped
+    nccl = runtime._forward_cuda_worker_environment({}, {**env, 'NCCL_P2P_DISABLE': '1', 'NCCL_DEBUG': ''})
+    assert nccl['env_vars'] == {'PATH': '/bin', 'PYTHONPATH': '/src', 'NCCL_P2P_DISABLE': '1'}
     ascend = runtime._forward_ascend_worker_environment({}, env)['env_vars']
     assert ascend == {'PATH': '/bin', 'PYTHONPATH': '/src', 'ASCEND_HOME_PATH': '/cann', 'ATB_HOME_PATH': '/atb'}
 
