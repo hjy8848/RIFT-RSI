@@ -229,6 +229,37 @@ class TrainRehearsal(unittest.TestCase):
                 run.collect_failures(context, specs=specs, groups=1, seed=1, max_cases=2,
                                      init_from_run=source, from_run=source)
 
+    def test_stage1_can_drop_tasks_the_service_cannot_resolve(self):
+        from rift.designer.stage0 import dry_run_generate, run as stage0
+        with tempfile.TemporaryDirectory() as plans_root, tempfile.TemporaryDirectory() as root:
+            stage0(run.WorldKit(plans_root), lambda prompts: dry_run_generate(prompts, seed=51), [],
+                   samples=8, seed=51, out_dir=plans_root, signatures=False)
+            self._initial(root)
+            FakeRuntime.opened = []
+            context = run.ExperimentContext(root=root, service_model='m', verl_config_dir='.',
+                episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6),
+                runtime_factory=lambda checkpoint: FakeRuntime(context, checkpoint), persist_every=0)
+            context._worker_manifest = lambda checkpoint: None
+            collector = self._collector(context, skilled=False)
+            seen = []
+            def spy(loaded, index):
+                inner = collector(loaded, index)
+                class Spy:
+                    def collect(self, package, checkpoint):
+                        seen.extend(group.task_ref for group in package.task_groups)
+                        return inner.collect(package, checkpoint)
+                return Spy()
+            result = run.train_pool(context,
+                train_specs=[{'generator': 'F1', 'instances': 6, 'seed': 300, 'balanced': True},
+                             {'generator': 'F1', 'instances': 3, 'seed': 400, 'near_distractors': 2}],
+                rounds=2, tasks_per_round=4, seed=3, designer_plans=Path(plans_root) / 'designer-plans.jsonl',
+                mix_fraction=0.25, drop_references=('delivery_age',), collector_factory=spy)
+            self.assertTrue(seen)
+            self.assertFalse(any(run.uses_reference(context, ref, {'delivery_age'}) for ref in seen))
+            # the near-miss class is told apart only by delivery age, so none of it can be trained on
+            self.assertEqual(result['pool']['gen:F1:{"near_distractors":2}'], {'kept': 0, 'dropped': 3})
+            self.assertEqual(result['pool']['designer']['kept'] + result['pool']['designer']['dropped'], 8)
+
     def test_eval_reports_designer_tasks_as_their_own_class(self):
         from rift.designer.stage0 import dry_run_generate, run as stage0
         with tempfile.TemporaryDirectory() as plans_root, tempfile.TemporaryDirectory() as root:

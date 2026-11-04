@@ -158,6 +158,24 @@ def test_stage0_with_focus_selects_and_can_reload_only_the_selection(tmp_path):
         certify_saved_plans(WorldKit(tmp_path / 'c'), tmp_path / 'old.jsonl', selected_only=True)
 
 
+def test_merge_selects_across_files_and_keeps_copies_on_request(tmp_path):
+    from rift.designer.merge import merge_plans
+    for name, seed in (('a', 61), ('b', 62)):
+        run(WorldKit(tmp_path / name), lambda prompts, s=seed: dry_run_generate(prompts, seed=s), [],
+            samples=5, seed=seed, out_dir=tmp_path / name)
+    inputs = [tmp_path / 'a' / 'designer-plans.jsonl', tmp_path / 'b' / 'designer-plans.jsonl']
+    report = merge_plans(inputs, tmp_path / 'm' / 'designer-plans.jsonl', copy_threshold=1.01)
+    assert report['input_plans'] == 10 and report['plans_kept'] == 10
+    assert 0 < report['selected_tasks'] <= report['certified_tasks']
+    merged = [json.loads(line) for line in (tmp_path / 'm' / 'designer-plans.jsonl').read_text().splitlines()]
+    signatures = [sig for row in merged for sig, keep in zip(row['signatures'], row['selected']) if keep]
+    assert len(signatures) == len(set(signatures))                      # distinct over BOTH files
+    refs = certify_saved_plans(WorldKit(tmp_path / 'check'), tmp_path / 'm' / 'designer-plans.jsonl', selected_only=True)
+    assert len(refs) == report['selected_tasks']
+    with pytest.raises(ValueError, match='two input files'):
+        merge_plans([inputs[0], inputs[0]], tmp_path / 'x.jsonl')
+
+
 def test_balanced_seeds_split_answers_evenly():
     seeds = balanced_seeds('F5', 6, 100)
     answers = [task_outcome(generate_instance('F5', seed).task) for seed in seeds]

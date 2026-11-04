@@ -633,6 +633,13 @@ def _pool_stats(request, groups):
                              sum(t.informative for t in tasks) / len(tasks), len(tasks), len(groups))
 
 
+def uses_reference(context, task_ref, kinds):
+    """Whether a certified task names an item in one of the ``kinds`` of reference (for example delivery_age)."""
+    task = context.world.task_registry.resolve_record(task_ref).task
+    requests = getattr(getattr(task, 'request_bundle', None), 'requests', ())
+    return any(getattr(request, 'reference', 'attributes') in kinds for request in requests)
+
+
 def designer_round(rng, designer_refs, mix_pairs, tasks_per_round, mix_fraction):
     """One stage-1 round: Designer tasks plus a fixed share of balanced generator tasks.
 
@@ -648,7 +655,7 @@ def designer_round(rng, designer_refs, mix_pairs, tasks_per_round, mix_fraction)
 def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from_run=None,
                collector_factory=None, policy=None, heldout_specs=None, heldout_groups=4,
                heldout_seed=2000, heldout_label='x2base', designer_plans=None, mix_fraction=0.25,
-               designer_selected_only=False):
+               designer_selected_only=False, drop_references=()):
     """Plain GRPO on a fixed pool of certified tasks.
 
     Without ``policy`` each round is a balanced sample of every class (X2). With one of the
@@ -682,6 +689,30 @@ def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from
             raise ValueError('a mix fraction needs balanced generator --train-specs to mix in')
     else:
         by_key = context.world.certify_specs(train_specs)
+    pool = {}
+    if drop_references:
+        # Tasks naming an item in a way the Service cannot resolve from public information
+        # (delivery_age: it never sees today's date) are noise, not signal, so they are not trained on.
+        kinds = set(drop_references)
+        if designer_refs is not None:
+            kept = [ref for ref in designer_refs if not uses_reference(context, ref, kinds)]
+            pool['designer'] = {'kept': len(kept), 'dropped': len(designer_refs) - len(kept)}
+            designer_refs = kept
+            if not designer_refs:
+                raise ValueError('no Designer task is left after dropping %s' % sorted(kinds))
+        for key in list(by_key):
+            kept = [ref for ref in by_key[key] if not uses_reference(context, ref, kinds)]
+            pool[key] = {'kept': len(kept), 'dropped': len(by_key[key]) - len(kept)}
+            if kept:
+                by_key[key] = kept
+            else:
+                del by_key[key]
+        if designer_refs is not None:
+            mix_pairs = [(key, ref) for key in sorted(by_key) for ref in by_key[key]]
+            if mix_fraction and not mix_pairs:
+                raise ValueError('no generator task is left to mix in after dropping %s' % sorted(kinds))
+        elif not by_key:
+            raise ValueError('no task is left after dropping %s' % sorted(kinds))
     heldout = context.world.certify_specs(heldout_specs) if heldout_specs else None
     context.world.save()
     keys = sorted(by_key)
@@ -747,7 +778,7 @@ def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from
         'checkpoint': asdict(checkpoint), 'manifest': str(manifest.resolve()), 'rounds': rounds,
         'in_memory_only': checkpoint in context.checkpoint_store.virtual}, sort_keys=True), encoding='utf-8')
     result = {'status': 'pool_training_completed', 'rounds': rounds, 'final_checkpoint': asdict(checkpoint),
-              'history': history, 'run_root': str(context.root)}
+              'history': history, 'run_root': str(context.root), 'pool': pool}
     if report is not None:
         result['heldout'] = {'status': 'evaluation_completed', 'label': heldout_label, 'seed': heldout_seed,
                              'groups_per_task': heldout_groups, 'group_size': context.group_size,
@@ -930,6 +961,9 @@ def main(argv=None):
     pool_parser.add_argument('--designer-plans', help='stage-0 designer-plans.jsonl: train on its certified tasks')
     pool_parser.add_argument('--designer-selected-only', action='store_true',
         help='with --designer-plans: only the tasks stage 0 selected (not copied, distinct signature)')
+    pool_parser.add_argument('--drop-references', default='',
+        help='comma-separated reference kinds to leave out of the training pool, e.g. delivery_age '
+             '(the Service cannot see today\'s date, so those tasks cannot be resolved)')
     pool_parser.add_argument('--mix-fraction', type=float, default=0.25,
         help='with --designer-plans: share of each round drawn from --train-specs')
     pool_parser.add_argument('--rounds', type=int, required=True)
@@ -1011,7 +1045,8 @@ def main(argv=None):
             init_from_run=args.init_from_run, policy=policy,
             heldout_specs=load_json_argument(args.heldout_specs) if args.heldout_specs else None,
             heldout_groups=args.heldout_groups, designer_plans=args.designer_plans,
-            mix_fraction=args.mix_fraction, designer_selected_only=args.designer_selected_only)
+            mix_fraction=args.mix_fraction, designer_selected_only=args.designer_selected_only,
+            drop_references=tuple(item for item in args.drop_references.split(',') if item))
         if 'heldout' in result:
             (context.root / 'eval-result.json').write_text(
                 json.dumps(result['heldout'], sort_keys=True, indent=2), encoding='utf-8')
