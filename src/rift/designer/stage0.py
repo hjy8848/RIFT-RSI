@@ -81,10 +81,11 @@ def summarize(rows):
 
 
 def vllm_generate(model, messages_list, *, seed, temperature=1.0, max_tokens=4096, tensor_parallel_size=1,
-                  constrained=True):
+                  constrained=True, enforce_eager=False, gpu_memory_utilization=0.9):
     """Generate one Designer response per prompt with vLLM, constrained to the plan schema."""
     from vllm import LLM, SamplingParams
-    llm = LLM(model=str(model), tensor_parallel_size=tensor_parallel_size, seed=seed)
+    llm = LLM(model=str(model), tensor_parallel_size=tensor_parallel_size, seed=seed,
+              enforce_eager=enforce_eager, gpu_memory_utilization=gpu_memory_utilization)
     tokenizer = llm.get_tokenizer()
     prompts = [tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
                                              enable_thinking=False) for messages in messages_list]
@@ -177,6 +178,10 @@ def main(argv=None):
     parser.add_argument('--max-tokens', type=int, default=4096)
     parser.add_argument('--tensor-parallel-size', type=int, default=1)
     parser.add_argument('--unconstrained', action='store_true', help='do not constrain decoding to the schema')
+    parser.add_argument('--enforce-eager', action='store_true',
+        help='skip torch.compile and cudagraph capture: faster start-up, the verified GPU path')
+    parser.add_argument('--gpu-memory-utilization', type=float, default=0.9,
+        help='share of each GPU vLLM may take (lower it on a shared machine)')
     parser.add_argument('--patience-slack', type=int)
     parser.add_argument('--no-signatures', action='store_true')
     parser.add_argument('--dry-run', action='store_true', help='use generator examples instead of a model')
@@ -187,7 +192,8 @@ def main(argv=None):
     elif args.designer_model:
         generate = lambda prompts: vllm_generate(args.designer_model, prompts, seed=args.seed,
             temperature=args.temperature, max_tokens=args.max_tokens,
-            tensor_parallel_size=args.tensor_parallel_size, constrained=not args.unconstrained)
+            tensor_parallel_size=args.tensor_parallel_size, constrained=not args.unconstrained,
+            enforce_eager=args.enforce_eager, gpu_memory_utilization=args.gpu_memory_utilization)
     else:
         parser.error('--designer-model is required unless --dry-run')
     kit = WorldKit(args.run_root, patience_slack=args.patience_slack)
