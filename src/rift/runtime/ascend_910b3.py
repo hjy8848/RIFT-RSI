@@ -3,6 +3,11 @@
 This module follows VERL's PPO worker setup using its public Ray, worker,
 LLMServerManager, AgentLoopManager, and CheckpointEngineManager APIs. It is
 specific to the 8x 910B3 deployment; it is not a second runtime framework.
+
+The same construction runs on CUDA GPUs when ``RIFT_PLATFORM=cuda`` (see
+``rift.hardware``): the device name, rank count, Ray resource map and vLLM
+tensor parallelism come from the platform, and every Ascend-only step (torch_npu,
+CANN environment, ATB library) is skipped. The Ascend path is unchanged.
 """
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ import threading
 import time
 
 
-WORLD_SIZE = 8
+WORLD_SIZE = 8   # the Ascend host; other platforms take their rank count from rift.hardware
 VERL_COMMIT = "1876b06d0a3e4e71e06230be10af14492ca8a75b"
 RAY_AF_UNIX_PATH_LIMIT = 107
 ASCEND_WORKER_ENV_KEYS = (
@@ -31,14 +36,48 @@ ASCEND_WORKER_ENV_KEYS = (
 )
 
 
-def _forward_ascend_worker_environment(runtime_env, environ=None):
-    """Pass the sourced CANN library paths into Ray and vLLM child workers."""
+CUDA_WORKER_ENV_KEYS = ("PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "HF_HOME", "HF_HUB_OFFLINE",
+                        "TRANSFORMERS_OFFLINE", "VLLM_CACHE_ROOT", "TORCHINDUCTOR_CACHE_DIR")
+
+
+def _world_size():
+    """Ranks of the platform this process runs on (8 on the Ascend host)."""
+    from rift import hardware
+    return hardware.current().world_size
+
+
+def _rollout_tensor_parallel_size(world_size):
+    """vLLM tensor parallelism: all ranks on Ascend; one GPU per replica unless overridden.
+
+    Qwen3-4B has 8 KV heads, so only 1, 2, 4 or 8 divide it, and a 4B model fits one
+    GPU; replicas then use every rank whatever the (often odd) number of free GPUs.
+    """
+    from rift import hardware
+    if hardware.current().name == "ascend":
+        return world_size
+    forced = os.environ.get("RIFT_ROLLOUT_TP")
+    size = int(forced) if forced else 1
+    if size not in (1, 2, 4, 8) or world_size % size:
+        raise ValueError(f"rollout tensor parallelism {size} must be 1, 2, 4 or 8 and divide {world_size} ranks")
+    return size
+
+
+def _forward_worker_environment(runtime_env, keys, environ=None):
+    """Pass the launcher's library and import paths into Ray and vLLM child workers."""
     source = os.environ if environ is None else environ
     worker_env = runtime_env.setdefault("env_vars", {})
-    for key in ASCEND_WORKER_ENV_KEYS:
+    for key in keys:
         value = source.get(key)
         if value:
             worker_env[key] = value
+    return runtime_env
+
+
+def _forward_ascend_worker_environment(runtime_env, environ=None):
+    """Pass the sourced CANN library paths into Ray and vLLM child workers."""
+    source = os.environ if environ is None else environ
+    _forward_worker_environment(runtime_env, ASCEND_WORKER_ENV_KEYS, source)
+    worker_env = runtime_env.setdefault("env_vars", {})
     for key, value in source.items():
         if key.startswith(("ATB_", "LCCL_")) and value:
             worker_env[key] = value
@@ -144,7 +183,11 @@ from rift.hardware import CHAT_TEMPLATE_KWARGS  # noqa: E402,F401 - platform-neu
 def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
                  group_size=4, prompt_length=4096, response_length=8192, learning_rate=1.0e-6):
     """Compose the installed VERL v0.9.1 defaults and apply the RIFT target config."""
-    import torch_npu  # noqa: F401 - load CANN platform support before VERL config inspection.
+    from rift import hardware
+    platform = hardware.current()
+    world_size = platform.world_size
+    if platform.name == "ascend":
+        import torch_npu  # noqa: F401 - load CANN platform support before VERL config inspection.
     import verl
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
@@ -160,7 +203,7 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.actor.strategy = "fsdp2"
     config.actor_rollout_ref.actor.fsdp_config.model_dtype = "bfloat16"
     config.actor_rollout_ref.actor.use_kl_loss = False
-    config.actor_rollout_ref.actor.ppo_mini_batch_size = WORLD_SIZE
+    config.actor_rollout_ref.actor.ppo_mini_batch_size = world_size
     config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu = 1
     max_sequence_length = prompt_length + response_length
     config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu = max_sequence_length
@@ -177,14 +220,15 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.actor.checkpoint.load_contents = ["model", "optimizer", "extra"]
     config.actor_rollout_ref.rollout.name = "vllm"
     config.actor_rollout_ref.rollout.n = group_size
-    config.actor_rollout_ref.rollout.tensor_model_parallel_size = WORLD_SIZE
+    config.actor_rollout_ref.rollout.tensor_model_parallel_size = _rollout_tensor_parallel_size(world_size)
     config.actor_rollout_ref.rollout.data_parallel_size = 1
     config.actor_rollout_ref.rollout.dtype = "bfloat16"
-    config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.45
+    config.actor_rollout_ref.rollout.gpu_memory_utilization = float(
+        os.environ.get("RIFT_VLLM_MEMORY_UTILIZATION", "0.45"))
     config.actor_rollout_ref.rollout.max_model_len = max_sequence_length
     config.actor_rollout_ref.rollout.max_num_batched_tokens = max_sequence_length
     config.actor_rollout_ref.rollout.calculate_log_probs = True
-    config.actor_rollout_ref.rollout.agent.num_workers = WORLD_SIZE
+    config.actor_rollout_ref.rollout.agent.num_workers = world_size
     config.actor_rollout_ref.rollout.prompt_length = prompt_length
     config.actor_rollout_ref.rollout.response_length = response_length
     config.data.max_prompt_length = prompt_length
@@ -194,11 +238,11 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.algorithm.use_kl_in_reward = False
     config.critic.enable = False
     config.trainer.use_v1 = True
-    config.trainer.device = "npu"
+    config.trainer.device = platform.device
     config.trainer.nnodes = 1
-    config.trainer.n_gpus_per_node = WORLD_SIZE
+    config.trainer.n_gpus_per_node = world_size
     config.trainer.project_name = "RIFT-RSI"
-    config.trainer.experiment_name = f"ascend910b3-{role}"
+    config.trainer.experiment_name = f"{'ascend910b3' if platform.name == 'ascend' else platform.name}-{role}"
     config.trainer.default_local_dir = str(Path(run_root).resolve() / "verl" / role)
     config.trainer.total_training_steps = 1
     config.trainer.logger = ["console"]
@@ -366,16 +410,23 @@ def _build_service_host_provider(manifest, checkpoint_raw):
 
 
 def _start_ray(config, run_root, *, worker_manifest_path=None, checkpoint=None):
-    """Start a private Ray session advertising the eight physical NPUs."""
-    import torch_npu  # noqa: F401
+    """Start a private Ray session advertising this platform's accelerators (eight NPUs on Ascend)."""
+    from rift import hardware
+    target = hardware.current()
+    world_size = target.world_size
+    if target.name == "ascend":
+        import torch_npu  # noqa: F401
     import ray
     if ray.is_initialized():
         raise RuntimeError("refusing to attach to a Ray session not owned by this RIFT run")
     from verl.plugin.platform import get_platform
     platform = get_platform()
-    resources = platform.ray_resource_options(WORLD_SIZE).get("resources", {})
-    if resources != {"NPU": WORLD_SIZE}:
-        raise RuntimeError(f"VERL selected an unexpected Ascend Ray resource map: {resources}")
+    options = platform.ray_resource_options(world_size)
+    expected = ({"resources": {"NPU": world_size}} if target.name == "ascend"
+                else {"num_gpus": world_size})
+    if options != expected:
+        raise RuntimeError(f"VERL selected an unexpected {target.name} Ray resource map: {options}")
+    resources = options.get("resources", {})
     # Ray appends a timestamped session directory and Unix socket names here.
     # Generate a short unique path and verify the worst-case socket before
     # Ray starts, so a long persistent run root can never trigger this failure.
@@ -385,8 +436,11 @@ def _start_ray(config, run_root, *, worker_manifest_path=None, checkpoint=None):
     from omegaconf import OmegaConf
     runtime_env = get_ppo_ray_runtime_env(config)
     runtime_env.setdefault("env_vars", {})
-    _forward_ascend_worker_environment(runtime_env)
-    _require_cann_atb_library()
+    if target.name == "ascend":
+        _forward_ascend_worker_environment(runtime_env)
+        _require_cann_atb_library()
+    else:
+        _forward_worker_environment(runtime_env, CUDA_WORKER_ENV_KEYS)
     if worker_manifest_path is not None:
         from dataclasses import asdict
         runtime_env["env_vars"]["RIFT_ASCEND910B3_RUN_MANIFEST"] = str(
@@ -397,14 +451,17 @@ def _start_ray(config, run_root, *, worker_manifest_path=None, checkpoint=None):
             asdict(checkpoint), sort_keys=True)
     ray_init = OmegaConf.to_container(config.ray_kwargs.ray_init, resolve=True)
     ray_init.pop("runtime_env", None)
-    ray_init.update(num_cpus=32, resources=resources,
-                    include_dashboard=False, log_to_driver=True,
+    ray_init.update(num_cpus=32, include_dashboard=False, log_to_driver=True,
                     _temp_dir=str(ray_dir), runtime_env=runtime_env)
+    if resources:
+        ray_init.update(resources=resources)          # Ascend: a custom "NPU" resource
+    else:
+        ray_init.update(num_gpus=world_size)           # CUDA: Ray's built-in GPU resource
     ray.init(**ray_init)
     available = ray.cluster_resources()
-    if available.get("NPU", 0) < WORLD_SIZE:
+    if available.get(target.ray_resource, 0) < world_size:
         ray.shutdown()
-        raise RuntimeError(f"Ray did not register eight NPUs: {available}")
+        raise RuntimeError(f"Ray did not register {world_size} {target.ray_resource}s: {available}")
 
 
 def _stop_ray():
@@ -531,7 +588,10 @@ class Ascend910B3RoleRuntime:
             raise
 
     def _construct_workers(self):
-        import torch_npu  # noqa: F401 - registers the VERL Ascend platform.
+        from rift import hardware
+        target = hardware.current()
+        if target.name == "ascend":
+            import torch_npu  # noqa: F401 - registers the VERL Ascend platform.
         import ray
         from verl.single_controller.ray.base import (
             RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager,
@@ -553,7 +613,7 @@ class Ascend910B3RoleRuntime:
         # its role includes "rollout", even if no LLMServerManager is started.
         role_enum = Role.ActorRollout if self.initialize_vllm else Role.Actor
         self.resource_pool_manager = ResourcePoolManager(
-            resource_pool_spec={"global_pool": [WORLD_SIZE]},
+            resource_pool_spec={"global_pool": [target.world_size]},
             mapping={role_enum: "global_pool"}, max_colocate_count=1)
         self.resource_pool_manager.create_resource_pool()
         class_dict = {str(role_enum): RayClassWithInitArgs(
@@ -564,10 +624,10 @@ class Ascend910B3RoleRuntime:
         self.worker_group = RayWorkerGroup(
             resource_pool=self.resource_pool_manager.get_resource_pool(role_enum),
             ray_cls_with_init=create_colocated_worker_cls(class_dict=class_dict),
-            device_name="npu")
+            device_name=target.device)
         spawned = self.worker_group.spawn(prefix_set=class_dict.keys())
         self.worker_group = spawned[str(role_enum)]
-        if self.worker_group.world_size != WORLD_SIZE:
+        if self.worker_group.world_size != target.world_size:
             raise RuntimeError(f"VERL actor worker group has {self.worker_group.world_size} ranks")
         self.worker_group.init_model()
 
@@ -617,12 +677,12 @@ class Ascend910B3RoleRuntime:
     def verify_loaded_state(self, checkpoint):
         return (not self.closed and self._loaded_checkpoint == checkpoint
                 and self.checkpoint_store.verify(checkpoint) is True
-                and self.worker_group.world_size == WORLD_SIZE
+                and self.worker_group.world_size == _world_size()
                 and self.serving_attestor.verify_serving(checkpoint) is True)
 
     def verify_runtime_environment(self, role, worker_group):
         return (not self.closed and role == self.role and worker_group is self.worker_group
-                and worker_group.world_size == WORLD_SIZE
+                and worker_group.world_size == _world_size()
                 and str(self.config.actor_rollout_ref.actor.strategy) == "fsdp2"
                 and str(self.config.actor_rollout_ref.rollout.name) == "vllm")
 
@@ -640,7 +700,7 @@ class Ascend910B3RoleRuntime:
             from rift.verl.version import VERL_COMMIT, VERL_VERSION
             value = self.service_update['learning_rate']
             results = worker_group.set_training_learning_rate(value)
-            if (not isinstance(results, (list, tuple)) or len(results) != WORLD_SIZE
+            if (not isinstance(results, (list, tuple)) or len(results) != _world_size()
                     or any(not _learning_rate_readback_matches(row, value,
                         version=VERL_VERSION, commit=VERL_COMMIT) for row in results)):
                 raise ValueError('learning-rate readback or pinned VERL identity differs on an FSDP rank')
@@ -692,7 +752,7 @@ class Ascend910B3RoleRuntime:
             pad_token_id=int(self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None
                              else self.tokenizer.eos_token_id),
             mini_batch_size=(mini_batch_size if mini_batch_size is not None else
-                self.service_update.get("mini_batch_size") or max(WORLD_SIZE, len(request.rollouts))),
+                self.service_update.get("mini_batch_size") or max(_world_size(), len(request.rollouts))),
             epochs=epochs if epochs is not None else self.service_update.get("epochs", 1),
             learning_rate=self.service_update.get('learning_rate', 1e-6),
             metric_sink=metric_sink, round_index=round_index,
@@ -837,7 +897,7 @@ def run_service_smoke(*, service_model, run_root, verl_config_dir, episode_budge
     require_verl_version()
     task_registry, _split_registry, task = _create_smoke_task_registry(root, episode_budget=budget)
     tokenizer_id = str(Path(service_model).resolve())
-    checkpoint_store = FSDPCheckpointStore({}, world_size=WORLD_SIZE)
+    checkpoint_store = FSDPCheckpointStore({}, world_size=_world_size())
     serving_attestor = VerlServingAttestor(root / "serving", checkpoint_store)
     checkpoint = initialize_checkpoint("service", service_model,
         root / "checkpoints" / "service-initial", checkpoint_store=checkpoint_store,
@@ -848,7 +908,8 @@ def run_service_smoke(*, service_model, run_root, verl_config_dir, episode_budge
     checkpoint_manifest = root / "checkpoints" / "initial.json"
     checkpoint_store.save_manifest(checkpoint_manifest)
 
-    serialization = "verl-v0.9.1-vllm-ascend-0.23.0-native-token-ids-v1"
+    from rift import hardware
+    serialization = hardware.current().serialization
     (root / "generations").mkdir(exist_ok=True)
     (root / "episodes").mkdir(exist_ok=True)
     generation_attestor = GenerationLedger(root / "generations", serving_attestor)
@@ -912,7 +973,7 @@ def run_service_smoke(*, service_model, run_root, verl_config_dir, episode_budge
             raise RuntimeError("real Service update receipt did not verify")
         return {"status": "service_smoke_completed", "role": "service",
             "verl_version": "0.9.1", "verl_commit": VERL_COMMIT,
-            "world_size": WORLD_SIZE, "task_ref": task.record_hash,
+            "world_size": _world_size(), "platform": hardware.current().name, "task_ref": task.record_hash,
             "rollouts": len(update_request.rollouts),
             "group_ids": sorted({row.group_id for row in update_request.rollouts}),
             "reward_counts": {str(value): sum(row.reward == value for row in update_request.rollouts)
@@ -930,7 +991,8 @@ def service_smoke_main(argv=None):
     import argparse
     import json
     parser = argparse.ArgumentParser(
-        description="Run one real VERL v0.9.1 FSDP2 Service update on 8 Ascend 910B3 NPUs")
+        description="Run one real VERL v0.9.1 FSDP2 Service update on this platform's accelerators "
+                    "(8 Ascend 910B3 NPUs, or the CUDA GPUs of RIFT_WORLD_SIZE with RIFT_PLATFORM=cuda)")
     parser.add_argument("--service-model", required=True)
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--verl-config-dir", required=True,
