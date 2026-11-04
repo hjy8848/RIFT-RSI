@@ -1,4 +1,4 @@
-"""Trusted in-process registry for native Usami task certificates."""
+﻿"""Trusted in-process registry for native Usami task certificates."""
 from dataclasses import dataclass
 from datetime import timedelta
 from hashlib import sha256
@@ -129,7 +129,7 @@ class CertifiedTaskRegistry:
         from usami_v2.runtime.customer import CustomerProfileV3
         from usami_v2.scenarios.task_certification import CustomerScenario, TaskCertification
         from usami_v2.scenarios.refusal_certification import RefusalCertificate
-        from usami_v2.scenarios.tasks import TaskSpecV3
+        from usami_v2.scenarios.tasks import parse_task_spec
         registry = cls(split_registry)
         for task_ref, row in raw['records'].items():
             identity_raw = row['identity']
@@ -139,7 +139,7 @@ class CertifiedTaskRegistry:
                 None if identity_raw['purpose'] is None else DataPurpose(identity_raw['purpose']))
             record = CertifiedNativeTask(
                 World.model_validate(row['world']),
-                TaskSpecV3.model_validate(row['task']),
+                parse_task_spec(row['task']),
                 CustomerProfileV3.model_validate(row['profile']),
                 CustomerScenario.model_validate(row['scenario']),
                 (RefusalCertificate if row['certificate'].get('protocol') == 'commerce-refusal-certificate-v1'

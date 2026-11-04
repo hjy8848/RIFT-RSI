@@ -1,4 +1,4 @@
-import json
+﻿import json
 import random
 
 import pytest
@@ -68,6 +68,20 @@ def test_a_plan_with_engine_history_round_trips_and_certifies(tmp_path):
     from rift.designer.format import plan_drafts
     rebuilt, _ = plan_drafts(parse_plan(plan), 'plan-history')
     assert rebuilt['history'] == data['history']
+
+
+def test_a_saved_registry_with_designer_tasks_reloads(tmp_path):
+    """Training workers reload the registry from disk; a task with several requests on one line is v4 (covered by the real-pool rehearsal)."""
+    kit = WorldKit(tmp_path)
+    data, task = draft_instance('F1', 3, near_distractors=3)
+    plan = plan_from_drafts(data, task, 'reload').model_dump(mode='json')
+    row = certify_designer_plan(kit, json.dumps(plan), 'plan-reload', 3)
+    assert row['status'] == 'certified', row
+    kit.save()
+    reloaded = WorldKit(tmp_path)
+    ref = row['task_refs'][0]
+    assert (reloaded.task_registry.resolve_record(ref).task.protocol
+            == kit.task_registry.resolve_record(ref).task.protocol)
 
 
 def test_uncertifiable_request_is_rejected_with_a_reason_not_a_crash(tmp_path):
