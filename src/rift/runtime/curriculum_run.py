@@ -805,15 +805,27 @@ def sample_outcomes(context, by_key, checkpoint, *, groups, seed, label):
     return summarize_outcomes([(row['key'], row['task_ref'], row['outcome']) for row in rows])
 
 
-def collect_failures(context, *, specs, groups, seed, max_cases, from_run=None):
+def collect_failures(context, *, specs, groups, seed, max_cases, from_run=None, init_from_run=None):
     """Sample the Service on training tasks and write the Designer's failure context.
 
     Writes ``failures.json`` (cases with hidden goals; training split only) next to the report.
+    ``init_from_run`` reuses another run's base checkpoint instead of writing a new 8 GB one
+    (about ten minutes); ``from_run`` samples a finished training run's final checkpoint.
     """
     from rift.designer.failures import failure_cases
+    if from_run and init_from_run:
+        raise ValueError('--from-run and --init-from-run are alternatives')
+    if init_from_run and (Path(init_from_run) / 'final.json').exists():
+        raise ValueError('%s trained a policy; --init-from-run takes a base checkpoint (use --from-run '
+                         'to sample a trained one)' % init_from_run)
     by_key = context.world.certify_specs(specs)
     context.world.save()
-    checkpoint = (context.checkpoint_from_run(from_run) if from_run else context.initial_checkpoint())
+    if init_from_run and not (context.root / 'initial-checkpoint.json').exists():
+        checkpoint = context.adopt_initial_from(init_from_run)
+    elif from_run:
+        checkpoint = context.checkpoint_from_run(from_run)
+    else:
+        checkpoint = context.initial_checkpoint()
     try:
         rows = sample_rows(context, by_key, checkpoint, groups=groups, seed=seed, label='failures')
     finally:
@@ -925,6 +937,8 @@ def main(argv=None):
     failures_parser.add_argument('--group-size', type=int, default=4)
     failures_parser.add_argument('--max-cases', type=int, default=8)
     failures_parser.add_argument('--from-run', help='train run directory whose final.json supplies the checkpoint')
+    failures_parser.add_argument('--init-from-run',
+        help='an earlier eval/collect run directory whose base checkpoint to reuse (skips writing a new one)')
     failures_parser.add_argument('--response-length', type=int, default=20480)
     eval_parser = sub.add_parser('eval', help='evaluate a frozen checkpoint without updating it')
     _common(eval_parser)
@@ -980,7 +994,8 @@ def main(argv=None):
         context = _context(args, UpdateBudget(WORLD_SIZE, 1, 1e-6), args.group_size,
                            response_length=args.response_length)
         result = collect_failures(context, specs=load_json_argument(args.specs), groups=args.groups,
-                                  seed=args.seed, max_cases=args.max_cases, from_run=args.from_run)
+                                  seed=args.seed, max_cases=args.max_cases, from_run=args.from_run,
+                                  init_from_run=args.init_from_run)
     else:
         context = _context(args, UpdateBudget(WORLD_SIZE, 1, 1e-6), args.group_size,
                            response_length=args.response_length)

@@ -204,6 +204,31 @@ class TrainRehearsal(unittest.TestCase):
             with self.assertRaises(FileExistsError):                # a finished run is not overwritten
                 run.train_pool(context, train_specs=[], rounds=1, tasks_per_round=2, seed=1)
 
+    def test_collect_failures_reuses_a_base_checkpoint_and_refuses_a_trained_run(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as root:
+            self._initial(source)
+            context = run.ExperimentContext(root=root, service_model='m', verl_config_dir='.',
+                episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6),
+                runtime_factory=lambda checkpoint: FakeRuntime(context, checkpoint), persist_every=0)
+            specs = [{'generator': 'F1', 'instances': 1, 'seed': 0}]
+            with mock.patch.object(run, 'sample_rows', return_value=[]), \
+                    mock.patch('rift.designer.failures.failure_cases', return_value=[]):
+                result = run.collect_failures(context, specs=specs, groups=1, seed=1, max_cases=2,
+                                              init_from_run=source)
+            self.assertEqual(result['status'], 'failures_collected')
+            self.assertTrue((Path(root) / 'initial-checkpoint.json').exists())
+            self.assertTrue((Path(root) / 'checkpoints' / 'initial.json').exists())
+            self.assertFalse((Path(root) / 'checkpoints' / 'service-initial').exists())   # nothing rewritten
+            self.assertEqual(json.loads((Path(root) / 'initial-checkpoint.json').read_text()),
+                             json.loads((Path(source) / 'initial-checkpoint.json').read_text()))
+            (Path(source) / 'final.json').write_text('{}')                          # a run that trained
+            with self.assertRaisesRegex(ValueError, 'trained a policy'):
+                run.collect_failures(context, specs=specs, groups=1, seed=1, max_cases=2, init_from_run=source)
+            with self.assertRaisesRegex(ValueError, 'alternatives'):
+                run.collect_failures(context, specs=specs, groups=1, seed=1, max_cases=2,
+                                     init_from_run=source, from_run=source)
+
     def test_stage1_trains_on_designer_plans_with_a_balanced_mix(self):
         from rift.designer.stage0 import dry_run_generate, run as stage0
         with tempfile.TemporaryDirectory() as plans_root, tempfile.TemporaryDirectory() as root:
