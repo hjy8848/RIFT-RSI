@@ -252,7 +252,10 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.rollout.max_model_len = max_sequence_length
     config.actor_rollout_ref.rollout.max_num_batched_tokens = max_sequence_length
     config.actor_rollout_ref.rollout.calculate_log_probs = True
-    config.actor_rollout_ref.rollout.agent.num_workers = world_size
+    # Usami's engine is CPU work, so the AgentLoop worker count need not follow the card count
+    # (one GPU would otherwise serve every episode from a single process).
+    config.actor_rollout_ref.rollout.agent.num_workers = int(
+        os.environ.get("RIFT_AGENT_WORKERS", world_size))
     config.actor_rollout_ref.rollout.prompt_length = prompt_length
     config.actor_rollout_ref.rollout.response_length = response_length
     config.data.max_prompt_length = prompt_length

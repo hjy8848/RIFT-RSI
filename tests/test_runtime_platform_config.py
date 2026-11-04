@@ -84,6 +84,8 @@ def test_verl_config_for_cuda_uses_the_gpu_count(monkeypatch, tmp_path):
     # SDPA needs padded inputs: packed samples would attend to each other.
     assert config.actor_rollout_ref.model.override_config.attn_implementation == 'sdpa'
     assert config.actor_rollout_ref.model.use_remove_padding is False
+    monkeypatch.setenv('RIFT_AGENT_WORKERS', '8')
+    assert _config(tmp_path).actor_rollout_ref.rollout.agent.num_workers == 8     # independent of the 4 GPUs
     monkeypatch.setenv('RIFT_ATTN_IMPLEMENTATION', 'flash_attention_2')
     packed = _config(tmp_path)
     assert packed.actor_rollout_ref.model.use_remove_padding is True

@@ -229,6 +229,26 @@ class TrainRehearsal(unittest.TestCase):
                 run.collect_failures(context, specs=specs, groups=1, seed=1, max_cases=2,
                                      init_from_run=source, from_run=source)
 
+    def test_eval_reports_designer_tasks_as_their_own_class(self):
+        from rift.designer.stage0 import dry_run_generate, run as stage0
+        with tempfile.TemporaryDirectory() as plans_root, tempfile.TemporaryDirectory() as root:
+            stage0(run.WorldKit(plans_root), lambda prompts: dry_run_generate(prompts, seed=31), [],
+                   samples=3, seed=31, out_dir=plans_root, signatures=False)
+            self._initial(root)
+            FakeRuntime.opened = []
+            context = run.ExperimentContext(root=root, service_model='m', verl_config_dir='.',
+                episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6),
+                runtime_factory=lambda checkpoint: FakeRuntime(context, checkpoint), persist_every=0)
+            context._worker_manifest = lambda checkpoint: None
+            plans = Path(plans_root) / 'designer-plans.jsonl'
+            result = run.evaluate(context, specs=[{'generator': 'F4', 'instances': 2, 'seed': 70, 'balanced': True}],
+                                  groups=1, seed=5, label='t', designer_plans=plans)
+            self.assertEqual(sorted(result['families']), ['designer', 'gen:F4:{"balanced":true}'])
+            self.assertEqual(result['families']['designer']['tasks'], 3)
+            self.assertEqual(result['families']['gen:F4:{"balanced":true}']['tasks'], 2)
+            with self.assertRaisesRegex(ValueError, 'nothing to evaluate'):
+                run.evaluate(context, specs=[], groups=1, seed=5, label='t')
+
     def test_stage1_trains_on_designer_plans_with_a_balanced_mix(self):
         from rift.designer.stage0 import dry_run_generate, run as stage0
         with tempfile.TemporaryDirectory() as plans_root, tempfile.TemporaryDirectory() as root:

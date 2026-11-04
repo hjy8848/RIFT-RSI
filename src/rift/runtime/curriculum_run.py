@@ -844,9 +844,18 @@ def collect_failures(context, *, specs, groups, seed, max_cases, from_run=None, 
             'failures': str(context.root / 'failures.json'), 'run_root': str(context.root)}
 
 
-def evaluate(context, *, specs, groups, seed, label, from_run=None):
-    """Sample ``groups`` x group_size episodes per task and report success rates."""
-    by_key = context.world.certify_specs(specs)
+def evaluate(context, *, specs, groups, seed, label, from_run=None, designer_plans=None):
+    """Sample ``groups`` x group_size episodes per task and report success rates.
+
+    ``designer_plans`` adds the certified tasks of a stage-0 file as one more class,
+    ``designer``, next to the classes of ``specs``.
+    """
+    by_key = context.world.certify_specs(specs) if specs else {}
+    if designer_plans:
+        from rift.designer.stage0 import certify_saved_plans
+        by_key['designer'] = certify_saved_plans(context.world, designer_plans)
+    if not by_key:
+        raise ValueError('nothing to evaluate: give --specs and/or --designer-plans')
     context.world.save()
     checkpoint = (context.checkpoint_from_run(from_run) if from_run else context.initial_checkpoint())
     try:
@@ -949,7 +958,9 @@ def main(argv=None):
     failures_parser.add_argument('--response-length', type=int, default=20480)
     eval_parser = sub.add_parser('eval', help='evaluate a frozen checkpoint without updating it')
     _common(eval_parser)
-    eval_parser.add_argument('--specs', help='JSON list of {family, knobs, instances, seed}; inline or file')
+    eval_parser.add_argument('--specs', help='JSON list of {family, knobs, instances, seed} or generator specs; '
+        'inline or file (default: the built-in benchmark, unless --designer-plans is given)')
+    eval_parser.add_argument('--designer-plans', help='stage-0 designer-plans.jsonl: also evaluate its certified tasks')
     eval_parser.add_argument('--groups', type=int, default=2, help='GRPO groups sampled per task')
     eval_parser.add_argument('--group-size', type=int, default=4)
     eval_parser.add_argument('--from-run', help='train run directory whose final.json supplies the checkpoint')
@@ -1007,8 +1018,10 @@ def main(argv=None):
         context = _context(args, UpdateBudget(world_size, 1, 1e-6), args.group_size,
                            response_length=args.response_length)
         result = evaluate(context,
-            specs=load_json_argument(args.specs) if args.specs else list(DEFAULT_BENCH),
-            groups=args.groups, seed=args.seed, label=args.label, from_run=args.from_run)
+            specs=(load_json_argument(args.specs) if args.specs
+                   else [] if args.designer_plans else list(DEFAULT_BENCH)),
+            groups=args.groups, seed=args.seed, label=args.label, from_run=args.from_run,
+            designer_plans=args.designer_plans)
     (context.root / ('%s-result.json' % args.command)).write_text(
         json.dumps(result, sort_keys=True, indent=2), encoding='utf-8')
     print(json.dumps(result, sort_keys=True))
