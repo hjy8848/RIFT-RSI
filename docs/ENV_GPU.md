@@ -41,7 +41,29 @@ UV_CACHE_DIR=/home/hejingyu/.cache/uv $ENV/bin/uv pip install --python $ENV/bin/
 - 驱动 555/560/570 的机器（zju-17、zju-12、zju-54）：理论上靠 CUDA 12 的次版本兼容可用，当时没有空闲卡，没有测。
 - A100（zju-12，sm_80）、4090（zju-17、zju-18，sm_89）、zju-48/49/53：同上。
 - zju-55 连接被拒绝。
-- 训练：RIFT 的 VERL 运行时目前只有昇腾实现（`rift.hardware` 里 CUDA 平台 `runtime_ready=False`，调用会明确报 `PlatformNotReady`）。这个环境现在只用于阶段 0（Designer 出题 + CPU 认证）。
+- 训练只在 zju-47 的 2 张 A6000 上验证过；Blackwell（96GB）、更多卡、其他机器的 NCCL 行为没测。
+- **多轮训练还没有在 GPU 上验证**：冒烟只覆盖一次更新。运行时常驻、每轮权重同步、虚拟检查点、训练后原地评测（`train-pool`，配置见 `configs/experiments/cuda_port_*.json`）的第一次尝试因为 GPU 被别人占走而 OOM，之后整个实验室没有 2 张空闲卡，还没重跑。
+
+## 训练环境（`rift-gpu-train`）与 CUDA 移植
+2026-11-04 另建了 `/home/hejingyu/miniconda3/envs/rift-gpu-train`，**110 秒**（uv 缓存让 vLLM 几乎瞬间装完）：vLLM 0.19.1、torch 2.10.0+cu128、transformers 5.10.4（VERL 0.9.1 要求 <5.11，所以比 `rift-gpu` 低）、ray 2.60、tensordict 0.10。
+VERL 用的是昇腾环境同一份源码（共享盘上 `verl-v091-cann91-py312/verl`，复制到 `/home/hejingyu/src/verl-v091-cuda` 后 `pip install --no-deps -e`，共享目录不动），代码里钉的 VERL 提交因此一致。
+
+运行时 `rift.runtime.ascend_910b3` 由 `rift.hardware` 驱动（`RIFT_PLATFORM=cuda`、`RIFT_WORLD_SIZE=N`），昇腾路径的取值不变（测试逐项断言）。CUDA 上的差异：
+- Ray 资源用内置 `num_gpus`，不是自定义 `NPU`；
+- vLLM 张量并行度默认 1（Qwen3-4B 有 8 个 KV 头，只能取 1/2/4/8；每个 GPU 一个副本，卡数不必是 2 的幂），可用 `RIFT_ROLLOUT_TP` 改；
+- vLLM 显存占比 `RIFT_VLLM_MEMORY_UTILIZATION`（默认 0.45）；
+- 注意力用 **SDPA 且关闭 remove-padding**：torch 2.10 没有 flash-attn 预编译轮子（最新只到 torch 2.8），而去填充的打包输入靠 flash-attn 变长内核隔开样本，SDPA 下会悄悄串样本。更新时每卡微批次 1 条，没有填充浪费。`RIFT_ATTN_IMPLEMENTATION=flash_attention_2` 可改回。
+
+### 踩到的坑
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| FSDP 初始化 `FlashAttention2 ... not installed` | VERL 默认 flash_attention_2 | 上面的 SDPA 设置 |
+| 两个 rank 11 分钟 100% GPU/100% CPU 无日志 | **zju-47 的 GPU 0↔1 NCCL P2P 会死锁**（拓扑显示 P2P OK）。独立的 torchrun all_reduce 复现，`NCCL_P2P_DISABLE=1` 后 0.42 秒通过 | 启动时 `export NCCL_P2P_DISABLE=1`；运行时把 `NCCL_*` 环境变量转发给 Ray 工作进程。别的机器是否需要未测 |
+| 单卡放不下 | 4B 的 FSDP2 训练：权重+梯度+Adam 状态约 48GB | A6000（48GB）至少 2 张；批次要能被卡数整除（8 条采样 → 1/2/4/8 张） |
+| 多轮验证在 NCCL 初始化时 `Cuda failure 'out of memory'` | 别的用户的任务在我们启动后几分钟才开始占 GPU（他们的进程在 CPU 上加载了几分钟，启动检查时显存还是空的），把两张卡各占到 42GB。**"空闲"检查不是预约**，启动到真正占卡之间有几分钟窗口 | 不是代码问题。重跑时选更闲的机器，失败了换新标签重来；窗口越短越好（先把任务认证和基础检查点放在占卡之前不现实，只能重试） |
+
+### 已验证
+2026-11-04，zju-47，2×RTX A6000，`python -m rift.runtime.ascend_910b3`（冒烟）：FSDP2 初始化并保存检查点（约 2 分钟）→ vLLM 服务与权重同步 → 8 条滚动采样 → 1 次 GRPO 更新 → 保存并校验新检查点，`status: service_smoke_completed`。冒烟任务 8/8 成功，优势为零，只证明流程通，不证明学习。
 
 ## 用法
 ```bash
