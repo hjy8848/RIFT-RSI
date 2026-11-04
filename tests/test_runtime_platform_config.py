@@ -62,6 +62,8 @@ def test_verl_config_for_ascend_is_unchanged(monkeypatch, tmp_path):
     assert config.actor_rollout_ref.rollout.agent.num_workers == 8
     assert config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.45
     assert config.trainer.experiment_name == 'ascend910b3-service'
+    assert 'attn_implementation' not in config.actor_rollout_ref.model.override_config   # NPU keeps VERL's default
+    assert config.actor_rollout_ref.model.use_remove_padding is True
 
 
 def test_verl_config_for_cuda_uses_the_gpu_count(monkeypatch, tmp_path):
@@ -77,3 +79,9 @@ def test_verl_config_for_cuda_uses_the_gpu_count(monkeypatch, tmp_path):
     assert config.actor_rollout_ref.rollout.gpu_memory_utilization == 0.3
     assert config.trainer.experiment_name == 'cuda-service'
     assert config.actor_rollout_ref.actor.strategy == 'fsdp2' and config.actor_rollout_ref.rollout.name == 'vllm'
+    # SDPA needs padded inputs: packed samples would attend to each other.
+    assert config.actor_rollout_ref.model.override_config.attn_implementation == 'sdpa'
+    assert config.actor_rollout_ref.model.use_remove_padding is False
+    monkeypatch.setenv('RIFT_ATTN_IMPLEMENTATION', 'flash_attention_2')
+    packed = _config(tmp_path)
+    assert packed.actor_rollout_ref.model.use_remove_padding is True

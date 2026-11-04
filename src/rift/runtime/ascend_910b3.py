@@ -199,6 +199,15 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.model.path = str(Path(model_path).resolve())
     config.actor_rollout_ref.model.lora_rank = 0
     config.actor_rollout_ref.model.trust_remote_code = False
+    if platform.name == "cuda":
+        # flash-attn has no prebuilt wheel for torch 2.10, so use PyTorch's SDPA. Packed
+        # (remove-padding) inputs rely on flash-attn's varlen kernels to keep samples apart
+        # and would silently mix them under SDPA, so padding stays. The update uses one
+        # sample per micro-batch, so there is no padding to waste.
+        attention = os.environ.get("RIFT_ATTN_IMPLEMENTATION", "sdpa")
+        config.actor_rollout_ref.model.override_config.attn_implementation = attention
+        if attention != "flash_attention_2":
+            config.actor_rollout_ref.model.use_remove_padding = False
     config.actor_rollout_ref.hybrid_engine = True
     config.actor_rollout_ref.actor.strategy = "fsdp2"
     config.actor_rollout_ref.actor.fsdp_config.model_dtype = "bfloat16"
