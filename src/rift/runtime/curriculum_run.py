@@ -1,4 +1,4 @@
-"""Real 8x910B3 entry points for the dense-proxy curriculum.
+"""Real-accelerator entry points for the dense-proxy curriculum (8x910B3 is the runtime that exists).
 
 ``train`` runs ``CurriculumRunner`` rounds on a real VERL Service policy.
 ``eval`` measures a frozen checkpoint on certified synthetic families without
@@ -16,7 +16,8 @@ import math
 import os
 from pathlib import Path
 
-from rift.runtime.ascend_910b3 import CHAT_TEMPLATE_KWARGS, WORLD_SIZE
+from rift import hardware
+from rift.hardware import CHAT_TEMPLATE_KWARGS
 DEFAULT_ARMS = ({'family_id': 'F1', 'knobs': {}}, {'family_id': 'F4', 'knobs': {'age_days': 20}})
 DEFAULT_BENCH = ({'family': 'F1', 'knobs': {}, 'instances': 8, 'seed': 1000000},
                  {'family': 'F4', 'knobs': {'age_days': 20}, 'instances': 8, 'seed': 1001000})
@@ -220,11 +221,12 @@ class ExperimentContext:
         self.verl_config_dir, self.episode_budget = Path(verl_config_dir), episode_budget
         self.update_budget, self.tool_profile, self.group_size = update_budget, tool_profile, group_size
         self.response_length = response_length
-        self.runtime_factory = runtime_factory or self._ascend_runtime
+        self.platform = hardware.current()
+        self.runtime_factory = runtime_factory or self._device_runtime
         for name in ('task_registry', 'checkpoints', 'episodes', 'generations', 'serving', 'updates'):
             (self.root / name).mkdir(parents=True, exist_ok=True)
         self.world = WorldKit(self.root, episode_budget=episode_budget, patience_slack=patience_slack)
-        self.checkpoint_store = FSDPCheckpointStore({}, world_size=WORLD_SIZE)
+        self.checkpoint_store = FSDPCheckpointStore({}, world_size=self.platform.world_size)
         self.runtime = None
         self._wire_stores()
 
@@ -234,7 +236,7 @@ class ExperimentContext:
         from rift.verl.generation_ledger import GenerationLedger
         from rift.verl.serving import VerlServingAttestor
         from rift.verl.update_ledger import UpdateLedger
-        self.serialization = 'verl-v0.9.1-vllm-ascend-0.23.0-native-token-ids-v1'
+        self.serialization = self.platform.serialization
         self.serving_attestor = VerlServingAttestor(self.root / 'serving', self.checkpoint_store)
         self.generation_attestor = GenerationLedger(self.root / 'generations', self.serving_attestor)
         self.capture_store = NativeCaptureStore(self.root / 'episodes',
@@ -279,6 +281,7 @@ class ExperimentContext:
             if self.checkpoint_store.verify(checkpoint) is not True:
                 raise ValueError('stored initial checkpoint failed verification')
             return checkpoint
+        self.platform.require_runtime('writing the base checkpoint')
         from rift.runtime.ascend_910b3 import initialize_checkpoint
         checkpoint = initialize_checkpoint('service', self.service_model,
             self.root / 'checkpoints' / 'service-initial', checkpoint_store=self.checkpoint_store,
@@ -353,7 +356,8 @@ class ExperimentContext:
         os.replace(temporary, path)   # workers never see a half-written manifest
         return path
 
-    def _ascend_runtime(self, checkpoint):
+    def _device_runtime(self, checkpoint):
+        self.platform.require_runtime('starting the Service runtime')
         from rift.runtime.ascend_910b3 import Ascend910B3RoleRuntime
         return Ascend910B3RoleRuntime('service', checkpoint, model_path=self.service_model,
             run_root=self.root, checkpoint_store=self.checkpoint_store,
@@ -568,13 +572,14 @@ class PoolBatch:
         return tuple(group.task_ref for group in self.task_groups)
 
 
-def fit_request_to_batches(request, mini_batch_size, world_size=WORLD_SIZE):
+def fit_request_to_batches(request, mini_batch_size, world_size=None):
     """Drop whole GRPO groups until the rollout count divides into complete mini-batches.
 
     A group whose rollouts are all right or all wrong has zero advantage, so those go first;
     informative groups are only dropped when nothing else is left to drop.
     """
     from dataclasses import replace
+    world_size = world_size or hardware.current().world_size
     unit = mini_batch_size * world_size // math.gcd(mini_batch_size, world_size)
     groups = {}
     for row in request.rollouts:
@@ -880,7 +885,9 @@ def _context(args, update_budget, group_size, response_length=8192, keep_runtime
 
 def main(argv=None):
     import argparse
-    parser = argparse.ArgumentParser(description='RIFT curriculum training and checkpoint evaluation on 8 Ascend 910B3 NPUs')
+    parser = argparse.ArgumentParser(description='RIFT curriculum training and checkpoint evaluation '
+                                     '(platform: %s)' % hardware.current().name)
+    world_size = hardware.current().world_size
     sub = parser.add_subparsers(dest='command', required=True)
     train_parser = sub.add_parser('train', help='run CurriculumRunner rounds')
     _common(train_parser)
@@ -892,7 +899,7 @@ def main(argv=None):
     train_parser.add_argument('--tasks-per-round', type=int, default=16)
     train_parser.add_argument('--group-size', type=int, default=4)
     train_parser.add_argument('--window', type=int, default=10)
-    train_parser.add_argument('--mini-batch-size', type=int, default=WORLD_SIZE)
+    train_parser.add_argument('--mini-batch-size', type=int, default=world_size)
     train_parser.add_argument('--epochs', type=int, default=1)
     train_parser.add_argument('--learning-rate', type=float, default=1e-6)
     train_parser.add_argument('--response-length', type=int, default=12288,
@@ -903,7 +910,7 @@ def main(argv=None):
     train_parser.add_argument('--init-from-run',
         help='an earlier run directory whose base checkpoint to start from (skips writing a new one)')
     train_parser.add_argument('--restart-each-round', action='store_true',
-        help='tear the NPU runtime down after every update (slow; the default keeps it up)')
+        help='tear the accelerator runtime down after every update (slow; the default keeps it up)')
     pool_parser = sub.add_parser('train-pool', help='plain GRPO on a fixed pool of tasks (X2)')
     _common(pool_parser)
     pool_parser.add_argument('--train-specs', help='JSON list of task specs; inline or file. With '
@@ -991,13 +998,13 @@ def main(argv=None):
             (context.root / 'eval-result.json').write_text(
                 json.dumps(result['heldout'], sort_keys=True, indent=2), encoding='utf-8')
     elif args.command == 'collect-failures':
-        context = _context(args, UpdateBudget(WORLD_SIZE, 1, 1e-6), args.group_size,
+        context = _context(args, UpdateBudget(world_size, 1, 1e-6), args.group_size,
                            response_length=args.response_length)
         result = collect_failures(context, specs=load_json_argument(args.specs), groups=args.groups,
                                   seed=args.seed, max_cases=args.max_cases, from_run=args.from_run,
                                   init_from_run=args.init_from_run)
     else:
-        context = _context(args, UpdateBudget(WORLD_SIZE, 1, 1e-6), args.group_size,
+        context = _context(args, UpdateBudget(world_size, 1, 1e-6), args.group_size,
                            response_length=args.response_length)
         result = evaluate(context,
             specs=load_json_argument(args.specs) if args.specs else list(DEFAULT_BENCH),

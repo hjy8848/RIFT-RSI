@@ -138,7 +138,7 @@ def _learning_rate_readback_matches(row, learning_rate, *, version, commit):
 # Qwen3 is a hybrid model whose chat template thinks by default. RIFT trains and
 # evaluates the non-thinking mode so replies reaching the customer never carry
 # <think> text; VERL forwards these kwargs to every chat-template render.
-CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
+from rift.hardware import CHAT_TEMPLATE_KWARGS  # noqa: E402,F401 - platform-neutral; re-exported
 
 
 def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
