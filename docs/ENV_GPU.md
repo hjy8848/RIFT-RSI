@@ -54,11 +54,21 @@ VERL 用的是昇腾环境同一份源码（共享盘上 `verl-v091-cann91-py312
 - vLLM 显存占比 `RIFT_VLLM_MEMORY_UTILIZATION`（默认 0.45）；
 - 注意力用 **SDPA 且关闭 remove-padding**：torch 2.10 没有 flash-attn 预编译轮子（最新只到 torch 2.8），而去填充的打包输入靠 flash-attn 变长内核隔开样本，SDPA 下会悄悄串样本。更新时每卡微批次 1 条，没有填充浪费。`RIFT_ATTN_IMPLEMENTATION=flash_attention_2` 可改回。
 
+### flash-attn（可选，已装进 `rift-gpu-train`）
+官方没有 torch 2.10 的预编译轮子（最新到 torch 2.8，PyPI 只有源码包），装的是第三方预编译轮子：
+`flash_attn-2.8.3+cu128torch2.10-cp312-cp312-linux_x86_64.whl`（253,572,977 字节），来自 GitHub `mjun0812/flash-attention-prebuild-wheels` 的 v0.9.0 发布，经实验室代理下载（约 6 分钟）。
+SHA256 `a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12e36a0f`，与 GitHub 接口报告的摘要一致。用 `uv pip install --no-deps` 只装这个轮子（torch 未改动），加 einops；文件缓存在 `/home/hejingyu/.cache/wheels/`。**这是社区个人维护的二进制，不是 Dao-AILab 官方发布。**
+
+数值检查（2×RTX A6000，Qwen3-4B 的头配置 32 查询头 / 8 KV 头 / 头维 128，bf16）：与 PyTorch SDPA 的最大绝对偏差 0.0020；变长内核把两条样本打包计算，与分开计算的结果完全一致（偏差 0.0000），即样本之间不串。只在 sm_86 上测过，Blackwell 上未测。
+
+用法：`RIFT_ATTN_IMPLEMENTATION=flash_attention_2`，此时 remove-padding 保持 VERL 的默认开启。**还没有用它跑过 VERL 的端到端更新**（已验证的冒烟用的是 SDPA），默认仍是 SDPA。
+
 ### 踩到的坑
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | FSDP 初始化 `FlashAttention2 ... not installed` | VERL 默认 flash_attention_2 | 上面的 SDPA 设置 |
 | 两个 rank 11 分钟 100% GPU/100% CPU 无日志 | **zju-47 的 GPU 0↔1 NCCL P2P 会死锁**（拓扑显示 P2P OK）。独立的 torchrun all_reduce 复现，`NCCL_P2P_DISABLE=1` 后 0.42 秒通过 | 启动时 `export NCCL_P2P_DISABLE=1`；运行时把 `NCCL_*` 环境变量转发给 Ray 工作进程。别的机器是否需要未测 |
+| `torch.cuda` 偶发 `CUDA driver initialization failed`（zju-46 一次，重试三次都正常） | 那台机器 GPU 持久模式关闭，当时 CPU 负载约 73；`cuInit` 本身返回 0 | 偶发的宿主机现象，重试即可 |
 | 单卡放不下 | 4B 的 FSDP2 训练：权重+梯度+Adam 状态约 48GB | A6000（48GB）至少 2 张；批次要能被卡数整除（8 条采样 → 1/2/4/8 张） |
 | 多轮验证在 NCCL 初始化时 `Cuda failure 'out of memory'` | 别的用户的任务在我们启动后几分钟才开始占 GPU（他们的进程在 CPU 上加载了几分钟，启动检查时显存还是空的），把两张卡各占到 42GB。**"空闲"检查不是预约**，启动到真正占卡之间有几分钟窗口 | 不是代码问题。重跑时选更闲的机器，失败了换新标签重来；窗口越短越好（先把任务认证和基础检查点放在占卡之前不现实，只能重试） |
 
