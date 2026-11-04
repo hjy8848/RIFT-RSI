@@ -40,9 +40,9 @@ class Platform:
     def require_runtime(self, what):
         if not self.runtime_ready:
             raise PlatformNotReady(
-                f'{what} needs a VERL/vLLM runtime for the {self.name!r} platform, which is not '
-                'available. Only the Ascend runtime has been implemented and run; Designer stage 0 '
-                '(python -m rift.designer.stage0) needs no runtime and works on any platform.')
+                f'{what} needs a VERL/vLLM runtime, which the {self.name!r} platform does not have '
+                '(it only rehearses on CPU). The runtime runs on Ascend, and on CUDA when '
+                'RIFT_PLATFORM=cuda; Designer stage 0 (python -m rift.designer.stage0) needs none.')
 
 
 def _installed(module):
@@ -74,7 +74,8 @@ def detect():
     if name == 'ascend':
         return Platform('ascend', 'npu', 'NPU', ASCEND_WORLD_SIZE, ASCEND_SERIALIZATION, True)
     if name == 'cuda':
-        return Platform('cuda', 'cuda', 'GPU', _cuda_world_size(), CUDA_SERIALIZATION, False)
+        # Verified 2026-11-04: one VERL FSDP2 + vLLM GRPO update on 2 A6000s (docs/ENV_GPU.md).
+        return Platform('cuda', 'cuda', 'GPU', _cuda_world_size(), CUDA_SERIALIZATION, True)
     return Platform('rehearsal', 'cpu', None, ASCEND_WORLD_SIZE, ASCEND_SERIALIZATION, False)
 
 

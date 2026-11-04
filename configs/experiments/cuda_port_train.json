@@ -1,0 +1,4 @@
+[
+  {"generator": "F5", "instances": 4, "seed": 100, "balanced": true},
+  {"generator": "F6", "instances": 4, "seed": 200, "balanced": true}
+]

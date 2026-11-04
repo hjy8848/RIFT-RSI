@@ -26,8 +26,7 @@ def test_cuda_world_size_follows_the_environment_and_has_its_own_identity(monkey
     platform = hardware.detect()
     assert (platform.device, platform.ray_resource, platform.world_size) == ('cuda', 'GPU', 3)
     assert platform.serialization == CUDA_SERIALIZATION != ASCEND_SERIALIZATION
-    with pytest.raises(PlatformNotReady, match="'cuda'"):
-        platform.require_runtime('starting the Service runtime')
+    assert platform.runtime_ready                       # one GRPO update was run on 2 GPUs
     monkeypatch.setenv('RIFT_WORLD_SIZE', 'many')
     with pytest.raises(ValueError, match='positive integer'):
         hardware.detect()
@@ -63,7 +62,12 @@ def test_the_run_follows_the_platform_for_rank_count_and_identity(monkeypatch, t
         episode_budget=EpisodeBudget(), update_budget=UpdateBudget(4, 1, 1e-6))
     assert context.checkpoint_store.world_size == 4
     assert context.serialization == CUDA_SERIALIZATION
+    # A CPU rehearsal has the NPU contract's ranks but can start no runtime.
+    monkeypatch.setenv('RIFT_PLATFORM', 'rehearsal')
+    hardware.reset()
+    rehearsal = run.ExperimentContext(root=tmp_path / 'cpu', service_model='m', verl_config_dir='.',
+        episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6))
     with pytest.raises(PlatformNotReady, match='base checkpoint'):
-        context.initial_checkpoint()
+        rehearsal.initial_checkpoint()
     with pytest.raises(PlatformNotReady, match='Service runtime'):
-        context.runtime_factory(None)
+        rehearsal.runtime_factory(None)
