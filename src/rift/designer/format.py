@@ -6,7 +6,7 @@ certifies it. Everything a model can get wrong is reported as a readable reason.
 """
 from hashlib import sha256
 import json
-from typing import Dict, List, Literal, Optional
+from typing import Annotated, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -58,13 +58,31 @@ class PlanOrder(_Strict):
     lines: List[PlanLine] = Field(min_length=1, max_length=8)
 
 
-class PlanHistory(_Strict):
-    operation: Literal['return_delivered_order_items', 'cancel_order', 'exchange_delivered_order_items',
-                       'reship_order_items', 'request_item_return', 'return_received']
-    line: Optional[str] = None
-    order: Optional[str] = None
+class HistoryLine(_Strict):
+    """An earlier action on one order line."""
+    operation: Literal['return_delivered_order_items', 'reship_order_items', 'request_item_return',
+                       'return_received']
+    line: str
     quantity: int = Field(default=1, ge=1)
-    target_sku: Optional[str] = None
+
+
+class HistoryCancel(_Strict):
+    """An earlier cancellation of a whole order."""
+    operation: Literal['cancel_order']
+    order: str
+
+
+class HistoryExchange(_Strict):
+    """An earlier exchange of a line for another SKU."""
+    operation: Literal['exchange_delivered_order_items']
+    line: str
+    target_sku: str
+    quantity: int = Field(default=1, ge=1)
+
+
+# One variant per operation, each with exactly the fields it needs, so constrained decoding
+# cannot produce a history step the environment would have to reject.
+PlanHistory = Annotated[Union[HistoryLine, HistoryCancel, HistoryExchange], Field(discriminator='operation')]
 
 
 class PlanWorld(_Strict):
@@ -167,8 +185,9 @@ def plan_drafts(plan, plan_id):
     }
     if world.history:
         data['history'] = [{key: value for key, value in {
-            'operation': row.operation, 'line_alias': row.line, 'order_alias': row.order,
-            'quantity': row.quantity, 'target_sku_alias': row.target_sku}.items() if value is not None}
+            'operation': row.operation, 'line_alias': getattr(row, 'line', None),
+            'order_alias': getattr(row, 'order', None), 'quantity': getattr(row, 'quantity', None),
+            'target_sku_alias': getattr(row, 'target_sku', None)}.items() if value is not None}
             for row in world.history]
     style = int(sha256(plan_id.encode()).hexdigest()[:8], 16)
     tasks = []
@@ -238,8 +257,10 @@ def plan_from_drafts(data, task, hypothesis):
                    for row in data['orders']],
         'history': [{key: value for key, value in {
             'operation': row['operation'], 'line': row.get('line_alias'), 'order': row.get('order_alias'),
-            'quantity': row.get('quantity', 1), 'target_sku': row.get('target_sku_alias')}.items()
-            if value is not None} for row in data.get('history', ())],
+            # A cancellation covers the whole order and has no quantity.
+            'quantity': None if row['operation'] == 'cancel_order' else row.get('quantity', 1),
+            'target_sku': row.get('target_sku_alias')}.items() if value is not None}
+            for row in data.get('history', ())],
     }
     requests = [{'line': row['line_alias'], 'action': row['action'], 'quantity': row['quantity'],
                  'attributes': {item['name']: item['value'] for item in row.get('required_attributes', ())},

@@ -42,6 +42,34 @@ def test_plan_errors_are_readable_codes():
     assert plan_schema()['title'] == 'DesignerPlan'
 
 
+def test_history_steps_must_carry_the_fields_their_operation_needs():
+    base = example_plan('F1', 3)
+    for bad in ({'operation': 'return_delivered_order_items'},                      # no line
+                {'operation': 'exchange_delivered_order_items', 'line': 'line_0'},  # no target_sku
+                {'operation': 'cancel_order'},                                      # no order
+                {'operation': 'cancel_order', 'order': 'order_0', 'quantity': 2}):  # a cancel has no quantity
+        plan = json.loads(json.dumps(base))
+        plan['world']['history'] = [bad]
+        with pytest.raises(PlanError, match='SCHEMA'):
+            parse_plan(plan)
+    plan = json.loads(json.dumps(base))
+    plan['world']['history'] = [{'operation': 'cancel_order', 'order': 'order_0'}]
+    assert parse_plan(plan).world.history[0].order == 'order_0'
+    schema = json.dumps(plan_schema())
+    assert 'HistoryLine' in schema and 'HistoryExchange' in schema and 'HistoryCancel' in schema
+
+
+def test_a_plan_with_engine_history_round_trips_and_certifies(tmp_path):
+    data, task = draft_instance('F1', 3, near_distractors=3)
+    assert data.get('history')                                  # the generator recorded a settled distractor
+    plan = plan_from_drafts(data, task, 'history round trip').model_dump(mode='json')
+    row = certify_designer_plan(WorldKit(tmp_path), json.dumps(plan), 'plan-history', 3)
+    assert row['status'] == 'certified', row
+    from rift.designer.format import plan_drafts
+    rebuilt, _ = plan_drafts(parse_plan(plan), 'plan-history')
+    assert rebuilt['history'] == data['history']
+
+
 def test_uncertifiable_request_is_rejected_with_a_reason_not_a_crash(tmp_path):
     plan = example_plan('F1', 3)
     # Naming an item by its order date needs an order date the plan never gave.

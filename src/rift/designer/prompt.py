@@ -21,6 +21,8 @@ Business rules the environment applies:
 - Shipped (not yet delivered) orders cannot be refunded, exchanged or reshipped.
 - A customer with max_extra_charge_cents or arrive_within_days declines offers outside those limits.
 - history lists actions that already happened before the task (for example an earlier partial refund).
+  A step names its line (a line alias from your orders) and quantity; cancel_order names an order instead;
+  an exchange also names target_sku. Leave history empty unless the task needs it.
 - Every requested item must be identifiable from the request alone: refer_by chooses how the customer
   names it (attributes, delivery_age, price, order_date) and that description must match exactly one
   of the customer's order lines.
