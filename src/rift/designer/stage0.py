@@ -11,8 +11,11 @@ from collections import Counter
 import json
 from pathlib import Path
 
-from rift.designer.format import PlanError, plan_proposal, plan_schema
-from rift.designer.prompt import designer_messages, example_plans
+from rift.designer.format import PlanError, extract_json, plan_proposal, plan_schema
+from rift.designer.prompt import copy_score, designer_messages, example_plans
+
+# A plan sharing at least this fraction of its money values with a prompt example is a copy.
+COPY_THRESHOLD = 0.5
 
 
 def _reason_codes(challenge):
@@ -63,10 +66,18 @@ def summarize(rows):
     answers = Counter(answer for row in rows for answer in row['answers'])
     signatures = {sig for row in rows for sig in row['signatures'] if not sig.startswith('unmeasured')}
     certified = sum(len(row['task_refs']) for row in rows)
-    return {'plans': len(rows), 'plan_status': dict(statuses),
-            'plans_with_a_certified_task': sum(bool(row['task_refs']) for row in rows),
-            'certified_tasks': certified, 'answers': dict(answers),
-            'distinct_signatures': len(signatures), 'rejection_reasons': dict(reasons.most_common())}
+    scores = [row['copy_score'] for row in rows if row.get('copy_score') is not None]
+    copied = [row for row in rows if (row.get('copy_score') or 0) >= COPY_THRESHOLD]
+    report = {'plans': len(rows), 'plan_status': dict(statuses),
+              'plans_with_a_certified_task': sum(bool(row['task_refs']) for row in rows),
+              'certified_tasks': certified, 'answers': dict(answers),
+              'distinct_signatures': len(signatures), 'rejection_reasons': dict(reasons.most_common())}
+    if scores:
+        report.update(mean_copy_score=round(sum(scores) / len(scores), 3),
+                      copied_plans=len(copied), copy_threshold=COPY_THRESHOLD,
+                      certified_not_copied=sum(bool(row['task_refs']) for row in rows
+                                               if (row.get('copy_score') or 0) < COPY_THRESHOLD))
+    return report
 
 
 def vllm_generate(model, messages_list, *, seed, temperature=1.0, max_tokens=4096, tensor_parallel_size=1,
@@ -113,6 +124,10 @@ def run(world_kit, generate, failures, *, samples, seed, out_dir, examples=2, si
             row = certify_designer_plan(world_kit, text, f'designer-{seed}-{index:04d}', seed + index,
                                         signatures=signatures)
             row['response'] = text
+            try:
+                row['copy_score'] = copy_score(extract_json(text), example_plans(seed + index, examples))
+            except PlanError:
+                row['copy_score'] = None
             rows.append(row)
             stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + '\n')
     world_kit.save()

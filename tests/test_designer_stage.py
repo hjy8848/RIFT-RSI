@@ -70,6 +70,22 @@ def test_prompt_contains_rules_failures_and_examples():
     assert 'refuse (APPROVAL_REQUIRED)' in user['content'] and user['content'].count('"hypothesis"') == 2
 
 
+def test_copy_score_flags_a_copied_example_and_not_an_invented_plan():
+    from rift.designer.prompt import copy_score, example_plans
+    examples = example_plans(5, 2)
+    copied = examples[0].model_dump(mode='json')
+    assert copy_score(copied, examples) == 1.0
+    invented = json.loads(json.dumps(copied))
+    for sku in invented['world']['skus']:
+        sku['price_cents'] += 7919
+    for order in invented['world']['orders']:
+        for line in order['lines']:
+            line['paid_cents'] += 6101
+    invented['world']['refund_approval_limit_cents'] += 4409
+    assert copy_score(invented, examples) < 0.5
+    assert 'example' not in designer_messages([], seed=5)[1]['content'].split('Examples of valid plans:')[1].lower()
+
+
 def test_balanced_seeds_split_answers_evenly():
     seeds = balanced_seeds('F5', 6, 100)
     answers = [task_outcome(generate_instance('F5', seed).task) for seed in seeds]

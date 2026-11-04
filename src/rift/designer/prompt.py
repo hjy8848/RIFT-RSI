@@ -26,8 +26,12 @@ Business rules the environment applies:
   of the customer's order lines.
 
 Good tasks train the agent's weaknesses shown in the failures, mix requests that should be carried out
-with requests that should be refused, place values near the rule boundaries, and are not copies of
-the failures or of the examples. Answer with exactly one JSON object and nothing else."""
+with requests that should be refused, and place values near the rule boundaries.
+
+The examples only show the format. Do not copy an example or a failure: invent a different store
+(other products, families, prices, quantities, delivery ages, limits, number of orders and lines) and
+different requests. Your hypothesis must name the weakness you target in your own words.
+Answer with exactly one JSON object and nothing else."""
 
 
 def failure_text(case):
@@ -48,8 +52,48 @@ def example_plans(seed, count=2):
     plans = []
     for family in families:
         data, task = draft_instance(family, rng.randrange(10**6))
-        plans.append(plan_from_drafts(data, task, f'example of a generated {family} task'))
+        # Neutral text: a family name or "example" label here gets copied into the answer.
+        plans.append(plan_from_drafts(data, task, 'what this task trains, in your own words'))
     return plans
+
+
+def plan_numbers(value):
+    """Multiset of the integer values above 100 inside a plan: prices, amounts paid and limits.
+
+    Smaller values (days, quantities, the default 30-day return window) coincide by chance.
+    """
+    from collections import Counter
+    found = Counter()
+
+    def walk(node):
+        if isinstance(node, bool):
+            return
+        if isinstance(node, int) and node > 100:
+            found[node] += 1
+        elif isinstance(node, dict):
+            for item in node.values():
+                walk(item)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+    walk(value)
+    return found
+
+
+def copy_score(plan_value, examples):
+    """Largest share of a plan's money values that also occur in one prompt example.
+
+    Invented values hardly ever coincide; a copied example scores near 1. No numbers scores 0.
+    """
+    mine = plan_numbers(plan_value.get('world', plan_value))
+    total = sum(mine.values())
+    if not total:
+        return 0.0
+    best = 0.0
+    for example in examples:
+        shared = sum((mine & plan_numbers(example.model_dump(mode='json')['world'])).values())
+        best = max(best, shared / total)
+    return round(best, 3)
 
 
 def designer_messages(failures, *, seed, examples=2, feedback=()):
