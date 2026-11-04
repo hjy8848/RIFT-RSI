@@ -98,8 +98,8 @@ def copy_score(plan_value, examples):
     return round(best, 3)
 
 
-def designer_messages(failures, *, seed, examples=2, feedback=()):
-    """Chat messages for one Designer generation."""
+def designer_messages(failures, *, seed, examples=2, feedback=(), focus=False):
+    """Chat messages for one Designer generation; ``focus`` adds the seed's coverage focus."""
     parts = ['Training failures of the agent:']
     parts += [f'[{index + 1}]\n' + failure_text(case) for index, case in enumerate(failures)] or ['(none yet)']
     if feedback:
@@ -108,5 +108,8 @@ def designer_messages(failures, *, seed, examples=2, feedback=()):
     parts.append('Examples of valid plans:')
     parts += [json.dumps(plan.model_dump(mode='json', exclude_defaults=True), ensure_ascii=False)
               for plan in example_plans(seed, examples)]
+    if focus:
+        from rift.designer.focus import focus_for, focus_text
+        parts.append(focus_text(focus_for(seed)))
     parts.append('Write one new plan as a single JSON object.')
     return [{'role': 'system', 'content': SYSTEM}, {'role': 'user', 'content': '\n\n'.join(parts)}]

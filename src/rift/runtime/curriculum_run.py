@@ -647,7 +647,8 @@ def designer_round(rng, designer_refs, mix_pairs, tasks_per_round, mix_fraction)
 
 def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from_run=None,
                collector_factory=None, policy=None, heldout_specs=None, heldout_groups=4,
-               heldout_seed=2000, heldout_label='x2base', designer_plans=None, mix_fraction=0.25):
+               heldout_seed=2000, heldout_label='x2base', designer_plans=None, mix_fraction=0.25,
+               designer_selected_only=False):
     """Plain GRPO on a fixed pool of certified tasks.
 
     Without ``policy`` each round is a balanced sample of every class (X2). With one of the
@@ -672,7 +673,7 @@ def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from
         from rift.designer.stage0 import certify_saved_plans
         if policy is not None or not 0 <= mix_fraction < 1:
             raise ValueError('Designer training takes no curriculum policy and a mix fraction in [0, 1)')
-        designer_refs = certify_saved_plans(context.world, designer_plans)
+        designer_refs = certify_saved_plans(context.world, designer_plans, selected_only=designer_selected_only)
         if not designer_refs:
             raise ValueError('the stage-0 file has no certified Designer task')
         by_key = context.world.certify_specs(train_specs) if train_specs else {}
@@ -844,7 +845,8 @@ def collect_failures(context, *, specs, groups, seed, max_cases, from_run=None, 
             'failures': str(context.root / 'failures.json'), 'run_root': str(context.root)}
 
 
-def evaluate(context, *, specs, groups, seed, label, from_run=None, designer_plans=None):
+def evaluate(context, *, specs, groups, seed, label, from_run=None, designer_plans=None,
+             designer_selected_only=False):
     """Sample ``groups`` x group_size episodes per task and report success rates.
 
     ``designer_plans`` adds the certified tasks of a stage-0 file as one more class,
@@ -853,7 +855,8 @@ def evaluate(context, *, specs, groups, seed, label, from_run=None, designer_pla
     by_key = context.world.certify_specs(specs) if specs else {}
     if designer_plans:
         from rift.designer.stage0 import certify_saved_plans
-        by_key['designer'] = certify_saved_plans(context.world, designer_plans)
+        by_key['designer'] = certify_saved_plans(context.world, designer_plans,
+                                                 selected_only=designer_selected_only)
     if not by_key:
         raise ValueError('nothing to evaluate: give --specs and/or --designer-plans')
     context.world.save()
@@ -925,6 +928,8 @@ def main(argv=None):
     pool_parser.add_argument('--train-specs', help='JSON list of task specs; inline or file. With '
         '--designer-plans these are the balanced generator tasks mixed into every round')
     pool_parser.add_argument('--designer-plans', help='stage-0 designer-plans.jsonl: train on its certified tasks')
+    pool_parser.add_argument('--designer-selected-only', action='store_true',
+        help='with --designer-plans: only the tasks stage 0 selected (not copied, distinct signature)')
     pool_parser.add_argument('--mix-fraction', type=float, default=0.25,
         help='with --designer-plans: share of each round drawn from --train-specs')
     pool_parser.add_argument('--rounds', type=int, required=True)
@@ -961,6 +966,8 @@ def main(argv=None):
     eval_parser.add_argument('--specs', help='JSON list of {family, knobs, instances, seed} or generator specs; '
         'inline or file (default: the built-in benchmark, unless --designer-plans is given)')
     eval_parser.add_argument('--designer-plans', help='stage-0 designer-plans.jsonl: also evaluate its certified tasks')
+    eval_parser.add_argument('--designer-selected-only', action='store_true',
+        help='only the tasks stage 0 selected (not copied, distinct signature)')
     eval_parser.add_argument('--groups', type=int, default=2, help='GRPO groups sampled per task')
     eval_parser.add_argument('--group-size', type=int, default=4)
     eval_parser.add_argument('--from-run', help='train run directory whose final.json supplies the checkpoint')
@@ -1004,7 +1011,7 @@ def main(argv=None):
             init_from_run=args.init_from_run, policy=policy,
             heldout_specs=load_json_argument(args.heldout_specs) if args.heldout_specs else None,
             heldout_groups=args.heldout_groups, designer_plans=args.designer_plans,
-            mix_fraction=args.mix_fraction)
+            mix_fraction=args.mix_fraction, designer_selected_only=args.designer_selected_only)
         if 'heldout' in result:
             (context.root / 'eval-result.json').write_text(
                 json.dumps(result['heldout'], sort_keys=True, indent=2), encoding='utf-8')
@@ -1021,7 +1028,7 @@ def main(argv=None):
             specs=(load_json_argument(args.specs) if args.specs
                    else [] if args.designer_plans else list(DEFAULT_BENCH)),
             groups=args.groups, seed=args.seed, label=args.label, from_run=args.from_run,
-            designer_plans=args.designer_plans)
+            designer_plans=args.designer_plans, designer_selected_only=args.designer_selected_only)
     (context.root / ('%s-result.json' % args.command)).write_text(
         json.dumps(result, sort_keys=True, indent=2), encoding='utf-8')
     print(json.dumps(result, sort_keys=True))

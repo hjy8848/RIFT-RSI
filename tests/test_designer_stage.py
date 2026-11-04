@@ -114,6 +114,50 @@ def test_copy_score_flags_a_copied_example_and_not_an_invented_plan():
     assert 'example' not in designer_messages([], seed=5)[1]['content'].split('Examples of valid plans:')[1].lower()
 
 
+def test_focus_is_deterministic_and_covers_every_action_and_structure():
+    from collections import Counter
+    from rift.designer.focus import ACTION_RULES, STRUCTURES, focus_for, focus_text
+    assert focus_for(7) == focus_for(7)
+    foci = [focus_for(seed) for seed in range(400)]
+    assert {f['action'] for f in foci} == set(ACTION_RULES)                 # reship and cancel are asked for
+    assert {f['structure'] for f in foci} == set(STRUCTURES)                # history and multi-request too
+    assert min(Counter(f['action'] for f in foci).values()) > 40
+    assert 'reship' in focus_text({**foci[0], 'action': 'reship'})
+    messages = designer_messages([], seed=5, focus=True)
+    assert focus_text(focus_for(5)) in messages[1]['content']
+    assert 'Focus of this plan' not in designer_messages([], seed=5)[1]['content']
+
+
+def test_selection_drops_copies_and_repeated_signatures():
+    from rift.designer.stage0 import select_tasks
+    rows = [{'task_refs': ['a', 'b'], 'signatures': ['s1', 's2'], 'copy_score': 0.1},
+            {'task_refs': ['c'], 'signatures': ['s1'], 'copy_score': 0.0},                  # same signature as 'a'
+            {'task_refs': ['d'], 'signatures': ['s9'], 'copy_score': 0.9},                  # copied from an example
+            {'task_refs': ['e', 'f'], 'signatures': ['unmeasured:ValueError', 'unmeasured:ValueError'],
+             'copy_score': None}]                                                           # unmeasured counts as unique
+    assert select_tasks(rows) == 4
+    assert [row['selected'] for row in rows] == [[True, True], [False], [False], [True, True]]
+
+
+def test_stage0_with_focus_selects_and_can_reload_only_the_selection(tmp_path):
+    report = run(WorldKit(tmp_path / 's0'), lambda prompts: dry_run_generate(prompts, seed=41), [],
+                 samples=6, seed=41, out_dir=tmp_path / 's0', focus=True)
+    assert report['plans'] == 6 and report['selected_tasks'] <= report['certified_tasks']
+    assert 'focus_asked' in report and report['actions']
+    rows = [json.loads(line) for line in (tmp_path / 's0' / 'designer-plans.jsonl').read_text().splitlines()]
+    assert all(len(row['selected']) == len(row['task_refs']) == len(row['actions']) for row in rows)
+    plans = tmp_path / 's0' / 'designer-plans.jsonl'
+    everything = certify_saved_plans(WorldKit(tmp_path / 'a'), plans)
+    chosen = certify_saved_plans(WorldKit(tmp_path / 'b'), plans, selected_only=True)
+    assert set(chosen) <= set(everything) and len(chosen) == report['selected_tasks']
+    legacy = [dict(row) for row in rows]
+    for row in legacy:
+        row.pop('selected')
+    (tmp_path / 'old.jsonl').write_text('\n'.join(json.dumps(row) for row in legacy), encoding='utf-8')
+    with pytest.raises(ValueError, match='no selection'):
+        certify_saved_plans(WorldKit(tmp_path / 'c'), tmp_path / 'old.jsonl', selected_only=True)
+
+
 def test_balanced_seeds_split_answers_evenly():
     seeds = balanced_seeds('F5', 6, 100)
     answers = [task_outcome(generate_instance('F5', seed).task) for seed in seeds]

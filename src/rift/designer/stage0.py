@@ -32,7 +32,7 @@ def certify_designer_plan(world_kit, text, plan_id, world_seed, *, signatures=Fa
     """Certify one Designer output. Returns a JSON-ready row; certified task refs in ``task_refs``."""
     from rift.runtime.curriculum_run import plan_identity
     row = {'plan_id': plan_id, 'world_seed': world_seed, 'task_refs': [], 'answers': [],
-           'reasons': [], 'signatures': []}
+           'actions': [], 'reasons': [], 'signatures': []}
     try:
         proposal = plan_proposal(text, plan_id)
     except PlanError as exc:
@@ -48,6 +48,8 @@ def certify_designer_plan(world_kit, text, plan_id, world_seed, *, signatures=Fa
     for task in result.tasks:
         row['task_refs'].append(task.record_hash)
         row['answers'].append('refusal' if task.refusal_goals else 'success')
+        requests = getattr(task.request_bundle, 'requests', ())
+        row['actions'].append(sorted({request.action for request in requests}))
         if signatures:
             from rift.probes.fingerprint import decision_fingerprint
             try:
@@ -58,6 +60,27 @@ def certify_designer_plan(world_kit, text, plan_id, world_seed, *, signatures=Fa
     row['status'] = ('certified' if len(result.tasks) == len(result.challenge_results)
                      else 'partly_certified' if result.tasks else 'tasks_rejected')
     return row
+
+
+def select_tasks(rows, copy_threshold=COPY_THRESHOLD):
+    """Mark which certified tasks to train on: not copied from an example, first of their signature.
+
+    A task whose signature could not be measured counts as unique. Sets ``row['selected']``
+    (one boolean per certified task, in ``task_refs`` order) and returns the number selected.
+    """
+    seen, total = set(), 0
+    for row in rows:
+        flags = []
+        for index in range(len(row['task_refs'])):
+            signature = row['signatures'][index] if index < len(row['signatures']) else None
+            measured = signature is not None and not signature.startswith('unmeasured')
+            keep = (row.get('copy_score') or 0) < copy_threshold and not (measured and signature in seen)
+            if keep and measured:
+                seen.add(signature)
+            flags.append(keep)
+        row['selected'] = flags
+        total += sum(flags)
+    return total
 
 
 def summarize(rows):
@@ -77,6 +100,18 @@ def summarize(rows):
                       copied_plans=len(copied), copy_threshold=COPY_THRESHOLD,
                       certified_not_copied=sum(bool(row['task_refs']) for row in rows
                                                if (row.get('copy_score') or 0) < COPY_THRESHOLD))
+    actions = Counter(action for row in rows for task_actions in row.get('actions', ()) for action in task_actions)
+    multi = sum(len(task_actions) > 1 for row in rows for task_actions in row.get('actions', ()))
+    report.update(actions=dict(actions), tasks_with_several_actions=multi)
+    if any('selected' in row for row in rows):
+        picked = [(row, index) for row in rows for index, flag in enumerate(row.get('selected', ())) if flag]
+        report.update(selected_tasks=len(picked),
+                      selected_answers=dict(Counter(row['answers'][index] for row, index in picked)),
+                      selected_actions=dict(Counter(action for row, index in picked
+                                                    for action in row['actions'][index])))
+    focused = [row for row in rows if row.get('focus_hit') is not None]
+    if focused:
+        report.update(focus_obeyed=sum(bool(row['focus_hit']) for row in focused), focus_asked=len(focused))
     return report
 
 
@@ -109,27 +144,36 @@ def dry_run_generate(messages_list, *, seed):
             for index in range(len(messages_list))]
 
 
-def run(world_kit, generate, failures, *, samples, seed, out_dir, examples=2, signatures=True):
+def run(world_kit, generate, failures, *, samples, seed, out_dir, examples=2, signatures=True, focus=False):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     plans_path = out_dir / 'designer-plans.jsonl'
     if plans_path.exists():
         raise FileExistsError('this run directory already has Designer plans; use a new one')
-    prompts = [designer_messages(failures, seed=seed + index, examples=examples) for index in range(samples)]
+    prompts = [designer_messages(failures, seed=seed + index, examples=examples, focus=focus)
+               for index in range(samples)]
     texts = generate(prompts)
     if len(texts) != len(prompts):
         raise ValueError('the generator returned a different number of responses')
     rows = []
+    for index, text in enumerate(texts):
+        row = certify_designer_plan(world_kit, text, f'designer-{seed}-{index:04d}', seed + index,
+                                    signatures=signatures)
+        row['response'] = text
+        parsed = None
+        try:
+            parsed = extract_json(text)
+            row['copy_score'] = copy_score(parsed, example_plans(seed + index, examples))
+        except PlanError:
+            row['copy_score'] = None
+        if focus:
+            from rift.designer.focus import focus_for, focus_hit
+            row['focus'] = focus_for(seed + index)
+            row['focus_hit'] = None if parsed is None else focus_hit(row['focus'], parsed)
+        rows.append(row)
+    select_tasks(rows)          # needs every row's signature, so the file is written afterwards
     with plans_path.open('w', encoding='utf-8') as stream:
-        for index, text in enumerate(texts):
-            row = certify_designer_plan(world_kit, text, f'designer-{seed}-{index:04d}', seed + index,
-                                        signatures=signatures)
-            row['response'] = text
-            try:
-                row['copy_score'] = copy_score(extract_json(text), example_plans(seed + index, examples))
-            except PlanError:
-                row['copy_score'] = None
-            rows.append(row)
+        for row in rows:
             stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + '\n')
     world_kit.save()
     report = summarize(rows)
@@ -141,10 +185,11 @@ def load_plans(path):
     return [json.loads(line) for line in Path(path).read_text(encoding='utf-8').splitlines() if line.strip()]
 
 
-def certify_saved_plans(world_kit, path):
+def certify_saved_plans(world_kit, path, *, selected_only=False):
     """Re-certify the certified plans of a stage-0 file into ``world_kit``; returns their task refs.
 
     World construction and certification are deterministic, so the refs are the same ones.
+    ``selected_only`` keeps only the tasks stage 0 marked for training (not copied, distinct signature).
     """
     from rift.runtime.curriculum_run import plan_identity
     from rift.tasks import Proposal
@@ -160,6 +205,10 @@ def certify_saved_plans(world_kit, path):
         found = [task.record_hash for task in result.tasks]
         if found != row['task_refs']:
             raise ValueError(f"plan {row['plan_id']} no longer certifies to the same tasks")
+        if selected_only:
+            if 'selected' not in row:
+                raise ValueError('this stage-0 file has no selection; rerun stage 0 or drop --designer-selected-only')
+            found = [ref for ref, keep in zip(found, row['selected']) if keep]
         refs.extend(found)
     return refs
 
@@ -184,6 +233,8 @@ def main(argv=None):
         help='share of each GPU vLLM may take (lower it on a shared machine)')
     parser.add_argument('--patience-slack', type=int)
     parser.add_argument('--no-signatures', action='store_true')
+    parser.add_argument('--focus', action='store_true',
+        help='tell each plan what to cover (action, rule, structure, side, naming), chosen by seed')
     parser.add_argument('--dry-run', action='store_true', help='use generator examples instead of a model')
     args = parser.parse_args(argv)
     failures = json.loads(Path(args.failures).read_text(encoding='utf-8'))['cases'] if args.failures else []
@@ -198,7 +249,7 @@ def main(argv=None):
         parser.error('--designer-model is required unless --dry-run')
     kit = WorldKit(args.run_root, patience_slack=args.patience_slack)
     report = run(kit, generate, failures, samples=args.samples, seed=args.seed, out_dir=args.run_root,
-                 examples=args.examples, signatures=not args.no_signatures)
+                 examples=args.examples, signatures=not args.no_signatures, focus=args.focus)
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
