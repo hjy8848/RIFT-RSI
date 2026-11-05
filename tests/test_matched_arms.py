@@ -1,6 +1,7 @@
-import sys
+﻿import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path[:0] = ['src', 'third_party/usami']
@@ -282,6 +283,26 @@ class ContextForkTests(unittest.TestCase):
             runtime = context.ensure_runtime(start)
             self.assertIs(context.resync(start), runtime)
             self.assertEqual(self.log, [('sync', '0')])
+
+    def test_the_worker_manifest_lists_a_forked_arms_checkpoint(self):
+        import json
+        arm_a = Checkpoint('service', '2', 't', 'a' * 64)
+        arm_b = Checkpoint('service', '2', 't', 'b' * 64)       # same step, other arm
+        with tempfile.TemporaryDirectory() as root:
+            context = self._context(root)
+            del context._worker_manifest                         # use the real method
+            for cp in (arm_a, arm_b):
+                context.checkpoint_store.virtual.add(cp)
+                context.checkpoint_store.artifact_digests[cp] = cp.weights_digest
+            manifests = Path(root) / 'checkpoints'
+            context.checkpoint_store.save_manifest(manifests / 'service-step-2.json')   # arm A's, written first
+            path = context._worker_manifest(arm_b)               # arm B's own manifest was skipped
+            listed = json.loads(path.read_text())['checkpoint_manifest']
+            records = json.loads(Path(listed).read_text())['records']
+            self.assertIn({'policy': 'service', 'revision': '2', 'tokenizer': 't', 'weights_digest': 'b' * 64},
+                          [row['checkpoint'] for row in records])
+            with self.assertRaises(ValueError):
+                context._worker_manifest(Checkpoint('service', '9', 't', 'c' * 64))
 
     def test_two_arms_reaching_the_same_step_do_not_collide_on_the_manifest(self):
         from types import SimpleNamespace

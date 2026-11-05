@@ -388,8 +388,12 @@ class ExperimentContext:
             self.checkpoint_store.save_manifest(manifest_path)
         records = json.loads(manifest_path.read_text(encoding='utf-8'))['records']
         if asdict(checkpoint) not in [row['checkpoint'] for row in records]:
-            # The active checkpoint came from an adopted external manifest.
-            manifest_path = self.root / 'checkpoints' / 'adopted.json'
+            # The newest step manifest does not list the active checkpoint: it came from an adopted
+            # external manifest, or from a forked arm whose own step manifest was not written
+            # (its step number was already taken). Write one that lists it, named by its weights.
+            if checkpoint not in self.checkpoint_store.paths and checkpoint not in self.checkpoint_store.virtual:
+                raise ValueError('the active checkpoint is unknown to the checkpoint store')
+            manifest_path = self.root / 'checkpoints' / ('active-%s.json' % checkpoint.weights_digest[:20])
             if not manifest_path.exists():
                 self.checkpoint_store.save_manifest(manifest_path)
         # One fixed path: a runtime that stays up across rounds keeps the path it was
