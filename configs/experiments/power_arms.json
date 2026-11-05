@@ -1,0 +1,5 @@
+[
+  {"name": "A", "source": "random", "seed": 1},
+  {"name": "A2", "source": "random", "seed": 2},
+  {"name": "B", "source": "designer", "seed": 1}
+]

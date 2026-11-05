@@ -405,6 +405,38 @@ class ExperimentContext:
             return runtime
         return self.open_runtime(checkpoint)
 
+    def resync(self, checkpoint):
+        """Wake vLLM with ``checkpoint``'s weights after a batch put it to sleep.
+
+        The runtime releases vLLM after every generate call and only a weight sync brings it
+        back, so two generate calls in a row (screening, then a measurement) need this between.
+        """
+        runtime = self.ensure_runtime(checkpoint)
+        runtime.synchronize(checkpoint)
+        return runtime
+
+    def restore(self, checkpoint):
+        """Load ``checkpoint`` from disk into the live trainer and vLLM, without restarting Ray.
+
+        Matched arms fork from one checkpoint: each arm after the first starts by restoring it.
+        The model, optimizer, scheduler and RNG state all come back from the files.
+        """
+        if checkpoint in getattr(self.checkpoint_store, 'virtual', ()):
+            raise ValueError('revision %s exists only in memory and cannot be restored' % checkpoint.revision)
+        runtime = self.runtime
+        if runtime is None:
+            return self.open_runtime(checkpoint)
+        try:
+            if runtime.restore_training_state('service', runtime.worker_group, checkpoint) is not True:
+                raise ValueError('restoring the training state of revision %s failed' % checkpoint.revision)
+            runtime.synchronize(checkpoint)
+        except BaseException:
+            self.close_runtime()      # a half-restored runtime must not serve anything
+            raise
+        self.world.save()
+        self._worker_manifest(checkpoint)
+        return runtime
+
     def close_runtime(self):
         runtime, self.runtime = self.runtime, None
         if runtime is not None:
@@ -427,8 +459,9 @@ class LazyBatch:
 
 class RoundBackend:
     """Runs the real VERL update on the live runtime, which stays up for the next round."""
-    def __init__(self, context, index, checkpoint):
+    def __init__(self, context, index, checkpoint, persist=None):
         self.context, self.index, self.checkpoint = context, index, checkpoint
+        self.persist = persist          # None: the run's persist_every schedule decides
 
     def budget_for(self, request):
         return self.context.update_budget
@@ -450,7 +483,7 @@ class RoundBackend:
                 checkpoint_manifest_path=context.root / 'checkpoints' / ('service-step-%d.json' % step),
                 mini_batch_size=context.update_budget.mini_batch_size,
                 epochs=context.update_budget.epochs,
-                persist=context.persists(self.index))
+                persist=context.persists(self.index) if self.persist is None else self.persist)
             completed = backend.train(request)
         except BaseException:
             context.close_runtime()    # a half-updated runtime must not serve another round
@@ -786,6 +819,62 @@ def train_pool(context, *, train_specs, rounds, tasks_per_round, seed, init_from
     return result
 
 
+def _drop(context, refs, kinds):
+    return [ref for ref in refs if not uses_reference(context, ref, kinds)] if kinds else list(refs)
+
+
+def power_check(context, *, train_specs, probe_specs, designer_plans, designer_selected_only, arms, pairs,
+                steps, tasks_per_step, mix_fraction, n_recovery, n_retention, seed, screen_groups,
+                probe_groups, lambda_retention, drop_references=(), init_from_run=None, n_boot=2000):
+    """Matched arms from the starting checkpoint: is one Teacher action's reward measurable?
+
+    Two random arms give the noise floor of the reward difference; a Designer arm against a
+    random one gives an effect size. Nothing is written back as a new policy.
+    """
+    from rift.runtime.matched_arms import run_matched_arms
+    if (context.root / 'power-check-log.jsonl').exists():
+        raise FileExistsError('this run directory already ran a power check; use a new one')
+    if init_from_run and not (context.root / 'initial-checkpoint.json').exists():
+        start = context.adopt_initial_from(init_from_run)
+    else:
+        start = context.initial_checkpoint()
+    kinds = set(drop_references)
+    train_by_key = context.world.certify_specs(train_specs)
+    train_pairs = [(key, ref) for key in sorted(train_by_key) for ref in _drop(context, train_by_key[key], kinds)]
+    probe_by_key = context.world.certify_specs(probe_specs)
+    probe_pool = {key: kept for key in sorted(probe_by_key)
+                  if (kept := _drop(context, probe_by_key[key], kinds))}
+    designer_refs = None
+    if any(arm.source == 'designer' for arm in arms):
+        if not designer_plans:
+            raise ValueError('a designer arm needs --designer-plans')
+        from rift.designer.stage0 import certify_saved_plans
+        designer_refs = _drop(context, certify_saved_plans(context.world, designer_plans,
+                                                           selected_only=designer_selected_only), kinds)
+        if not designer_refs:
+            raise ValueError('no Designer task is left for the designer arm')
+    if not train_pairs or not probe_pool:
+        raise ValueError('both the training pool and the probe pool need tasks')
+    context.world.save()
+    log_path = context.root / 'power-check-log.jsonl'
+
+    def log(event):
+        with log_path.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(event, sort_keys=True, default=str) + '\n')
+    log({'event': 'pools', 'train': len(train_pairs), 'designer': len(designer_refs or ()),
+         'probe_pool': sum(len(v) for v in probe_pool.values())})
+    try:
+        result = run_matched_arms(context, start=start, arms=arms, probe_pool=probe_pool,
+            train_pairs=train_pairs, designer_refs=designer_refs, steps=steps, tasks_per_step=tasks_per_step,
+            mix_fraction=mix_fraction, n_recovery=n_recovery, n_retention=n_retention, seed=seed, pairs=pairs,
+            screen_groups=screen_groups, probe_groups=probe_groups, lambda_retention=lambda_retention,
+            n_boot=n_boot, log=log)
+    finally:
+        context.close_runtime()
+    result['run_root'] = str(context.root)
+    return result
+
+
 def build_eval_requests(by_key, checkpoint, *, groups, group_size, seed, label):
     """Train-mode GRPO groups on frozen tasks; the update step is never run."""
     from rift.runtime.evaluator import checkpoint_json
@@ -984,6 +1073,34 @@ def main(argv=None):
     pool_parser.add_argument('--heldout-groups', type=int, default=4)
     pool_parser.add_argument('--init-from-run')
     pool_parser.add_argument('--restart-each-round', action='store_true')
+    power_parser = sub.add_parser('power-check',
+        help='matched arms from one checkpoint on frozen probes: noise floor and effect of one Teacher action')
+    _common(power_parser)
+    power_parser.add_argument('--train-specs', required=True, help='TRAIN pool task specs; inline or file')
+    power_parser.add_argument('--probe-specs', required=True,
+        help='probe pool task specs (seeds disjoint from the TRAIN pool); inline or file')
+    power_parser.add_argument('--designer-plans', help='stage-0 designer-plans.jsonl for designer arms')
+    power_parser.add_argument('--designer-selected-only', action='store_true')
+    power_parser.add_argument('--arms', required=True,
+        help='JSON list of {name, source: random|designer, seed}; inline or file')
+    power_parser.add_argument('--pairs', required=True, help='treatment-control pairs, e.g. "B-A,A2-A"')
+    power_parser.add_argument('--steps', type=int, default=4, help='updates per arm (K)')
+    power_parser.add_argument('--tasks-per-step', type=int, default=16)
+    power_parser.add_argument('--mix-fraction', type=float, default=0.5,
+        help='share of each designer-arm step drawn from the TRAIN pool')
+    power_parser.add_argument('--recovery', type=int, default=64)
+    power_parser.add_argument('--retention', type=int, default=64)
+    power_parser.add_argument('--screen-groups', type=int, default=1)
+    power_parser.add_argument('--probe-groups', type=int, default=2,
+        help='groups of --group-size samples per probe task (2 x 4 = 8)')
+    power_parser.add_argument('--lambda-retention', type=float, default=0.5)
+    power_parser.add_argument('--drop-references', default='')
+    power_parser.add_argument('--group-size', type=int, default=4)
+    power_parser.add_argument('--mini-batch-size', type=int, default=16)
+    power_parser.add_argument('--epochs', type=int, default=1)
+    power_parser.add_argument('--learning-rate', type=float, default=1e-6)
+    power_parser.add_argument('--response-length', type=int, default=20480)
+    power_parser.add_argument('--init-from-run')
     failures_parser = sub.add_parser('collect-failures',
         help='sample the Service on training tasks and write failures.json for the Designer')
     _common(failures_parser)
@@ -1050,6 +1167,22 @@ def main(argv=None):
         if 'heldout' in result:
             (context.root / 'eval-result.json').write_text(
                 json.dumps(result['heldout'], sort_keys=True, indent=2), encoding='utf-8')
+    elif args.command == 'power-check':
+        from rift.runtime.matched_arms import parse_arms, parse_pairs
+        arms = parse_arms(load_json_argument(args.arms))
+        budget = UpdateBudget(args.mini_batch_size, args.epochs, args.learning_rate)
+        # Arms must not write checkpoint files except where the runner asks for it.
+        context = _context(args, budget, args.group_size, response_length=args.response_length,
+                           keep_runtime=True, persist_every=0)
+        context.persist_final = False
+        result = power_check(context, train_specs=load_json_argument(args.train_specs),
+            probe_specs=load_json_argument(args.probe_specs), designer_plans=args.designer_plans,
+            designer_selected_only=args.designer_selected_only, arms=arms,
+            pairs=parse_pairs(args.pairs, arms), steps=args.steps, tasks_per_step=args.tasks_per_step,
+            mix_fraction=args.mix_fraction, n_recovery=args.recovery, n_retention=args.retention,
+            seed=args.seed, screen_groups=args.screen_groups, probe_groups=args.probe_groups,
+            lambda_retention=args.lambda_retention, init_from_run=args.init_from_run,
+            drop_references=tuple(item for item in args.drop_references.split(',') if item))
     elif args.command == 'collect-failures':
         context = _context(args, UpdateBudget(world_size, 1, 1e-6), args.group_size,
                            response_length=args.response_length)
