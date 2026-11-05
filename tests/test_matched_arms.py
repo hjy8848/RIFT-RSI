@@ -119,6 +119,11 @@ class ArmTests(unittest.TestCase):
         self.assertEqual(sum(source == 'designer' for source, _ in first), 8)
         self.assertNotEqual(first, step_tasks(arm, 1, train_pairs=train, designer_refs=designer,
                                               tasks_per_step=16, mix_fraction=0.5))
+        few = step_tasks(arm, 0, train_pairs=train, designer_refs=['d0', 'd1', 'd1'], tasks_per_step=16,
+                         mix_fraction=0.5)                       # fewer new tasks than the Teacher's share
+        self.assertEqual(len(few), 16)
+        self.assertEqual(len({ref for _, ref in few}), 16)       # no task twice in one package
+        self.assertEqual(sum(source == 'designer' for source, _ in few), 2)
         random_arm = step_tasks(ArmSpec('A', 'random', 3), 0, train_pairs=train, designer_refs=None,
                                 tasks_per_step=16, mix_fraction=0.5)
         self.assertEqual(len(random_arm), 16)

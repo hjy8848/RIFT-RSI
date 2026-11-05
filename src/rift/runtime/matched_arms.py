@@ -205,7 +205,17 @@ def step_tasks(arm, step, *, train_pairs, designer_refs, tasks_per_step, mix_fra
         return rng.sample(pool, tasks_per_step) if len(pool) >= tasks_per_step else rng.choices(pool, k=tasks_per_step)
     if not designer_refs:
         raise ValueError('arm %s needs Designer tasks' % arm.name)
-    return designer_round(rng, designer_refs, train_pairs, tasks_per_step, mix_fraction)
+    # A task may appear once per package (its rollout ids come from package, task and sample index),
+    # so when the Teacher wrote fewer new tasks than its share of a step, TRAIN tasks fill the rest.
+    designer_refs = list(dict.fromkeys(designer_refs))
+    n_mix = round(tasks_per_step * mix_fraction) if train_pairs else 0
+    share = min(tasks_per_step - n_mix, len(designer_refs))
+    chosen = [('designer', ref) for ref in rng.sample(designer_refs, share)]
+    pool = list(train_pairs)
+    chosen += rng.sample(pool, min(tasks_per_step - share, len(pool)))
+    if len(chosen) < tasks_per_step:
+        raise ValueError('too few distinct tasks to fill a step of %d' % tasks_per_step)
+    return chosen
 
 
 def train_step(context, checkpoint, chosen, *, index, seed, persist, label):
