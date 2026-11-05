@@ -223,6 +223,11 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
         config.actor_rollout_ref.model.override_config.attn_implementation = attention
         if attention != "flash_attention_2":
             config.actor_rollout_ref.model.use_remove_padding = False
+    # Gradient checkpointing recomputes the forward pass in the backward pass (about a third more compute)
+    # to keep activations out of memory. Without it a 5k-token sequence needs ~30 GB of activations and a
+    # 20k-token one does not fit, so turning it off goes with a micro-batch of 1 and risks the longest episodes.
+    if os.environ.get("RIFT_GRAD_CHECKPOINT", "1") == "0":
+        config.actor_rollout_ref.model.enable_gradient_checkpointing = False
     config.actor_rollout_ref.hybrid_engine = True
     config.actor_rollout_ref.actor.strategy = "fsdp2"
     config.actor_rollout_ref.actor.fsdp_config.model_dtype = "bfloat16"

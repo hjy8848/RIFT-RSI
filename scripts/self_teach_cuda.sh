@@ -29,6 +29,7 @@ setsid nohup bash -c '
   # P2P stays off by default (it deadlocked between two A6000s on zju-47); NVLink hosts can pass NCCL_P2P_DISABLE=0.
   export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1} HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
   export RIFT_PPO_MICRO_BATCH=${RIFT_PPO_MICRO_BATCH:-1}
+  export RIFT_GRAD_CHECKPOINT=${RIFT_GRAD_CHECKPOINT:-1} RIFT_ATTN_IMPLEMENTATION=${RIFT_ATTN_IMPLEMENTATION:-sdpa}
   cd "$W" || exit 7
   python -m rift.runtime.curriculum_run '"$COMMAND"' --service-model "$MODEL" --run-root "$RUN" \
     --verl-config-dir "$W/configs/verl" "$@"
