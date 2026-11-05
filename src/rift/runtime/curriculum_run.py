@@ -975,6 +975,28 @@ def agent_workers():
     return max(1, int(os.environ.get('RIFT_AGENT_WORKERS', hardware.current().world_size)))
 
 
+def even_batch(requests, owners, workers):
+    """Drop the fewest episodes that make ``requests`` divide evenly over ``workers``.
+
+    One episode is taken from each of the last tasks in turn, so a task keeps all but at most one of
+    its samples and none disappears from a report. A batch smaller than the worker count is left to VERL.
+    """
+    extra = len(requests) % workers
+    if not extra or len(requests) < workers:
+        return requests
+    dropped = set()
+    while len(dropped) < extra:
+        taken = set()
+        for position in range(len(requests) - 1, -1, -1):
+            task = owners[requests[position]['rift_request_id']][1]
+            if position not in dropped and task not in taken:
+                dropped.add(position)
+                taken.add(task)
+                if len(dropped) == extra:
+                    break
+    return [request for position, request in enumerate(requests) if position not in dropped]
+
+
 def sample_rows(context, by_key, checkpoint, *, groups, seed, label):
     """Sample ``groups`` x group_size episodes per task on the live runtime.
 
@@ -984,9 +1006,7 @@ def sample_rows(context, by_key, checkpoint, *, groups, seed, label):
         group_size=context.group_size, seed=seed, label=label)
     # VERL hands the batch to its agent workers in equal chunks, so the count must divide
     # evenly: the last few episodes of an uneven batch are left out.
-    requests = requests[:len(requests) - len(requests) % agent_workers()]
-    if not requests:
-        raise ValueError('too few episodes to give every agent worker one')
+    requests = even_batch(requests, owners, agent_workers())
     # One generate call only: the runtime puts vLLM to sleep after every call and
     # nothing wakes it before the next one, so a second call would wait forever.
     outputs = LazyBatch(context, checkpoint).generate(requests)

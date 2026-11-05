@@ -1,6 +1,7 @@
 """VERL v0.9.1 AgentLoop extension; the host session stays outside model input."""
 from dataclasses import asdict
 import json
+import os
 from uuid import uuid4
 from rift.verl.capture import ContinuousCapture
 
@@ -116,8 +117,15 @@ def __getattr__(name):
                 raise ValueError('rollout checkpoint was not verified')
             if sink.attestor.verify_serving(checkpoint) is not True:
                 raise ValueError('rollout serving weights were not verified')
+            import time
+            laps, episode_started = {}, time.perf_counter()
+
+            def lap(name, since):
+                laps[name] = laps.get(name, 0.0) + time.perf_counter() - since
             try:
+                lap_started = time.perf_counter()
                 messages, tools = await session.start()
+                lap('start', lap_started)
                 messages = list(messages)
                 initial = await self.ct_build_initial_tokens(messages, tools=tools)
                 capture = ContinuousCapture(initial, checkpoint)
@@ -151,8 +159,10 @@ def __getattr__(name):
                     explicit = turn_sampling_params.get('max_tokens')
                     limits = [remaining] + [x for x in (requested, explicit) if x is not None]
                     turn_sampling_params['max_tokens'] = min(limits)
+                    lap_started = time.perf_counter()
                     output = await self.server_manager.generate(request_id=model_request_id, prompt_ids=prefix,
                                                                 sampling_params=turn_sampling_params)
+                    lap('generate', lap_started)
                     token_ids = list(output.token_ids)
                     from rift.verl.sampling import finite_logprobs
                     token_logprobs = finite_logprobs(output.log_probs)
@@ -171,21 +181,27 @@ def __getattr__(name):
                     # accumulator before appending the first assistant logprobs.
                     if token_logprobs is not None and logprobs is None:
                         logprobs = []
+                    lap_started = time.perf_counter()
                     merged, masks, logprobs = await self.ct_merge_assistant_token(
                         prefix, token_ids, masks, logprobs, assistant_logprobs=token_logprobs)
                     capture.add_generation(prefix, token_ids, token_logprobs, merged.token_ids, masks)
+                    lap('merge', lap_started)
                     # Host parses the actual model output, invokes Usami, and returns
                     # only the appended public conversation. No Oracle enters messages.
+                    lap_started = time.perf_counter()
                     assistant_message, additions, done = await session.advance(token_ids, prefix,
                         turn_sampling_params, token_logprobs, generation_id, serving_fields=serving_fields)
+                    lap('advance', lap_started)
                     messages.append(assistant_message)
                     if len(capture.mask) > self.rollout_config.response_length:
                         raise ValueError('rollout exceeds response budget; no truncation of evidence')
                     if done: break
                     previous = list(messages)
                     messages.extend(additions)
+                    lap_started = time.perf_counter()
                     merged, next_masks, next_logprobs = await self.ct_merge_context_msg(
                         previous, messages, list(capture.current), masks, logprobs, tools=tools)
+                    lap('merge', lap_started)
                     if (len(next_masks) >= self.rollout_config.response_length
                             or (model_limit is not None and len(merged.token_ids) >= model_limit)):
                         # The environment output was never sent to the model. Keep
@@ -194,7 +210,9 @@ def __getattr__(name):
                         break
                     masks, logprobs = next_masks, next_logprobs
                     capture.add_context(merged.token_ids, masks)
+                lap_started = time.perf_counter()
                 episode = await session.finish()
+                lap('finish', lap_started)
                 tokens = capture.output()
                 if logprobs is not None and len(logprobs) != len(tokens.response):
                     raise ValueError('rollout log probabilities are not aligned with response tokens')
@@ -202,7 +220,15 @@ def __getattr__(name):
                     raise ValueError('Service episode crossed synchronized policy revisions')
                 # Persist the native replay object and exact model tokens before
                 # deriving the public outcome. UNKNOWN remains unevaluable.
+                lap_started = time.perf_counter()
                 await sink.persist(episode, checkpoint, tuple(capture.decisions), tokens)
+                lap('persist', lap_started)
+                profile_file = os.environ.get('RIFT_PROFILE_FILE')
+                if profile_file:     # one line per episode: where its wall time went (seconds)
+                    with open(profile_file, 'a', encoding='utf-8') as stream:
+                        stream.write(json.dumps({'mode': mode, 'turns': len(capture.decisions),
+                            'response_tokens': len(tokens.response), 'total': time.perf_counter() - episode_started,
+                            **{key: round(value, 4) for key, value in laps.items()}}) + '\n')
                 from rift.benchmark.public_feedback import service_reward
                 from rift.benchmark.usami import public_episode
                 public = public_episode(episode)
