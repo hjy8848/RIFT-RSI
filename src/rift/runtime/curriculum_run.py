@@ -142,6 +142,14 @@ class WorldKit:
         self.proof_budget = proof_budget or ProofBudget()
         self.episode_budget = episode_budget or EpisodeBudget()
         self.patience_slack = patience_slack
+        # Generator instances already certified under the same settings: key -> task ref.
+        # Re-proving them costs about two seconds each; the registry already holds the result.
+        self.spec_refs_path = directory / 'spec-refs.json'
+        self._spec_refs = {}
+        if self.spec_refs_path.exists():
+            stored = json.loads(self.spec_refs_path.read_text(encoding='utf-8'))
+            if stored.get('patience_slack') == patience_slack:
+                self._spec_refs = dict(stored.get('refs', {}))
 
     def host(self, instance):
         from rift.benchmark.usami import CommerceHost
@@ -172,6 +180,16 @@ class WorldKit:
                  if spec.get('balanced') else range(spec['seed'], spec['seed'] + spec['instances']))
         refs = []
         for seed in seeds:
+            cache_key = '%s:%d:%s' % (spec['generator'], seed, json.dumps(options, sort_keys=True))
+            cached = self._spec_refs.get(cache_key)
+            if cached is not None:
+                try:
+                    self.task_registry.resolve_record(cached)
+                except Exception:           # not in this registry after all: certify it again
+                    cached = None
+            if cached is not None:
+                refs.append(cached)
+                continue
             data, task = draft_instance(spec['generator'], seed, **options)
             proposal = Proposal(f"gen-{spec['generator']}-{seed}", f"generated {spec['generator']}",
                                 world_draft=data, challenges=(task,))
@@ -181,6 +199,7 @@ class WorldKit:
                 raise RuntimeError('generator %s seed %d did not certify: %s %s'
                                    % (spec['generator'], seed, result.build.status, result.challenge_results))
             refs.append(result.tasks[0].record_hash)
+            self._spec_refs[cache_key] = result.tasks[0].record_hash
         return refs
 
     def certify_specs(self, specs):
@@ -206,6 +225,45 @@ class WorldKit:
     def save(self):
         self.split_registry.save()
         self.task_registry.save()
+        temporary = self.spec_refs_path.with_suffix('.tmp')
+        temporary.write_text(json.dumps({'patience_slack': self.patience_slack, 'refs': self._spec_refs},
+                                        sort_keys=True), encoding='utf-8')
+        temporary.replace(self.spec_refs_path)
+
+
+def seed_task_registry(run_root, source, patience_slack=None):
+    """Start a run with the certified tasks of an earlier one (its ``task_registry`` directory or a copy of it).
+
+    The split and task registries must come from the same moment, so the pair is checked on load.
+    """
+    import shutil
+    source, target = Path(source), Path(run_root) / 'task_registry'
+    if source.name != 'task_registry' and (source / 'task_registry').is_dir():
+        source = source / 'task_registry'
+    names = ('splits.json', 'certified-tasks.json', 'spec-refs.json')
+    if not all((source / name).exists() for name in names[:2]):
+        raise FileNotFoundError('%s has no splits.json and certified-tasks.json to start from' % source)
+    target.mkdir(parents=True, exist_ok=True)
+    if any((target / name).exists() for name in names):
+        raise FileExistsError('%s already holds a task registry' % target)
+    for name in names:
+        if (source / name).exists():
+            shutil.copy2(source / name, target / name)
+    if not (source / 'spec-refs.json').exists():
+        # A registry written before the spec cache existed: every generator task records its
+        # generator, options and seed in its identity, so the cache can be rebuilt from it.
+        if patience_slack is not None:
+            raise ValueError('cannot tell which patience setting that registry was certified with; '
+                             'start it from a registry that has spec-refs.json')
+        refs = {}
+        for ref, row in json.loads((source / 'certified-tasks.json').read_text(encoding='utf-8'))['records'].items():
+            if not row['identity']['family'].startswith('gen:'):
+                continue
+            lineage = json.loads(row['identity']['lineage'])
+            options = {k: v for k, v in lineage.items() if k not in ('generator', 'spec_hash', 'world_seed')}
+            refs['%s:%d:%s' % (lineage['generator'], lineage['world_seed'], json.dumps(options, sort_keys=True))] = ref
+        (target / 'spec-refs.json').write_text(json.dumps({'patience_slack': None, 'refs': refs}, sort_keys=True),
+                                               encoding='utf-8')
 
 
 class ExperimentContext:
@@ -1000,6 +1058,9 @@ def _common(parser):
     parser.add_argument('--verl-config-dir', required=True)
     parser.add_argument('--episode-budget-config')
     parser.add_argument('--tool-profile', default='full9', choices=('full9', 'core4'))
+    parser.add_argument('--task-registry-from',
+        help='start from the certified tasks of an earlier run (its task_registry directory); '
+             'generator tasks already in it are not proved again')
     parser.add_argument('--seed', type=int, default=2000)
     parser.add_argument('--patience-slack', type=int,
         help='Customer leaves after the certified minimum Service decisions, plus one per extra '
@@ -1011,6 +1072,8 @@ def _context(args, update_budget, group_size, response_length=8192, keep_runtime
     from rift.runtime.ascend_910b3 import _default_smoke_episode_budget
     budget = (EpisodeBudget.model_validate(json.loads(Path(args.episode_budget_config).read_text(encoding='utf-8')))
               if args.episode_budget_config else _default_smoke_episode_budget())
+    if getattr(args, 'task_registry_from', None):
+        seed_task_registry(args.run_root, args.task_registry_from, getattr(args, 'patience_slack', None))
     return ExperimentContext(root=args.run_root, service_model=args.service_model,
         verl_config_dir=args.verl_config_dir, episode_budget=budget,
         update_budget=update_budget, tool_profile=args.tool_profile, group_size=group_size,
