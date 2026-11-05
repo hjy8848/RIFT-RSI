@@ -225,12 +225,18 @@ def train_step(context, checkpoint, chosen, *, index, seed, persist, label):
     source = {group.group_id: group.source for group in groups}
     for row in request.rollouts:
         rewards.setdefault(source[row.group_id], []).append(row.reward)
+    counts, episodes = {}, []
+    for row in request.rollouts:                  # what the Solver did on each task, for plan rewards and failures
+        won, seen = counts.get(row.task_id, (0, 0))
+        counts[row.task_id] = (won + int(row.reward >= 1), seen + 1)
+        episodes.append({'task_ref': row.task_id, 'outcome': 'success' if row.reward >= 1 else 'failure',
+                         'episode_id': row.episode_id})
     sampled = time.perf_counter()
     request = fit_request_to_batches(request, context.update_budget.mini_batch_size)
     update = RoundBackend(context, index, checkpoint, persist=persist).train(request)
     return update.policy_after, {
         'index': index, 'revision': update.policy_after.revision, 'rollouts': collected,
-        'trained_rollouts': len(request.rollouts),
+        'trained_rollouts': len(request.rollouts), 'task_counts': counts, 'episodes': episodes,
         'train_success': {key: sum(v) / len(v) for key, v in sorted(rewards.items())},
         'sample_seconds': round(sampled - started, 1),
         'update_seconds': round(time.perf_counter() - sampled, 1)}
@@ -241,7 +247,7 @@ def train_step(context, checkpoint, chosen, *, index, seed, persist, label):
 def run_matched_arms(context, *, start, arms, probe_pool, train_pairs, designer_refs, steps,
                      tasks_per_step, mix_fraction, n_recovery, n_retention, seed, pairs,
                      screen_groups=1, probe_groups=2, lambda_retention=0.5, min_valid_fraction=0.8,
-                     persist_last=False, n_boot=2000, log=None):
+                     persist_last=False, n_boot=2000, log=None, index_start=0, label_prefix=''):
     """Fork every arm from ``start``, train ``steps`` updates each, score all on one frozen probe set.
 
     ``start`` must exist on disk: every arm after the first restores it inside the live
@@ -258,14 +264,15 @@ def run_matched_arms(context, *, start, arms, probe_pool, train_pairs, designer_
         raise ValueError('%d probe-pool tasks are also training tasks' % len(probe_refs & train_refs))
     log = log or (lambda event: None)
     from rift.runtime.curriculum_run import sample_rows
-    screen_rows = sample_rows(context, probe_pool, start, groups=screen_groups, seed=seed + 1, label='screen')
+    screen_rows = sample_rows(context, probe_pool, start, groups=screen_groups, seed=seed + 1,
+                              label=label_prefix + 'screen')
     probes = select_probes(task_counts(screen_rows), n_recovery=n_recovery, n_retention=n_retention, seed=seed)
     log({'event': 'probes_frozen', 'recovery': len(probes.recovery), 'retention': len(probes.retention)})
     context.resync(start)
     before = task_counts(sample_rows(context, probes.by_key(), start, groups=probe_groups, seed=seed,
-                                     label='before'))
+                                     label=label_prefix + 'before'))
     log({'event': 'before_measured'})
-    after, history, index = {}, {}, 0
+    after, history, index = {}, {}, index_start
     for position, arm in enumerate(arms):
         if position:
             context.restore(start)
@@ -277,13 +284,13 @@ def run_matched_arms(context, *, start, arms, probe_pool, train_pairs, designer_
             if step == 0 and position == 0:
                 context.resync(checkpoint)       # the "before" evaluation left vLLM asleep
             checkpoint, row = train_step(context, checkpoint, chosen, index=index, seed=seed + 1000 * step,
-                                         persist=persist_last and last, label=arm.name)
+                                         persist=persist_last and last, label=label_prefix + arm.name)
             history[arm.name].append(row)
             log({'event': 'arm_step', 'arm': arm.name, **row})
             index += 1
         # Same customer seeds as "before" (paired); the label keeps rollout identities distinct.
         after[arm.name] = task_counts(sample_rows(context, probes.by_key(), checkpoint, groups=probe_groups,
-                                                  seed=seed, label='arm-' + arm.name))
+                                                  seed=seed, label=label_prefix + 'arm-' + arm.name))
         log({'event': 'arm_measured', 'arm': arm.name, 'revision': checkpoint.revision})
     report = compare_arms(before, after, probes, pairs, lambda_retention=lambda_retention,
                           min_valid_fraction=min_valid_fraction, n_boot=n_boot, seed=seed)
@@ -291,4 +298,4 @@ def run_matched_arms(context, *, start, arms, probe_pool, train_pairs, designer_
             'arms': [asdict(arm) for arm in arms], 'steps': steps, 'tasks_per_step': tasks_per_step,
             'mix_fraction': mix_fraction, 'probes': {'recovery': list(probes.recovery),
                                                      'retention': list(probes.retention)},
-            'history': history, 'report': report}
+            'history': history, 'report': report, 'next_index': index}

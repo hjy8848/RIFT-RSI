@@ -62,13 +62,16 @@ def certify_designer_plan(world_kit, text, plan_id, world_seed, *, signatures=Fa
     return row
 
 
-def select_tasks(rows, copy_threshold=COPY_THRESHOLD):
+def select_tasks(rows, copy_threshold=COPY_THRESHOLD, seen=None):
     """Mark which certified tasks to train on: not copied from an example, first of their signature.
 
     A task whose signature could not be measured counts as unique. Sets ``row['selected']``
     (one boolean per certified task, in ``task_refs`` order) and returns the number selected.
+    ``seen`` carries signatures from earlier rounds (it is updated in place), so a Teacher is
+    not credited for writing the same decision structure again.
     """
-    seen, total = set(), 0
+    seen = set() if seen is None else seen
+    total = 0
     for row in rows:
         flags = []
         for index in range(len(row['task_refs'])):

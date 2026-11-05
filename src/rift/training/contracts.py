@@ -15,9 +15,17 @@ class Rollout:
     response_id: str | None = None
     reward_ref: str | None = None
     target_ability_id: str | None = None
+    # Log-probabilities the sampling policy gave each response token (aligned with
+    # tokens.response). Only Teacher rollouts carry them: they were sampled before the
+    # weights moved, so the update needs the behavior probabilities, not recomputed ones.
+    behavior_logprobs: tuple[float, ...] | None = None
     def __post_init__(self):
         if not all((self.task_id, self.episode_id, self.reward_source)) or not isfinite(self.reward):
             raise ValueError("rollout provenance and finite reward required")
+        if self.behavior_logprobs is not None:
+            if (len(self.behavior_logprobs) != len(self.tokens.response)
+                    or any(not isfinite(x) or x > 1e-6 for x in self.behavior_logprobs)):
+                raise ValueError("behavior log-probabilities must be finite, non-positive and one per response token")
         if self.group_id is not None and not self.group_id:
             raise ValueError("empty group ID")
         if self.response_id == '' or self.reward_ref == '':
@@ -34,11 +42,18 @@ class UpdateRequest:
     advantage_baseline: float | None = None
     reward_protocol: str | None = None
     credit_assignment_mode: str | None = None
+    # Teacher updates only: the checkpoints the rollouts were sampled from.
+    behavior_policies: tuple[Checkpoint, ...] | None = None
     def __post_init__(self):
         if not self.package_id or not self.algorithm or not self.rollouts:
             raise ValueError("update requires package, algorithm and rollouts")
         if self.advantage_baseline is not None and not isfinite(self.advantage_baseline):
             raise ValueError("finite scalar advantage baseline required")
+        if self.algorithm.lower() == "teacher_grpo":
+            self._check_teacher_update()
+            return
+        if self.behavior_policies is not None or any(r.behavior_logprobs is not None for r in self.rollouts):
+            raise ValueError("behavior policies belong to Teacher updates only")
         if any(r.policy != self.policy_before for r in self.rollouts):
             raise ValueError("rollouts must match checkpoint")
         if self.algorithm.lower() == "reinforce_baseline":
@@ -60,6 +75,29 @@ class UpdateRequest:
                 raise ValueError("GRPO group members need a common, comparable reward source")
             if any(len({r.policy for r in g}) != 1 for g in groups.values()):
                 raise ValueError("GRPO group members must use one policy checkpoint")
+
+    def _check_teacher_update(self):
+        """Off-policy GRPO for the Teacher: groups of plans written from one prompt by an earlier policy."""
+        if (not self.behavior_policies or self.reward_protocol != "teacher_learnability_v1"
+                or self.credit_assignment_mode is not None):
+            raise ValueError("a Teacher update needs behavior policies and the teacher_learnability_v1 protocol")
+        before = self.policy_before
+        for policy in self.behavior_policies:
+            if (policy.policy != before.policy or policy.tokenizer != before.tokenizer
+                    or int(policy.revision) > int(before.revision)):
+                raise ValueError("behavior policies must be earlier checkpoints of the same policy")
+        allowed = set(self.behavior_policies)
+        groups = {}
+        for r in self.rollouts:
+            if r.policy not in allowed or r.behavior_logprobs is None:
+                raise ValueError("every Teacher rollout needs its behavior policy and log-probabilities")
+            if not r.group_id:
+                raise ValueError("Teacher updates require explicit groups")
+            groups.setdefault(r.group_id, []).append(r)
+        if any(len({r.episode_id for r in g}) < 2 or len({r.tokens.prompt for r in g}) != 1
+               or len({r.policy for r in g}) != 1 for g in groups.values()):
+            raise ValueError("Teacher groups need distinct plans written from the same prompt by one policy")
+
 
 @dataclass(frozen=True)
 class CompletedUpdate:

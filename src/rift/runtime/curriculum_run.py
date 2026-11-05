@@ -459,9 +459,11 @@ class LazyBatch:
 
 class RoundBackend:
     """Runs the real VERL update on the live runtime, which stays up for the next round."""
-    def __init__(self, context, index, checkpoint, persist=None):
+    def __init__(self, context, index, checkpoint, persist=None, *, rollout_verifier=None, mini_batch_size=None):
         self.context, self.index, self.checkpoint = context, index, checkpoint
         self.persist = persist          # None: the run's persist_every schedule decides
+        self.rollout_verifier = rollout_verifier        # None: Service episodes from the capture store
+        self.mini_batch_size = mini_batch_size          # None: the run's update budget
 
     def budget_for(self, request):
         return self.context.update_budget
@@ -473,7 +475,7 @@ class RoundBackend:
         runtime = context.ensure_runtime(self.checkpoint)
         try:
             runtime.backend_bindings = {
-                'rollout_verifier': NativeServiceRolloutVerifier(
+                'rollout_verifier': self.rollout_verifier or NativeServiceRolloutVerifier(
                     context.capture_store.resolve_episode, context.capture_store),
                 'run_recorder': context.ledger, 'update_verifier': context.ledger}
             backend = runtime.create_update_backend(request,
@@ -481,7 +483,8 @@ class RoundBackend:
                 after_revision=str(step), run_id=run_id_for(self.index), round_index=self.index,
                 metric_sink=context.metric_sink,
                 checkpoint_manifest_path=context.root / 'checkpoints' / ('service-step-%d.json' % step),
-                mini_batch_size=context.update_budget.mini_batch_size,
+                mini_batch_size=(context.update_budget.mini_batch_size if self.mini_batch_size is None
+                                 else self.mini_batch_size),
                 epochs=context.update_budget.epochs,
                 persist=context.persists(self.index) if self.persist is None else self.persist)
             completed = backend.train(request)
@@ -1101,6 +1104,38 @@ def main(argv=None):
     power_parser.add_argument('--learning-rate', type=float, default=1e-6)
     power_parser.add_argument('--response-length', type=int, default=20480)
     power_parser.add_argument('--init-from-run')
+    teach_parser = sub.add_parser('self-teach',
+        help='shared-weight Self-Taught Teacher: the policy writes tasks, trains on them, and learns from the result')
+    _common(teach_parser)
+    teach_parser.add_argument('--train-specs', required=True, help='TRAIN pool task specs; inline or file')
+    teach_parser.add_argument('--probe-specs', help='probe pool for calibration actions; inline or file')
+    teach_parser.add_argument('--actions', type=int, default=30, help='Teacher actions (plan, train, update)')
+    teach_parser.add_argument('--groups', type=int, default=2, help='prompts per action')
+    teach_parser.add_argument('--plans', type=int, default=8, help='plans per prompt (one GRPO group)')
+    teach_parser.add_argument('--steps', type=int, default=4, help='Solver updates per action (K)')
+    teach_parser.add_argument('--tasks-per-step', type=int, default=16)
+    teach_parser.add_argument('--mix-fraction', type=float, default=0.5)
+    teach_parser.add_argument('--calibrate-every', type=int, default=5,
+        help='run a random-task control arm and score both on probes every N actions (0: never)')
+    teach_parser.add_argument('--recovery', type=int, default=64)
+    teach_parser.add_argument('--retention', type=int, default=64)
+    teach_parser.add_argument('--probe-groups', type=int, default=2)
+    teach_parser.add_argument('--lambda-retention', type=float, default=0.5)
+    teach_parser.add_argument('--invalid-reward', type=float, default=-0.1)
+    teach_parser.add_argument('--max-tokens', type=int, default=4096)
+    teach_parser.add_argument('--unconstrained', action='store_true',
+        help='do not pass the plan schema to vLLM; unparseable plans simply score as invalid')
+    teach_parser.add_argument('--max-failures', type=int, default=8)
+    teach_parser.add_argument('--keep-checkpoints', type=int, default=0,
+        help='delete older fork checkpoints (about 23 GB each), keeping this many and every --keep-every-th; 0 keeps all')
+    teach_parser.add_argument('--keep-every', type=int, default=5)
+    teach_parser.add_argument('--drop-references', default='')
+    teach_parser.add_argument('--group-size', type=int, default=4)
+    teach_parser.add_argument('--mini-batch-size', type=int, default=16)
+    teach_parser.add_argument('--epochs', type=int, default=1)
+    teach_parser.add_argument('--learning-rate', type=float, default=1e-6)
+    teach_parser.add_argument('--response-length', type=int, default=20480)
+    teach_parser.add_argument('--init-from-run')
     failures_parser = sub.add_parser('collect-failures',
         help='sample the Service on training tasks and write failures.json for the Designer')
     _common(failures_parser)
@@ -1183,6 +1218,22 @@ def main(argv=None):
             seed=args.seed, screen_groups=args.screen_groups, probe_groups=args.probe_groups,
             lambda_retention=args.lambda_retention, init_from_run=args.init_from_run,
             drop_references=tuple(item for item in args.drop_references.split(',') if item))
+    elif args.command == 'self-teach':
+        from rift.runtime.self_teach import self_teach
+        budget = UpdateBudget(args.mini_batch_size, args.epochs, args.learning_rate)
+        context = _context(args, budget, args.group_size, response_length=args.response_length,
+                           keep_runtime=True, persist_every=0)
+        context.persist_final = False
+        result = self_teach(context, train_specs=load_json_argument(args.train_specs),
+            probe_specs=load_json_argument(args.probe_specs) if args.probe_specs else None,
+            actions=args.actions, groups=args.groups, plans=args.plans, steps=args.steps,
+            tasks_per_step=args.tasks_per_step, mix_fraction=args.mix_fraction, seed=args.seed,
+            calibrate_every=args.calibrate_every, n_recovery=args.recovery, n_retention=args.retention,
+            probe_groups=args.probe_groups, lambda_retention=args.lambda_retention,
+            invalid_reward=args.invalid_reward, max_tokens=args.max_tokens, constrained=not args.unconstrained,
+            max_failures=args.max_failures, keep_checkpoints=args.keep_checkpoints, keep_every=args.keep_every,
+            drop_references=tuple(item for item in args.drop_references.split(',') if item),
+            init_from_run=args.init_from_run)
     elif args.command == 'collect-failures':
         context = _context(args, UpdateBudget(world_size, 1, 1e-6), args.group_size,
                            response_length=args.response_length)

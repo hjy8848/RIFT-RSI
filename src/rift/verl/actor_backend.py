@@ -15,10 +15,31 @@ from rift.verl.serving import checkpoint_step
 from rift.verl.version import require_verl_version
 
 
+TEACHER_ALGORITHM = 'teacher_grpo'
+TEACHER_REWARD_SOURCE = 'teacher_learnability_v1'
+
+
 def validate_request(request, role, rollout_verifier):
-    if not isinstance(request, UpdateRequest) or request.algorithm.lower() not in ('grpo', 'reinforce_plus_plus', 'reinforce_baseline'):
+    if (not isinstance(request, UpdateRequest)
+            or request.algorithm.lower() not in ('grpo', 'reinforce_plus_plus', 'reinforce_baseline', TEACHER_ALGORITHM)):
         raise ValueError('unsupported on-policy advantage estimator')
     if role not in ('service', 'designer'): raise ValueError('unknown policy role')
+    if request.algorithm.lower() == TEACHER_ALGORITHM:
+        # One set of weights plays both roles, so the Teacher update runs on the Service worker group.
+        if role != 'service':
+            raise ValueError('Teacher updates run on the shared-weight (Service) worker group')
+        for row in request.rollouts:
+            if (row.reward_source != TEACHER_REWARD_SOURCE or not row.response_id or not row.reward_ref
+                    or not row.group_id):
+                raise ValueError('Teacher rollouts need the teacher reward source, response and group provenance')
+            if rollout_verifier.verify_rollout(row, row.policy) is not True:
+                raise ValueError('Teacher rollout evidence was not verified')
+        groups = {}
+        for row in request.rollouts: groups.setdefault(row.group_id, []).append(row)
+        for group in groups.values():
+            if rollout_verifier.verify_group(group, group[0].policy) is not True:
+                raise ValueError('Teacher group provenance was not verified')
+        return request
     if role == 'service' and request.algorithm.lower() != 'grpo':
         raise ValueError('Service updates require verified same-task GRPO groups')
     if role == 'designer' and request.reward_protocol == 'dual_bank_outcome_v1':
@@ -90,6 +111,18 @@ class VerlGRPOBackend:
             if isinstance(value, Real) and not isinstance(value, bool) and isfinite(float(value)):
                 self._metric('service_gradient_norm', float(value), metric_name=str(name))
 
+    def _report_teacher_drift(self, recomputed, behavior, response_mask):
+        """How far the current policy has moved from the one that wrote the plans (token log-ratio)."""
+        import torch
+        mask = response_mask.to(recomputed.device).bool()
+        log_ratio = (recomputed - behavior.to(recomputed.device))[mask]
+        if log_ratio.numel() == 0:
+            return
+        ratio = log_ratio.exp()
+        self._metric('teacher_log_ratio_mean', float(log_ratio.mean()))
+        self._metric('teacher_log_ratio_abs_p95', float(torch.quantile(log_ratio.abs().float(), 0.95)))
+        self._metric('teacher_ratio_outside_clip', float(((ratio < 0.8) | (ratio > 1.2)).float().mean()))
+
     def train(self, request):
         update_started = time.perf_counter()
         validate_request(request, self.role, self.rollout_verifier)
@@ -146,11 +179,21 @@ class VerlGRPOBackend:
         self._metric(f'{self.role}_logprob_seconds', time.perf_counter() - logprob_started)
         old = no_padding_2_padding(tu.get(result, 'log_probs'), infer).float()
         if not torch.isfinite(old).all(): raise ValueError('nonfinite old policy log probabilities')
+        teacher = request.algorithm.lower() == TEACHER_ALGORITHM
+        if teacher:
+            # The plans were sampled before the weights moved: the PPO ratio is taken against the
+            # behavior probabilities. The recomputed ones only report how far the policy has drifted.
+            behavior = torch.zeros_like(old)
+            for i, row in enumerate(rows):
+                values = torch.tensor(row.behavior_logprobs, dtype=torch.float32)
+                behavior[i, :values.numel()] = values.to(behavior.device)
+            self._report_teacher_drift(old, behavior, tensors['response_mask'])
+            old = behavior
         rewards = torch.zeros_like(tensors['response_mask'], dtype=torch.float32)
         for i, row in enumerate(rows):
             last = max(j for j, enabled in enumerate(row.tokens.mask) if enabled)
             rewards[i, last] = row.reward
-        if request.algorithm.lower() == 'grpo':
+        if request.algorithm.lower() in ('grpo', TEACHER_ALGORITHM):
             advantages, _ = compute_grpo_outcome_advantage(rewards, tensors['response_mask'],
                 np.asarray([row.group_id for row in rows], dtype=object))
         elif request.algorithm.lower() == 'reinforce_baseline':

@@ -614,6 +614,21 @@ class Ascend910B3RoleRuntime:
             _stop_ray()
             raise
 
+    def run_teacher(self, make_coroutine):
+        """Run one batch of Teacher generations on the Service weights; vLLM sleeps once at the end.
+
+        The shared-weight Teacher writes plans through the same vLLM servers as the Solver. Its
+        plans for one round are sampled concurrently, so the servers may only be released after
+        all of them are back (a per-call sleep would cut the others off). Wake them first with
+        ``synchronize`` if an earlier call put them to sleep.
+        """
+        if self.agent_loop_manager is None or self.llm_server_manager is None:
+            raise RuntimeError('Teacher generation needs the Service runtime with its vLLM servers')
+        try:
+            return _resolve(make_coroutine(self.llm_server_manager.get_client()))
+        finally:
+            _resolve(self.checkpoint_manager.sleep_replicas())
+
     def _construct_workers(self):
         from rift import hardware
         target = hardware.current()
