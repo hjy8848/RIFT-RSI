@@ -283,6 +283,26 @@ class ContextForkTests(unittest.TestCase):
             self.assertIs(context.resync(start), runtime)
             self.assertEqual(self.log, [('sync', '0')])
 
+    def test_two_arms_reaching_the_same_step_do_not_collide_on_the_manifest(self):
+        from types import SimpleNamespace
+        start = Checkpoint('service', '0', 't', 'w0')
+        with tempfile.TemporaryDirectory() as root:
+            context = self._context(root)
+            runtime = context.ensure_runtime(start)
+            seen = []
+
+            def create(request, **kwargs):
+                seen.append(kwargs['checkpoint_manifest_path'])
+                return SimpleNamespace(train=lambda request: 'done')
+            runtime.create_update_backend = create
+            request = SimpleNamespace(policy_before=start)
+            run.RoundBackend(context, 0, start).train(request)
+            (context.root / 'checkpoints').mkdir(exist_ok=True)
+            seen[0].write_text('{}')                          # the first arm wrote step 1's manifest
+            run.RoundBackend(context, 1, start).train(request)   # a second arm from the same fork
+            self.assertEqual(seen[0].name, 'service-step-1.json')
+            self.assertIsNone(seen[1])
+
     def test_round_backend_persist_override(self):
         from types import SimpleNamespace
         start = Checkpoint('service', '0', 't', 'w0')

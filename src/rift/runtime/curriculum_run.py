@@ -531,6 +531,10 @@ class RoundBackend:
         from rift.verl.rollout_evidence import NativeServiceRolloutVerifier
         context, step = self.context, checkpoint_step(request.policy_before) + 1
         runtime = context.ensure_runtime(self.checkpoint)
+        # Arms forked from one checkpoint reach the same step number; the first manifest of that
+        # step stays, a later arm's is not written (its checkpoints are in memory anyway).
+        manifest = context.root / 'checkpoints' / ('service-step-%d.json' % step)
+        manifest = None if manifest.exists() else manifest
         try:
             runtime.backend_bindings = {
                 'rollout_verifier': self.rollout_verifier or NativeServiceRolloutVerifier(
@@ -540,7 +544,7 @@ class RoundBackend:
                 output_dir=context.root / 'checkpoints' / 'service' / ('global-step-%08d' % step),
                 after_revision=str(step), run_id=run_id_for(self.index), round_index=self.index,
                 metric_sink=context.metric_sink,
-                checkpoint_manifest_path=context.root / 'checkpoints' / ('service-step-%d.json' % step),
+                checkpoint_manifest_path=manifest,
                 mini_batch_size=(context.update_budget.mini_batch_size if self.mini_batch_size is None
                                  else self.mini_batch_size),
                 epochs=context.update_budget.epochs,
