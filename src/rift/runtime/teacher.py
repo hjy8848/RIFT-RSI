@@ -174,18 +174,29 @@ def certify_samples(world_kit, samples, *, prompt_seed, examples=2, copy_thresho
 
 # -- reward -------------------------------------------------------------------
 
-def plan_rewards(samples, task_counts, *, copy_threshold=None, invalid_reward=-0.1, repeat_reward=0.0):
+REJECTION_PENALTY = {'format_rejected': -0.3, 'world_rejected': -0.2, 'tasks_rejected': -0.15}
+
+
+def plan_rewards(samples, task_counts, *, copy_threshold=None, invalid_reward=-0.1, repeat_reward=0.0,
+                 rejection_penalty=None):
     """``{sample_id: reward or None}``; None means its tasks were not measured, so it is left out.
 
     ``task_counts`` maps a task ref to ``(successes, valid)`` from the Solver samples that trained
     on it. A plan is scored by the mean learnability of its selected (new, uncopied) tasks.
+
+    Plans the environment rejects are penalised by how far they got (unparseable < no world exists
+    < world but no valid task), and copies of a prompt example by ``invalid_reward``. Equal penalties
+    would leave a group of all-rejected plans with no learning signal: nobody is better than the rest.
     """
     from rift.designer.stage0 import COPY_THRESHOLD
     threshold = COPY_THRESHOLD if copy_threshold is None else copy_threshold
+    penalties = REJECTION_PENALTY if rejection_penalty is None else rejection_penalty
     rewards = {}
     for sample in samples:
         if not sample.usable(threshold):
-            rewards[sample.sample_id] = invalid_reward
+            status = sample.row.get('status')
+            rewards[sample.sample_id] = (invalid_reward if status in ('certified', 'partly_certified')
+                                         else penalties.get(status, invalid_reward))
             continue
         refs = sample.selected_refs()
         if not refs:

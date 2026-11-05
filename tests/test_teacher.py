@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import sys
 import tempfile
@@ -108,7 +108,17 @@ class RewardTests(unittest.TestCase):
         unmeasured = fake_sample('u', 'g', refs=['t9'])
         rewards = T.plan_rewards([invalid, copied, repeat, unmeasured], {'t1': (2, 4), 't2': (2, 4)},
                                  invalid_reward=-0.1)
-        self.assertEqual(rewards, {'i': -0.1, 'c': -0.1, 'r': 0.0, 'u': None})
+        self.assertEqual(rewards, {'i': -0.3, 'c': -0.1, 'r': 0.0, 'u': None})
+
+    def test_rejected_plans_are_ranked_by_how_far_they_got(self):
+        plans = [fake_sample('f', 'g', status='format_rejected'), fake_sample('w', 'g', status='world_rejected'),
+                 fake_sample('t', 'g', status='tasks_rejected'), fake_sample('c', 'g', refs=['t1'], copy=0.9)]
+        rewards = T.plan_rewards(plans, {})
+        self.assertLess(rewards['f'], rewards['w'])
+        self.assertLess(rewards['w'], rewards['t'])
+        self.assertLess(rewards['t'], rewards['c'])
+        self.assertLess(rewards['c'], 0.0)
+        self.assertGreater(len(set(rewards.values())), 1)           # a group of rejected plans still has a signal
 
 
 class UpdateRequestTests(unittest.TestCase):
@@ -204,7 +214,7 @@ class CertificationTests(unittest.TestCase):
             garbage = fake_sample('c-p9', 'c', text='not json')
             T.certify_samples(kit, [garbage], prompt_seed=11)
             self.assertEqual(garbage.row['status'], 'format_rejected')
-            self.assertEqual(T.plan_rewards([garbage], {}, invalid_reward=-0.1), {'c-p9': -0.1})
+            self.assertEqual(T.plan_rewards([garbage], {}), {'c-p9': -0.3})
 
     def test_signatures_seen_in_earlier_rounds_are_not_rewarded_again(self):
         with tempfile.TemporaryDirectory() as root:
