@@ -961,6 +961,12 @@ def build_eval_requests(by_key, checkpoint, *, groups, group_size, seed, label):
     return requests, owners
 
 
+def agent_workers():
+    """How many agent workers VERL splits a generation batch over (same default as the runtime config)."""
+    import os
+    return max(1, int(os.environ.get('RIFT_AGENT_WORKERS', hardware.current().world_size)))
+
+
 def sample_rows(context, by_key, checkpoint, *, groups, seed, label):
     """Sample ``groups`` x group_size episodes per task on the live runtime.
 
@@ -968,6 +974,11 @@ def sample_rows(context, by_key, checkpoint, *, groups, seed, label):
     """
     requests, owners = build_eval_requests(by_key, checkpoint, groups=groups,
         group_size=context.group_size, seed=seed, label=label)
+    # VERL hands the batch to its agent workers in equal chunks, so the count must divide
+    # evenly: the last few episodes of an uneven batch are left out.
+    requests = requests[:len(requests) - len(requests) % agent_workers()]
+    if not requests:
+        raise ValueError('too few episodes to give every agent worker one')
     # One generate call only: the runtime puts vLLM to sleep after every call and
     # nothing wakes it before the next one, so a second call would wait forever.
     outputs = LazyBatch(context, checkpoint).generate(requests)
