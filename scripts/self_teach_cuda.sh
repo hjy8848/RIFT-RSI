@@ -26,7 +26,9 @@ setsid nohup bash -c '
   export PYTHONPATH="$W/src:$W/third_party/usami" TMPDIR="$HOME/tmp"
   export CUDA_DEVICE_ORDER=PCI_BUS_ID RIFT_PLATFORM=cuda RIFT_WORLD_SIZE='"$WORLD"' CUDA_VISIBLE_DEVICES='"$GPUS"'
   export RIFT_VLLM_MEMORY_UTILIZATION=${RIFT_VLLM_MEMORY_UTILIZATION:-0.3} RIFT_AGENT_WORKERS=${RIFT_AGENT_WORKERS:-8}
-  export NCCL_P2P_DISABLE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  # P2P stays off by default (it deadlocked between two A6000s on zju-47); NVLink hosts can pass NCCL_P2P_DISABLE=0.
+  export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1} HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  export RIFT_PPO_MICRO_BATCH=${RIFT_PPO_MICRO_BATCH:-1}
   cd "$W" || exit 7
   python -m rift.runtime.curriculum_run '"$COMMAND"' --service-model "$MODEL" --run-root "$RUN" \
     --verl-config-dir "$W/configs/verl" "$@"

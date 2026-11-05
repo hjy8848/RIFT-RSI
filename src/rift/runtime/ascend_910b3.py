@@ -228,10 +228,13 @@ def _verl_config(role, model_path, *, run_root, agent_loop_config=None,
     config.actor_rollout_ref.actor.fsdp_config.model_dtype = "bfloat16"
     config.actor_rollout_ref.actor.use_kl_loss = False
     config.actor_rollout_ref.actor.ppo_mini_batch_size = world_size
-    config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu = 1
+    # Sequences per GPU per forward/backward. FSDP gathers every parameter once per micro-batch, so on
+    # cards with memory to spare a larger value means fewer gathers (default 1 is the memory-safe choice).
+    micro_batch = int(os.environ.get("RIFT_PPO_MICRO_BATCH", "1"))
+    config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu = micro_batch
     max_sequence_length = prompt_length + response_length
     config.actor_rollout_ref.actor.ppo_max_token_len_per_gpu = max_sequence_length
-    config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu = 1
+    config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu = micro_batch
     config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu = max_sequence_length
     config.actor_rollout_ref.actor.optim.lr = learning_rate
     config.actor_rollout_ref.actor.optim.total_training_steps = 1
