@@ -50,7 +50,7 @@ while [ "$attempt" -le "$MAXTRY" ]; do
   setsid bash -c "
     source /home/hejingyu/miniconda3/etc/profile.d/conda.sh && conda activate rift-gpu-train
     export PYTHONPATH='$W/src:$W/third_party/usami'
-    export RIFT_PLATFORM=cuda RIFT_WORLD_SIZE=$world CUDA_VISIBLE_DEVICES=$pick
+    export CUDA_DEVICE_ORDER=PCI_BUS_ID RIFT_PLATFORM=cuda RIFT_WORLD_SIZE=$world CUDA_VISIBLE_DEVICES=$pick
     export RIFT_VLLM_MEMORY_UTILIZATION=0.3 RIFT_AGENT_WORKERS=8 NCCL_P2P_DISABLE=1
     export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
     cd '$W' || exit 7

@@ -75,6 +75,25 @@ SHA256 `a58c95a080363606e691c342d47dd173b510f4c013a8c5fcb8744def12e36a0f`，与 
 ### 已验证
 2026-11-04，zju-47，2×RTX A6000，`python -m rift.runtime.ascend_910b3`（冒烟）：FSDP2 初始化并保存检查点（约 2 分钟）→ vLLM 服务与权重同步 → 8 条滚动采样 → 1 次 GRPO 更新 → 保存并校验新检查点，`status: service_smoke_completed`。冒烟任务 8/8 成功，优势为零，只证明流程通，不证明学习。
 
+2026-11-05，a800-1（`node054`），2×A800 80G（3、5 号卡），同一冒烟：`status: service_smoke_completed`，退出码 0，用的是默认 SDPA。
+同日，zju-53 的冒烟**没有**测到 Blackwell：混装机上 `CUDA_VISIBLE_DEVICES=0,1` 与 nvidia-smi 的 0、1 号不是同一批卡，进程落到了别人几乎占满的卡上并卡住，已停止。Blackwell 上的训练仍未验证。
+
+## 混装 GPU 机器：先设 `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+CUDA 默认按速度给卡排序，与 `nvidia-smi` 的序号不一致。zju-53、zju-18 这类混装机上，指定卡之前先设 `CUDA_DEVICE_ORDER=PCI_BUS_ID`，启动后用 `nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory` 核对自己的进程到底在哪张卡上。`scripts/stage1_gpu.sh` 已加这条。
+
+## a800-1（独立存储，GitHub 不通）
+- 登录：`ssh a800-1`（公网 `101.37.174.109:8082`，8× A800 80G）。家目录 `/data/home/hejingyu`，与 zju 的共享家目录**不是同一份**；系统盘 `/` 只剩约 4 GB，**所有东西放 `/data` 下**，装包前设 `TMPDIR`、`UV_CACHE_DIR`、`PIP_CACHE_DIR` 到 `/data/home/hejingyu/` 下。
+- 没有 conda、没有 GitHub、没有 `/home/shenyl/hf/model`。清华/阿里云 PyPI 镜像和 hf-mirror 可用。
+- 配方（共约 25 分钟，其中 miniconda 安装包走清华只有约 0.4 MB/s 占了十来分钟）：
+  1. 清华下 Miniconda，装到 `/data/home/hejingyu/miniconda3`；`conda create -p .../envs/rift-gpu-train python=3.12 --override-channels -c <清华 main>`。
+  2. `uv pip install vllm==0.19.1`，**用阿里云 PyPI**（`https://mirrors.aliyun.com/pypi/simple/`，大文件 33 MB/s）；第一次用清华时接收速度掉到 0，uv 空等，停掉换阿里云并设 `UV_HTTP_TIMEOUT=300` 后顺利完成。
+  3. 与 zju 环境对齐的固定版本：transformers 5.10.4、ray 2.60.0、tensordict 0.10.0、accelerate 1.15.0、codetiming 1.4.0、datasets 5.1.0、dill 0.4.1、hydra-core 1.3.8、liger-kernel 0.8.5、omegaconf 2.3.1、peft 0.21.2、pybind11 3.1.0、pylatexenc 2.11、torchdata 0.11.0、wandb 0.31.0。
+  4. VERL：把 zju 上 `/home/hejingyu/src/verl-v091-cuda`（26 MB）打包经本机中转，`uv pip install --no-deps -e`。
+  5. 模型：`HF_ENDPOINT=https://hf-mirror.com`，`huggingface_hub.snapshot_download('Qwen/Qwen3-4B', local_dir=...)`，约 7.6 GB、半小时。
+  6. 代码：本机 `git archive HEAD` 打包后 scp 过去，解压到 `projects/RIFT-RSI-<提交>`；没有 `git pull`。
+  7. flash-attn：同一个第三方预编译轮子（见上），从 zju 缓存经本机中转（253 MB，直连跳板会断，用 `ServerAliveInterval`），核对 SHA256 后 `uv pip install --no-deps`。**A800（sm_80）上只验证了能导入，没有跑过端到端**。
+- 启动示例：`CUDA_DEVICE_ORDER=PCI_BUS_ID RIFT_PLATFORM=cuda RIFT_WORLD_SIZE=2 CUDA_VISIBLE_DEVICES=3,5 python -m rift.runtime.ascend_910b3 --service-model /data/home/hejingyu/models/Qwen/Qwen3-4B ...`。
+
 ## 用法
 ```bash
 source /home/hejingyu/miniconda3/etc/profile.d/conda.sh && conda activate rift-gpu
