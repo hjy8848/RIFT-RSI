@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path[:0] = ['src', 'third_party/usami']
 
@@ -57,13 +58,26 @@ class GenerationTests(unittest.TestCase):
             async def generate(self, request_id, *, prompt_ids, sampling_params):
                 calls.append((request_id, tuple(prompt_ids), dict(sampling_params)))
                 return SimpleNamespace(token_ids=[9, len(calls)], log_probs=[-1.0, -0.5])
+        marker = object()
         out = asyncio.run(T.generate_group(Client(), [1, 2, 3], count=3, seed=5, group_id='g',
-                                           structured_schema={'type': 'object'}))
+                                           structured_schema={'type': 'object'},
+                                           structured_factory=lambda schema: (marker, schema)))
         self.assertEqual(len(out), 3)
         self.assertEqual(len({c[0] for c in calls}), 3)                 # distinct request ids
         self.assertEqual({c[1] for c in calls}, {(1, 2, 3)})
-        self.assertTrue(all(c[2]['logprobs'] is True and c[2]['structured_outputs'] == {'json': {'type': 'object'}}
+        self.assertTrue(all(c[2]['logprobs'] is True and c[2]['structured_outputs'] == (marker, {'type': 'object'})
                             for c in calls))
+
+    def test_structured_outputs_become_a_vllm_object_when_vllm_is_present(self):
+        class Params:
+            def __init__(self, json):
+                self.json = json
+        module = SimpleNamespace(StructuredOutputsParams=Params)
+        with mock.patch.dict(sys.modules, {'vllm': SimpleNamespace(sampling_params=module),
+                                           'vllm.sampling_params': module}):
+            self.assertEqual(T.vllm_structured_outputs({'a': 1}).json, {'a': 1})
+        with mock.patch.dict(sys.modules, {'vllm': None, 'vllm.sampling_params': None}):
+            self.assertEqual(T.vllm_structured_outputs({'a': 1}), {'json': {'a': 1}})
 
     def test_prompt_ids_come_from_the_designer_prompt(self):
         class Tokenizer:

@@ -120,13 +120,22 @@ def check_generation(output):
     return ids, [min(0.0, float(x)) for x in logprobs]
 
 
+def vllm_structured_outputs(schema):
+    """The object vLLM's sampling parameters take for JSON-schema decoding (a plain dict is rejected)."""
+    try:
+        from vllm.sampling_params import StructuredOutputsParams
+    except ImportError:                       # no vLLM in this process (unit tests)
+        return {'json': schema}
+    return StructuredOutputsParams(json=schema)
+
+
 async def generate_group(client, prompt_ids, *, count, seed, group_id, max_tokens=4096, temperature=1.0,
-                         structured_schema=None):
+                         structured_schema=None, structured_factory=vllm_structured_outputs):
     """``count`` independent plans for one prompt through the live vLLM server of the shared weights."""
     async def one(index):
         params = {'temperature': temperature, 'top_p': 1.0, 'max_tokens': max_tokens, 'logprobs': True}
         if structured_schema is not None:
-            params['structured_outputs'] = {'json': structured_schema}
+            params['structured_outputs'] = structured_factory(structured_schema)
         output = await client.generate(request_id='%s-%d-%d' % (group_id, seed, index),
                                        prompt_ids=list(prompt_ids), sampling_params=params)
         return check_generation(output)

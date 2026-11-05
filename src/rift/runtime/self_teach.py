@@ -113,7 +113,8 @@ def run_solver_steps(context, checkpoint, *, action, index, seed, steps, tasks_p
 def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, steps, tasks_per_step, mix_fraction,
                seed, calibrate_every=5, n_recovery=64, n_retention=64, screen_groups=1, probe_groups=2,
                lambda_retention=0.5, invalid_reward=-0.1, max_tokens=4096, constrained=True, max_failures=8,
-               failure_groups=1, keep_checkpoints=0, keep_every=5, drop_references=(), init_from_run=None):
+               failure_groups=1, keep_checkpoints=0, keep_every=5, drop_references=(), init_from_run=None,
+               failures_file=None):
     from rift.runtime.curriculum_run import _drop, sample_rows
     from rift.runtime.matched_arms import parse_pairs
     log_path = context.root / 'self-teach.jsonl'
@@ -135,12 +136,16 @@ def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, ste
     context.world.save()
     ledger = T.TeacherLedger(context.root / 'teacher')
     seen, forks, index, history = set(), [(0, None)], 0, []
-    kept_by_key = {}
-    for key, ref in train_pairs:
-        kept_by_key.setdefault(key, []).append(ref)
-    failure_rows = sample_rows(context, kept_by_key, checkpoint, groups=failure_groups, seed=seed,
-                               label='failures0')
-    failures = failures_from_rows(context, failure_rows, train_refs, max_failures)
+    if failures_file:
+        # Failure cases written earlier (collect-failures) for the starting policy: skips the sampling pass.
+        failures = json.loads(Path(failures_file).read_text(encoding='utf-8'))['cases'][:max_failures]
+    else:
+        kept_by_key = {}
+        for key, ref in train_pairs:
+            kept_by_key.setdefault(key, []).append(ref)
+        failure_rows = sample_rows(context, kept_by_key, checkpoint, groups=failure_groups, seed=seed,
+                                   label='failures0')
+        failures = failures_from_rows(context, failure_rows, train_refs, max_failures)
     log({'event': 'start', 'train': len(train_pairs), 'probe_pool': sum(map(len, probe_pool.values())),
          'failures': len(failures), 'checkpoint': asdict(checkpoint)})
     try:

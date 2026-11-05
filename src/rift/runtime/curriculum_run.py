@@ -1210,6 +1210,8 @@ def main(argv=None):
     teach_parser.add_argument('--learning-rate', type=float, default=1e-6)
     teach_parser.add_argument('--response-length', type=int, default=20480)
     teach_parser.add_argument('--init-from-run')
+    teach_parser.add_argument('--failures-file',
+        help='failures.json from collect-failures for the starting policy; skips the first sampling pass')
     failures_parser = sub.add_parser('collect-failures',
         help='sample the Service on training tasks and write failures.json for the Designer')
     _common(failures_parser)
@@ -1307,7 +1309,7 @@ def main(argv=None):
             invalid_reward=args.invalid_reward, max_tokens=args.max_tokens, constrained=not args.unconstrained,
             max_failures=args.max_failures, keep_checkpoints=args.keep_checkpoints, keep_every=args.keep_every,
             drop_references=tuple(item for item in args.drop_references.split(',') if item),
-            init_from_run=args.init_from_run)
+            init_from_run=args.init_from_run, failures_file=args.failures_file)
     elif args.command == 'collect-failures':
         context = _context(args, UpdateBudget(world_size, 1, 1e-6), args.group_size,
                            response_length=args.response_length)
