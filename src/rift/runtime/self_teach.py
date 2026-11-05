@@ -58,9 +58,11 @@ def prune_forks(forks, *, keep_last, keep_every):
 
 def teacher_update(context, samples, rewards, policy_before, ledger, index):
     """Off-policy GRPO on the plans; the result is written to disk as the next fork."""
+    import os
     from rift.runtime.curriculum_run import RoundBackend
-    request = T.build_teacher_update(samples, rewards, policy_before, ledger,
-                                     world_size=context.checkpoint_store.world_size)
+    # Every worker takes whole micro-batches, so the batch is a multiple of workers x micro-batch size.
+    unit = context.checkpoint_store.world_size * int(os.environ.get('RIFT_PPO_MICRO_BATCH', '1'))
+    request = T.build_teacher_update(samples, rewards, policy_before, ledger, world_size=unit)
     backend = RoundBackend(context, index, policy_before, persist=True,
                            rollout_verifier=T.TeacherRolloutVerifier(ledger),
                            mini_batch_size=len(request.rollouts))

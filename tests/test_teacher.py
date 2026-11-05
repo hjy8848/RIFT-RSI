@@ -138,6 +138,18 @@ class UpdateRequestTests(unittest.TestCase):
             self.assertEqual(len(request.rollouts), 4)
             self.assertTrue(all(r.policy == SAMPLED and r.policy != BEFORE for r in request.rollouts))
 
+    def test_the_batch_is_trimmed_to_whole_micro_batches_on_every_worker(self):
+        with tempfile.TemporaryDirectory() as root:
+            ledger = T.TeacherLedger(root)
+            samples = [fake_sample('g-p%02d' % i, 'g', response=(5, 6, 7 + i), refs=['t%d' % i]) for i in range(20)]
+            for sample in samples:
+                ledger.record(sample)
+            rewards = {s.sample_id: float(i % 3) for i, s in enumerate(samples)}
+            request = T.build_teacher_update(samples, rewards, BEFORE, ledger, world_size=16)   # 4 workers x 4
+            self.assertEqual(len(request.rollouts), 16)
+            with self.assertRaises(ValueError):          # 8 plans cannot fill 16 even with one group of two kept
+                T.build_teacher_update(samples[:8], rewards, BEFORE, ledger, world_size=16)
+
     def test_groups_of_one_and_unmeasured_plans_are_left_out(self):
         with tempfile.TemporaryDirectory() as root:
             ledger = T.TeacherLedger(root)
