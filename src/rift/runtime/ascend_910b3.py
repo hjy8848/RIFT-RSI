@@ -37,7 +37,9 @@ ASCEND_WORKER_ENV_KEYS = (
 
 
 CUDA_WORKER_ENV_KEYS = ("PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "HF_HOME", "HF_HUB_OFFLINE",
-                        "TRANSFORMERS_OFFLINE", "VLLM_CACHE_ROOT", "TORCHINDUCTOR_CACHE_DIR")
+                        "TRANSFORMERS_OFFLINE", "VLLM_CACHE_ROOT", "TORCHINDUCTOR_CACHE_DIR",
+                        "RIFT_CUSTOMER_URL", "RIFT_CUSTOMER_MODEL", "RIFT_CUSTOMER_MAX_TOKENS",
+                        "RIFT_CUSTOMER_TEMPERATURE", "RIFT_CUSTOMER_TIMEOUT", "RIFT_PROFILE_FILE")
 
 
 def _world_size():
@@ -436,7 +438,8 @@ def _build_service_host_provider(manifest, checkpoint_raw):
     budget = EpisodeBudget(**manifest.get("episode_budget", {}))
     checkpoint_source = type("FixedCheckpointSource", (), {
         "current": lambda self: checkpoint})()
-    return NativeHostProvider(task_registry, task_registry, _UsamiCustomerFactory(),
+    from rift.runtime.llm_customer import build_customer_factory
+    return NativeHostProvider(task_registry, task_registry, build_customer_factory(_UsamiCustomerFactory()),
         checkpoint_source, checkpoint_store, capture_store, budget=budget,
         parser_format=manifest.get("parser_format", "hermes"),
         mode=manifest.get("usami_mode", "reference"),
