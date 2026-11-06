@@ -379,10 +379,32 @@ class ExperimentContext:
             raise ValueError('checkpoint of the source run failed verification')
         return checkpoint
 
-    # -- runtime ----------------------------------------------------------
+    def forget_checkpoints(self, checkpoints):
+        """Checkpoints whose files were deleted: out of the store, and workers get a manifest without them.
+
+        The step manifests written earlier still list them, and workers check a manifest against the
+        files on disk, so they must stop reading those.
+        """
+        checkpoints = list(checkpoints)
+        if not checkpoints:
+            return
+        for checkpoint in checkpoints:
+            self.checkpoint_store.forget(checkpoint)
+        self._pruned = getattr(self, '_pruned', 0) + len(checkpoints)
+        self.manifest_override = None          # the next worker manifest is written fresh
+
     def _worker_manifest(self, checkpoint):
         from rift.runtime.service_protocol import service_profile_descriptor
         manifest_path = self.latest_manifest() if self.manifests() else None
+        if getattr(self, '_pruned', 0):
+            override = getattr(self, 'manifest_override', None)
+            if override is None or asdict(checkpoint) not in [
+                    row['checkpoint'] for row in json.loads(override.read_text(encoding='utf-8'))['records']]:
+                override = self.root / 'checkpoints' / ('pruned-%d-%s.json' % (self._pruned, checkpoint.weights_digest[:12]))
+                if not override.exists():
+                    self.checkpoint_store.save_manifest(override)
+                self.manifest_override = override
+            manifest_path = override
         if manifest_path is None:
             manifest_path = self.root / 'checkpoints' / 'initial.json'
             self.checkpoint_store.save_manifest(manifest_path)
@@ -1238,6 +1260,9 @@ def main(argv=None):
     teach_parser.add_argument('--learning-rate', type=float, default=1e-6)
     teach_parser.add_argument('--response-length', type=int, default=20480)
     teach_parser.add_argument('--init-from-run')
+    teach_parser.add_argument('--resume-from',
+        help='an earlier self-teach run directory that stopped between actions: continue from the checkpoint '
+             'its last finished action wrote, numbering the actions on (use a new --run-root)')
     teach_parser.add_argument('--failures-file',
         help='failures.json from collect-failures for the starting policy; skips the first sampling pass')
     failures_parser = sub.add_parser('collect-failures',
@@ -1337,7 +1362,7 @@ def main(argv=None):
             invalid_reward=args.invalid_reward, max_tokens=args.max_tokens, constrained=not args.unconstrained,
             max_failures=args.max_failures, keep_checkpoints=args.keep_checkpoints, keep_every=args.keep_every,
             drop_references=tuple(item for item in args.drop_references.split(',') if item),
-            init_from_run=args.init_from_run, failures_file=args.failures_file)
+            init_from_run=args.init_from_run, failures_file=args.failures_file, resume_from=args.resume_from)
     elif args.command == 'collect-failures':
         context = _context(args, UpdateBudget(world_size, 1, 1e-6), args.group_size,
                            response_length=args.response_length)

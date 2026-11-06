@@ -190,6 +190,12 @@ class FSDPCheckpointStore:
         self.artifact_digests[checkpoint] = digest
         self.virtual.add(checkpoint)
         return checkpoint
+    def forget(self, checkpoint):
+        """Drop a checkpoint whose files were deleted, so no later manifest lists it."""
+        self.paths.pop(checkpoint, None)
+        self.artifact_digests.pop(checkpoint, None)
+        self._verified_fingerprints.pop(checkpoint, None)
+        self.virtual.discard(checkpoint)
     def _remember_verified(self, checkpoint, path):
         root = Path(path).resolve()
         fingerprint = _artifact_metadata_digest(root)

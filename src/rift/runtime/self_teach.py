@@ -41,19 +41,54 @@ def failures_from_rows(context, rows, train_refs, max_cases):
 def prune_forks(forks, *, keep_last, keep_every):
     """Delete old fork checkpoints, keeping the last ``keep_last`` and every ``keep_every``-th action's.
 
-    ``forks`` is a list of ``(action, directory)``; returns the directories removed. ``keep_last == 0``
-    keeps everything: nothing is deleted unless the run was started asking for it.
+    ``forks`` is a list of ``(action, directory, checkpoint)``; returns ``(directory, checkpoint)`` of what
+    was removed, and the caller must make the run forget those checkpoints. ``keep_last == 0`` keeps
+    everything: nothing is deleted unless the run was started asking for it.
     """
     removed = []
     if keep_last <= 0:
         return removed
-    for position, (action, directory) in enumerate(forks):
+    for position, (action, directory, checkpoint) in enumerate(forks):
         if directory is None or position >= len(forks) - keep_last or (keep_every and action % keep_every == 0):
             continue
         if Path(directory).is_dir():
             shutil.rmtree(directory)
-            removed.append(str(directory))
+        removed.append((str(directory), checkpoint))
+    forks[:] = [entry for entry in forks if entry[1] is None or str(entry[1]) not in {d for d, _ in removed}]
     return removed
+
+
+def resume_state(context, run_root):
+    """Pick up a run that stopped between actions: its last written checkpoint, next action, seen structures.
+
+    The checkpoint is the one the last finished action wrote to disk. Only it is carried over, so the
+    new run's manifest never lists files the old run deleted.
+    """
+    from rift.schemas import Checkpoint
+    run_root = Path(run_root)
+    rows = [json.loads(line) for line in (run_root / 'self-teach.jsonl').read_text(encoding='utf-8').splitlines()
+            if '"event": "action"' in line]
+    if not rows:
+        raise ValueError('%s finished no action, there is nothing to resume from' % run_root)
+    last = rows[-1]
+    revision = str(last['next_revision'])
+    manifest = json.loads((run_root / 'checkpoints' / ('service-step-%s.json' % revision)).read_text(encoding='utf-8'))
+    records = [row for row in manifest['records'] if row['checkpoint']['revision'] == revision and not row.get('virtual')]
+    if len(records) != 1:
+        raise ValueError('revision %s must be on disk exactly once in %s' % (revision, run_root))
+    target = context.root / 'checkpoints' / 'initial.json'
+    target.write_text(json.dumps({'world_size': manifest['world_size'], 'records': records}, sort_keys=True),
+                      encoding='utf-8')
+    context.adopt_manifest(target)
+    checkpoint = Checkpoint(**records[0]['checkpoint'])
+    (context.root / 'initial-checkpoint.json').write_text(json.dumps(asdict(checkpoint), sort_keys=True), encoding='utf-8')
+    seen = set()
+    for path in sorted((run_root / 'teacher').glob('*.json')):
+        row = json.loads(path.read_text(encoding='utf-8')).get('row') or {}
+        for signature, kept in zip(row.get('signatures', ()), row.get('selected', ())):
+            if kept and not str(signature).startswith('unmeasured'):
+                seen.add(signature)
+    return checkpoint, int(last['action']) + 1, seen
 
 
 def teacher_update(context, samples, rewards, policy_before, ledger, index):
@@ -116,14 +151,20 @@ def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, ste
                seed, calibrate_every=5, n_recovery=64, n_retention=64, screen_groups=1, probe_groups=2,
                lambda_retention=0.5, invalid_reward=-0.1, max_tokens=4096, constrained=True, max_failures=8,
                failure_groups=1, keep_checkpoints=0, keep_every=5, drop_references=(), init_from_run=None,
-               failures_file=None):
+               failures_file=None, resume_from=None):
     from rift.runtime.curriculum_run import _drop, sample_rows
     from rift.runtime.matched_arms import parse_pairs
     log_path = context.root / 'self-teach.jsonl'
     if log_path.exists():
-        raise FileExistsError('this run directory already has a self-teach log; resuming is not supported, use a new one')
+        raise FileExistsError('this run directory already has a self-teach log; start a new run directory '
+                              '(--resume-from continues an earlier run in a new one)')
+    if resume_from and init_from_run:
+        raise ValueError('--resume-from and --init-from-run are alternatives')
     log = _log_factory(log_path)
-    if init_from_run and not (context.root / 'initial-checkpoint.json').exists():
+    first_action, seen = 0, set()
+    if resume_from:
+        checkpoint, first_action, seen = resume_state(context, resume_from)
+    elif init_from_run and not (context.root / 'initial-checkpoint.json').exists():
         checkpoint = context.adopt_initial_from(init_from_run)
     else:
         checkpoint = context.initial_checkpoint()
@@ -137,7 +178,7 @@ def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, ste
         probe_pool = {key: kept for key in sorted(probe_by_key) if (kept := _drop(context, probe_by_key[key], kinds))}
     context.world.save()
     ledger = T.TeacherLedger(context.root / 'teacher')
-    seen, forks, index, history = set(), [(0, None)], 0, []
+    forks, index, history = [(first_action, None, None)], 0, []
     if failures_file:
         # Failure cases written earlier (collect-failures) for the starting policy: skips the sampling pass.
         failures = json.loads(Path(failures_file).read_text(encoding='utf-8'))['cases'][:max_failures]
@@ -149,9 +190,10 @@ def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, ste
                                    label='failures0')
         failures = failures_from_rows(context, failure_rows, train_refs, max_failures)
     log({'event': 'start', 'train': len(train_pairs), 'probe_pool': sum(map(len, probe_pool.values())),
-         'failures': len(failures), 'checkpoint': asdict(checkpoint)})
+         'failures': len(failures), 'checkpoint': asdict(checkpoint), 'first_action': first_action,
+         'resumed_from': str(resume_from) if resume_from else None, 'seen_structures': len(seen)})
     try:
-        for action in range(actions):
+        for action in range(first_action, first_action + actions):
             started = time.perf_counter()
             fork = checkpoint
             samples, prompt_seeds = generate_plans(context, fork, failures, action=action, seed=seed, groups=groups,
@@ -197,8 +239,11 @@ def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, ste
             update, trained = teacher_update(context, samples, rewards, after_solver, ledger, index)
             index += 1
             checkpoint = update.policy_after
-            forks.append((action + 1, context.root / 'checkpoints' / 'service' / ('global-step-%08d' % int(checkpoint.revision))))
-            removed = prune_forks(forks, keep_last=keep_checkpoints, keep_every=keep_every)
+            forks.append((action + 1, context.root / 'checkpoints' / 'service' / ('global-step-%08d' % int(checkpoint.revision)),
+                          checkpoint))
+            pruned = prune_forks(forks, keep_last=keep_checkpoints, keep_every=keep_every)
+            context.forget_checkpoints([cp for _, cp in pruned])
+            removed = [directory for directory, _ in pruned]
             if episodes:
                 failures = failures_from_rows(context, episodes[-4 * tasks_per_step * context.group_size:],
                                               train_refs, max_failures) or failures

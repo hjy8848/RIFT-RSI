@@ -50,6 +50,9 @@ class FakeContext:
     def close_runtime(self):
         self.closed = True
 
+    def forget_checkpoints(self, checkpoints):
+        self.forgotten = list(checkpoints)
+
 
 def sample(sid, group, refs):
     row = {'status': 'certified', 'task_refs': list(refs), 'selected': [True] * len(refs), 'copy_score': 0.0}
@@ -149,18 +152,65 @@ class SelfTeachTests(unittest.TestCase):
 
     def test_pruning_keeps_recent_and_every_nth_fork(self):
         with tempfile.TemporaryDirectory() as root:
-            dirs = []
-            forks = [(0, None)]
+            forks = [(0, None, None)]
             for action in range(1, 8):
                 path = Path(root) / ('fork%d' % action)
                 path.mkdir()
-                forks.append((action, path))
+                forks.append((action, path, checkpoint(action)))
             removed = S.prune_forks(forks, keep_last=2, keep_every=5)
             kept = sorted(p.name for p in Path(root).iterdir())
             self.assertEqual(kept, ['fork5', 'fork6', 'fork7'])
-            self.assertEqual(len(removed), 4)
-            self.assertEqual(S.prune_forks([(0, None), (1, Path(root) / 'fork5')], keep_last=0, keep_every=5), [])
+            self.assertEqual(sorted(cp.revision for _, cp in removed), ['1', '2', '3', '4'])    # the caller forgets these
+            self.assertEqual([entry[0] for entry in forks], [0, 5, 6, 7])
+            self.assertEqual(S.prune_forks([(0, None, None), (1, Path(root) / 'fork5', checkpoint(1))],
+                                           keep_last=0, keep_every=5), [])
             self.assertTrue((Path(root) / 'fork5').exists())
+
+    def test_the_run_forgets_what_pruning_deleted(self):
+        """The step after a prune must not read a manifest that still lists the deleted files."""
+        from rift.runtime.curriculum_run import ExperimentContext
+        from rift.evolution.matched_control import UpdateBudget
+        from usami_v2.runtime.runner import EpisodeBudget
+        with tempfile.TemporaryDirectory() as root:
+            context = ExperimentContext(root=root, service_model='m', verl_config_dir='.',
+                episode_budget=EpisodeBudget(), update_budget=UpdateBudget(8, 1, 1e-6),
+                runtime_factory=lambda cp: None)
+            old, kept = checkpoint(5), checkpoint(10)
+            store = context.checkpoint_store
+            for cp in (old, kept):
+                store.virtual.add(cp)
+                store.artifact_digests[cp] = cp.weights_digest
+            manifests = Path(root) / 'checkpoints'
+            store.save_manifest(manifests / 'service-step-10.json')       # lists both, as the old run's did
+            context.forget_checkpoints([old])
+            path = context._worker_manifest(kept)
+            listed = json.loads(json.loads(path.read_text())['checkpoint_manifest'] and
+                                Path(json.loads(path.read_text())['checkpoint_manifest']).read_text())['records']
+            revisions = sorted(row['checkpoint']['revision'] for row in listed)
+            self.assertEqual(revisions, ['10'])
+
+    def test_resume_takes_only_the_last_checkpoint_and_the_next_action_number(self):
+        with tempfile.TemporaryDirectory() as old, tempfile.TemporaryDirectory() as new:
+            old, new = Path(old), Path(new)
+            (old / 'checkpoints').mkdir()
+            (old / 'teacher').mkdir()
+            rows = [{'event': 'start'}, {'event': 'action', 'action': 0, 'next_revision': '5'},
+                    {'event': 'action', 'action': 1, 'next_revision': '10'}]
+            (old / 'self-teach.jsonl').write_text('\n'.join(json.dumps(r) for r in rows))
+            records = [{'checkpoint': asdict(checkpoint(5)), 'path': 'gone', 'artifact_digest': 'x'},
+                       {'checkpoint': asdict(checkpoint(10)), 'path': str(old / 'step10'), 'artifact_digest': 'y'}]
+            (old / 'checkpoints' / 'service-step-10.json').write_text(json.dumps({'world_size': 4, 'records': records}))
+            (old / 'teacher' / 'a001-g0-p00.json').write_text(json.dumps({'row': {
+                'signatures': ['sigA', 'unmeasured:KeyError', 'sigB'], 'selected': [True, True, False]}}))
+            adopted = []
+            context = SimpleNamespace(root=new, adopt_manifest=lambda path: adopted.append(json.loads(Path(path).read_text())))
+            (new / 'checkpoints').mkdir()
+            cp, first_action, seen = S.resume_state(context, old)
+            self.assertEqual((cp.revision, first_action, seen), ('10', 2, {'sigA'}))
+            self.assertEqual([r['checkpoint']['revision'] for r in adopted[0]['records']], ['10'])
+            with self.assertRaises(ValueError):                     # a run that finished no action
+                (old / 'self-teach.jsonl').write_text('{"event": "start"}')
+                S.resume_state(context, old)
 
 
 if __name__ == '__main__':
