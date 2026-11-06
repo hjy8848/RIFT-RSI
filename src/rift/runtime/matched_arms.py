@@ -89,12 +89,15 @@ def task_counts(rows):
     return counts
 
 
-def select_probes(screen, *, n_recovery, n_retention, seed, fail_max=0.5, success_min=0.75):
+def select_probes(screen, *, n_recovery, n_retention, seed, fail_max=0.5, success_min=0.75, shrink_to=None):
     """Freeze Recovery (lowest screened success) and Retention (random among mastered) banks.
 
     ``screen`` is ``task_counts`` of a screening evaluation at the current checkpoint. Its
     samples are not reused as the "before" measurement, so selecting on failure does not
     bias G by regression to the mean.
+
+    As the Solver improves, fewer tasks stay failing. With ``shrink_to`` (a minimum bank size) both
+    banks shrink to what the pool offers, equal in size, instead of the selection failing.
     """
     if not (0 <= fail_max < success_min <= 1):
         raise ValueError('need 0 <= fail_max < success_min <= 1')
@@ -102,6 +105,10 @@ def select_probes(screen, *, n_recovery, n_retention, seed, fail_max=0.5, succes
     rated = [(ref, success / valid) for ref, (success, valid, _) in sorted(screen.items()) if valid]
     failing = [(rate, rng.random(), ref) for ref, rate in rated if rate <= fail_max]
     mastered = sorted(ref for ref, rate in rated if rate >= success_min)
+    if shrink_to is not None and (len(failing) < n_recovery or len(mastered) < n_retention):
+        size = min(len(failing), len(mastered), n_recovery, n_retention)
+        if size >= shrink_to:
+            n_recovery = n_retention = size
     if len(failing) < n_recovery or len(mastered) < n_retention:
         raise ValueError('probe pool too small: %d failing (need %d), %d mastered (need %d)'
                          % (len(failing), n_recovery, len(mastered), n_retention))
@@ -257,7 +264,7 @@ def train_step(context, checkpoint, chosen, *, index, seed, persist, label):
 def run_matched_arms(context, *, start, arms, probe_pool, train_pairs, designer_refs, steps,
                      tasks_per_step, mix_fraction, n_recovery, n_retention, seed, pairs,
                      screen_groups=1, probe_groups=2, lambda_retention=0.5, min_valid_fraction=0.8,
-                     persist_last=False, n_boot=2000, log=None, index_start=0, label_prefix=''):
+                     persist_last=False, n_boot=2000, log=None, index_start=0, label_prefix='', shrink_probes_to=None):
     """Fork every arm from ``start``, train ``steps`` updates each, score all on one frozen probe set.
 
     ``start`` must exist on disk: every arm after the first restores it inside the live
@@ -276,7 +283,8 @@ def run_matched_arms(context, *, start, arms, probe_pool, train_pairs, designer_
     from rift.runtime.curriculum_run import sample_rows
     screen_rows = sample_rows(context, probe_pool, start, groups=screen_groups, seed=seed + 1,
                               label=label_prefix + 'screen')
-    probes = select_probes(task_counts(screen_rows), n_recovery=n_recovery, n_retention=n_retention, seed=seed)
+    probes = select_probes(task_counts(screen_rows), n_recovery=n_recovery, n_retention=n_retention, seed=seed,
+                           shrink_to=shrink_probes_to)
     log({'event': 'probes_frozen', 'recovery': len(probes.recovery), 'retention': len(probes.retention)})
     context.resync(start)
     before = task_counts(sample_rows(context, probes.by_key(), start, groups=probe_groups, seed=seed,

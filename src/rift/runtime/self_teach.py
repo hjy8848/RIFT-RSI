@@ -293,7 +293,7 @@ def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, ste
                         tasks_per_step=tasks_per_step, mix_fraction=mix_fraction, n_recovery=n_recovery,
                         n_retention=n_retention, seed=seed + 7 * action, pairs=parse_pairs('T-C', arms),
                         screen_groups=screen_groups, probe_groups=probe_groups,
-                        lambda_retention=lambda_retention, persist_last=False, log=log,
+                        lambda_retention=lambda_retention, persist_last=False, log=log, shrink_probes_to=16,
                         index_start=index, label_prefix='a%03d-' % action)
                     rows, report = result['history']['T'], result['report']
                     from rift.schemas import Checkpoint

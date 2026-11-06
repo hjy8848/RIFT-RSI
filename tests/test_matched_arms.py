@@ -32,6 +32,15 @@ class ProbeSelectionTests(unittest.TestCase):
         probes = select_probes(screen, n_recovery=1, n_retention=1, seed=0)
         self.assertEqual((probes.recovery, probes.retention), (('b',), ('c',)))
 
+    def test_banks_shrink_together_when_the_solver_has_improved(self):
+        screen = counts({'a%d' % i: (0.0 if i < 6 else 1.0) for i in range(30)}, n=4)    # 6 failing, 24 mastered
+        with self.assertRaises(ValueError):
+            select_probes(screen, n_recovery=10, n_retention=10, seed=0)
+        probes = select_probes(screen, n_recovery=10, n_retention=10, seed=0, shrink_to=4)
+        self.assertEqual((len(probes.recovery), len(probes.retention)), (6, 6))
+        with self.assertRaises(ValueError):                    # but not below the minimum worth measuring
+            select_probes(screen, n_recovery=10, n_retention=10, seed=0, shrink_to=8)
+
     def test_a_small_pool_is_refused(self):
         with self.assertRaises(ValueError):
             select_probes(counts({'a': 0.0, 'b': 1.0}), n_recovery=2, n_retention=1, seed=0)

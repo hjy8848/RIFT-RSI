@@ -1244,6 +1244,8 @@ def main(argv=None):
     teach_parser.add_argument('--recovery', type=int, default=64)
     teach_parser.add_argument('--retention', type=int, default=64)
     teach_parser.add_argument('--probe-groups', type=int, default=2)
+    teach_parser.add_argument('--screen-groups', type=int, default=1,
+        help='groups of --group-size samples per probe-pool task when choosing the probes (2 gives finer rates)')
     teach_parser.add_argument('--lambda-retention', type=float, default=0.5)
     teach_parser.add_argument('--invalid-reward', type=float, default=-0.1)
     teach_parser.add_argument('--max-tokens', type=int, default=4096)
@@ -1373,8 +1375,8 @@ def main(argv=None):
             actions=args.actions, groups=args.groups, plans=args.plans, steps=args.steps,
             tasks_per_step=args.tasks_per_step, mix_fraction=args.mix_fraction, seed=args.seed,
             calibrate_every=args.calibrate_every, n_recovery=args.recovery, n_retention=args.retention,
-            probe_groups=args.probe_groups, lambda_retention=args.lambda_retention,
-            invalid_reward=args.invalid_reward, max_tokens=args.max_tokens, constrained=not args.unconstrained,
+            probe_groups=args.probe_groups, screen_groups=args.screen_groups,
+            lambda_retention=args.lambda_retention, invalid_reward=args.invalid_reward, max_tokens=args.max_tokens, constrained=not args.unconstrained,
             max_failures=args.max_failures, keep_checkpoints=args.keep_checkpoints, keep_every=args.keep_every,
             drop_references=tuple(item for item in args.drop_references.split(',') if item),
             init_from_run=args.init_from_run, failures_file=args.failures_file, resume_from=args.resume_from,
