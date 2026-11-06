@@ -23,6 +23,10 @@ class FakeWorld:
     task_registry = object()
 
     def certify_specs(self, specs):
+        if specs == 'EVAL':
+            return {'E': ['e0', 'e1']}
+        if specs == 'OVERLAP':
+            return {'E': ['t0']}
         return {'F1': ['t0', 't1', 't2', 't3']}
 
     def save(self):
@@ -149,6 +153,58 @@ class SelfTeachTests(unittest.TestCase):
             self.assertEqual([line['event'] for line in lines], ['start', 'action', 'action'])
             with self.assertRaises(FileExistsError):
                 self._run(root)
+
+    def test_the_ability_curve_is_measured_on_fixed_tasks_after_every_action(self):
+        calls = []
+
+        def fake_eval(ctx, by_key, cp, *, groups, seed, label):
+            calls.append((label, cp.revision, seed, sorted(by_key)))
+            return {'success': 0.5, 'episodes': 8, 'tasks': 2, 'unknown': 0, 'classes': {'E': 0.5}, 'per_task': {}}
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(S, 'evaluate_checkpoint', fake_eval):
+            _, result, _ = self._run(root, actions=2, calibrate_every=0, eval_specs='EVAL', eval_every=1)
+            lines = [json.loads(line) for line in (Path(root) / 'self-teach.jsonl').read_text().splitlines()]
+        self.assertEqual([line['event'] for line in lines], ['start', 'action', 'eval', 'action', 'eval'])
+        self.assertEqual([c[1] for c in calls], ['1', '2'])                 # each evaluates the checkpoint just written
+        self.assertEqual({c[2] for c in calls}, {7000})                     # the same seed every time
+        self.assertEqual([c[0] for c in calls], ['eval-a000', 'eval-a001'])
+
+    def test_saved_checkpoints_are_evaluated_in_turn_on_the_same_tasks(self):
+        with tempfile.TemporaryDirectory() as old, tempfile.TemporaryDirectory() as new:
+            old, new = Path(old), Path(new)
+            (old / 'checkpoints').mkdir()
+            for revision in (10, 20):
+                (old / ('step%d' % revision)).mkdir()
+            records = [{'checkpoint': asdict(checkpoint(r)), 'path': str(old / ('step%d' % r)), 'artifact_digest': 'd%d' % r}
+                       for r in (10, 20)]
+            for r in (10, 20):
+                (old / 'checkpoints' / ('service-step-%d.json' % r)).write_text(json.dumps(
+                    {'world_size': 4, 'records': [rec for rec in records if rec['checkpoint']['revision'] == str(r)]}))
+            (new / 'checkpoints').mkdir()
+            order, adopted = [], []
+            context = FakeContext(new)
+            context.adopt_manifest = lambda path: adopted.append(json.loads(Path(path).read_text()))
+            context.restore = lambda cp: order.append(('restore', cp.revision))
+            context.world.certify_specs = lambda specs: {'E': ['e0', 'e1']}
+
+            def fake_eval(ctx, by_key, cp, *, groups, seed, label):
+                order.append(('eval', cp.revision, seed))
+                return {'success': 0.5 + int(cp.revision) / 100, 'episodes': 8, 'tasks': 2, 'unknown': 0,
+                        'classes': {}, 'per_task': {}}
+            with mock.patch.object(S, 'evaluate_checkpoint', fake_eval):
+                result = S.eval_checkpoints(context, entries=['%s:20' % old, '%s:10' % old], eval_specs='EVAL',
+                                            groups=2, seed=7000)
+            self.assertEqual(order, [('restore', '20'), ('eval', '20', 7000), ('restore', '10'), ('eval', '10', 7000)])
+            self.assertEqual(sorted(r['checkpoint']['revision'] for r in adopted[0]['records']), ['10', '20'])
+            self.assertEqual([r['revision'] for r in result['results']], ['20', '10'])
+            self.assertTrue(context.closed)
+            with self.assertRaises(FileNotFoundError):              # a deleted checkpoint is reported, not skipped
+                (old / 'step10').rmdir()
+                S.eval_checkpoints(context, entries=['%s:10' % old], eval_specs='EVAL', groups=2, seed=1)
+
+    def test_evaluation_tasks_may_not_overlap_the_training_pool(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(ValueError):
+                self._run(root, actions=1, eval_specs='OVERLAP')
 
     def test_pruning_keeps_recent_and_every_nth_fork(self):
         with tempfile.TemporaryDirectory() as root:

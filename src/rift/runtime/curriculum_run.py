@@ -1260,11 +1260,26 @@ def main(argv=None):
     teach_parser.add_argument('--learning-rate', type=float, default=1e-6)
     teach_parser.add_argument('--response-length', type=int, default=20480)
     teach_parser.add_argument('--init-from-run')
+    teach_parser.add_argument('--eval-specs',
+        help='tasks the run never trains on: the Service is evaluated on them after every --eval-every actions '
+             '(the ability curve); inline or file')
+    teach_parser.add_argument('--eval-groups', type=int, default=2)
+    teach_parser.add_argument('--eval-every', type=int, default=1)
     teach_parser.add_argument('--resume-from',
         help='an earlier self-teach run directory that stopped between actions: continue from the checkpoint '
              'its last finished action wrote, numbering the actions on (use a new --run-root)')
     teach_parser.add_argument('--failures-file',
         help='failures.json from collect-failures for the starting policy; skips the first sampling pass')
+    ckpt_parser = sub.add_parser('eval-checkpoints',
+        help='evaluate saved checkpoints of self-teach runs on one fixed task set (the ability curve)')
+    _common(ckpt_parser)
+    ckpt_parser.add_argument('--checkpoint', action='append', required=True, metavar='RUN_DIR:REVISION',
+        help='repeat for each checkpoint; REVISION may be "initial" for a run\'s starting weights')
+    ckpt_parser.add_argument('--eval-specs', required=True, help='fixed task specs the runs never trained on')
+    ckpt_parser.add_argument('--eval-groups', type=int, default=2)
+    ckpt_parser.add_argument('--drop-references', default='')
+    ckpt_parser.add_argument('--group-size', type=int, default=4)
+    ckpt_parser.add_argument('--response-length', type=int, default=20480)
     failures_parser = sub.add_parser('collect-failures',
         help='sample the Service on training tasks and write failures.json for the Designer')
     _common(failures_parser)
@@ -1362,7 +1377,19 @@ def main(argv=None):
             invalid_reward=args.invalid_reward, max_tokens=args.max_tokens, constrained=not args.unconstrained,
             max_failures=args.max_failures, keep_checkpoints=args.keep_checkpoints, keep_every=args.keep_every,
             drop_references=tuple(item for item in args.drop_references.split(',') if item),
-            init_from_run=args.init_from_run, failures_file=args.failures_file, resume_from=args.resume_from)
+            init_from_run=args.init_from_run, failures_file=args.failures_file, resume_from=args.resume_from,
+            eval_specs=load_json_argument(args.eval_specs) if args.eval_specs else None,
+            eval_groups=args.eval_groups, eval_every=args.eval_every)
+    elif args.command == 'eval-checkpoints':
+        from rift.runtime.self_teach import eval_checkpoints
+        context = _context(args, UpdateBudget(world_size, 1, 1e-6), args.group_size,
+                           response_length=args.response_length, keep_runtime=True, persist_every=0)
+        context.persist_final = False
+        result = eval_checkpoints(context, entries=args.checkpoint, eval_specs=load_json_argument(args.eval_specs),
+            groups=args.eval_groups, seed=args.seed,
+            drop_references=tuple(item for item in args.drop_references.split(',') if item))
+        (context.root / 'eval-checkpoints-result.json').write_text(
+            json.dumps(result, sort_keys=True, indent=2), encoding='utf-8')
     elif args.command == 'collect-failures':
         context = _context(args, UpdateBudget(world_size, 1, 1e-6), args.group_size,
                            response_length=args.response_length)

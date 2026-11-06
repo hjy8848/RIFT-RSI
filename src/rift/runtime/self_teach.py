@@ -132,6 +132,73 @@ def generate_plans(context, checkpoint, failures, *, action, seed, groups, plans
     return samples, prompt_seeds
 
 
+def evaluate_checkpoint(context, eval_by_key, checkpoint, *, groups, seed, label):
+    """Success rate of ``checkpoint`` on the fixed evaluation tasks: overall, per class, and per task."""
+    from rift.runtime.curriculum_run import sample_rows
+    context.resync(checkpoint)
+    rows = sample_rows(context, eval_by_key, checkpoint, groups=groups, seed=seed, label=label)
+    per_task, per_class = {}, {}
+    for row in rows:
+        if row['outcome'] not in ('success', 'failure'):
+            continue
+        won, seen = per_task.get(row['task_ref'], (0, 0))
+        per_task[row['task_ref']] = (won + (row['outcome'] == 'success'), seen + 1)
+        cwon, cseen = per_class.get(row['key'], (0, 0))
+        per_class[row['key']] = (cwon + (row['outcome'] == 'success'), cseen + 1)
+    wins, total = sum(w for w, _ in per_task.values()), sum(n for _, n in per_task.values())
+    return {'success': wins / total if total else None, 'episodes': total, 'tasks': len(per_task),
+            'unknown': len(rows) - total, 'classes': {key: won / seen for key, (won, seen) in sorted(per_class.items())},
+            'per_task': {ref: list(counts) for ref, counts in per_task.items()}}
+
+
+def eval_checkpoints(context, *, entries, eval_specs, groups, seed, drop_references=()):
+    """Evaluate saved checkpoints one after the other on the same fixed tasks: the ability curve.
+
+    ``entries`` are ``RUN_DIR:REVISION`` (``REVISION`` may be ``initial`` for a run's starting weights).
+    One runtime serves them all; each is restored from disk in turn.
+    """
+    from rift.runtime.curriculum_run import _drop
+    from rift.schemas import Checkpoint
+    records, checkpoints = [], []
+    for entry in entries:
+        run_root, _, revision = entry.rpartition(':')
+        run_root = Path(run_root)
+        if revision == 'initial':
+            source = run_root / 'checkpoints' / 'initial.json'
+            revision = json.loads((run_root / 'initial-checkpoint.json').read_text(encoding='utf-8'))['revision']
+        else:
+            source = run_root / 'checkpoints' / ('service-step-%s.json' % revision)
+        data = json.loads(source.read_text(encoding='utf-8'))
+        found = [row for row in data['records'] if row['checkpoint']['revision'] == str(revision) and not row.get('virtual')]
+        if len(found) != 1:
+            raise ValueError('revision %s must be on disk exactly once in %s' % (revision, source))
+        if not Path(found[0]['path']).is_dir():
+            raise FileNotFoundError('the files of revision %s are gone: %s' % (revision, found[0]['path']))
+        records.append(found[0])
+        checkpoints.append((entry, Checkpoint(**found[0]['checkpoint'])))
+    unique = {json.dumps(row['checkpoint'], sort_keys=True): row for row in records}
+    manifest = context.root / 'checkpoints' / 'initial.json'
+    manifest.write_text(json.dumps({'world_size': data['world_size'], 'records': list(unique.values())},
+                                   sort_keys=True), encoding='utf-8')
+    context.adopt_manifest(manifest)
+    kinds = set(drop_references)
+    raw = context.world.certify_specs(eval_specs)
+    by_key = {key: kept for key in sorted(raw) if (kept := _drop(context, raw[key], kinds))}
+    context.world.save()
+    results = []
+    try:
+        for entry, checkpoint in checkpoints:
+            context.restore(checkpoint)
+            report = evaluate_checkpoint(context, by_key, checkpoint, groups=groups, seed=seed,
+                                         label='eval-%s' % checkpoint.weights_digest[:12])
+            results.append({'entry': entry, 'revision': checkpoint.revision, **report})
+            with (context.root / 'eval-checkpoints.jsonl').open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(results[-1], sort_keys=True) + '\n')
+    finally:
+        context.close_runtime()
+    return {'status': 'eval_checkpoints_completed', 'results': results, 'run_root': str(context.root)}
+
+
 def run_solver_steps(context, checkpoint, *, action, index, seed, steps, tasks_per_step, mix_fraction,
                      train_pairs, teacher_refs):
     """Plain (non-calibration) action: the Solver trains ``steps`` steps on Teacher tasks mixed with TRAIN tasks."""
@@ -151,7 +218,7 @@ def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, ste
                seed, calibrate_every=5, n_recovery=64, n_retention=64, screen_groups=1, probe_groups=2,
                lambda_retention=0.5, invalid_reward=-0.1, max_tokens=4096, constrained=True, max_failures=8,
                failure_groups=1, keep_checkpoints=0, keep_every=5, drop_references=(), init_from_run=None,
-               failures_file=None, resume_from=None):
+               failures_file=None, resume_from=None, eval_specs=None, eval_groups=2, eval_every=1, eval_seed=7000):
     from rift.runtime.curriculum_run import _drop, sample_rows
     from rift.runtime.matched_arms import parse_pairs
     log_path = context.root / 'self-teach.jsonl'
@@ -176,6 +243,15 @@ def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, ste
     if probe_specs and calibrate_every:
         probe_by_key = context.world.certify_specs(probe_specs)
         probe_pool = {key: kept for key in sorted(probe_by_key) if (kept := _drop(context, probe_by_key[key], kinds))}
+    eval_by_key = {}
+    if eval_specs:
+        # A fixed set of tasks the run never trains on or probes with: the ability curve is measured here.
+        raw = context.world.certify_specs(eval_specs)
+        eval_by_key = {key: kept for key in sorted(raw) if (kept := _drop(context, raw[key], kinds))}
+        pool_refs = train_refs | {ref for refs in probe_pool.values() for ref in refs}
+        shared = {ref for refs in eval_by_key.values() for ref in refs} & pool_refs
+        if shared:
+            raise ValueError('%d evaluation tasks are also training or probe tasks' % len(shared))
     context.world.save()
     ledger = T.TeacherLedger(context.root / 'teacher')
     forks, index, history = [(first_action, None, None)], 0, []
@@ -263,6 +339,12 @@ def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, ste
                                'teacher_update': round(time.perf_counter() - solver_done, 1)}}
             log(row)
             history.append(row)
+            if eval_by_key and (action + 1) % eval_every == 0:
+                eval_started = time.perf_counter()
+                report = evaluate_checkpoint(context, eval_by_key, checkpoint, groups=eval_groups, seed=eval_seed,
+                                             label='eval-a%03d' % action)
+                log({'event': 'eval', 'action': action, 'revision': checkpoint.revision,
+                     'seconds': round(time.perf_counter() - eval_started, 1), **report})
     finally:
         context.close_runtime()
     return {'status': 'self_teach_completed', 'actions': history, 'final_checkpoint': asdict(checkpoint),
