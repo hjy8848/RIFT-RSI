@@ -8,7 +8,8 @@ from vast_coevo.schema import digest
 from usami_v2.contracts import Sealed
 from usami_v2.commerce.invariants import invariants
 from usami_v2.commerce.models import (
-    Customer, DeliveryRoute, Evidence, Inventory, Merchant, Order, OrderLine, SKU, Warehouse, World,
+    Address, Customer, DeliveryRoute, Evidence, Inventory, Merchant, Order, OrderLine, PaymentMethod, SKU,
+    Warehouse, World,
 )
 from .schema import BuildBudget, ScenarioSpec
 from .solver import (PropagationSearch, assignments, expression_value, impossible_by_interval,
@@ -58,6 +59,12 @@ def _identifier(seed, kind, alias):
     return kind + "_" + digest([seed, kind, alias])[:12]
 
 
+def _address(spec):
+    if spec is None:
+        return None
+    return Address(street=spec.street, city=spec.city, state=spec.state, postal_code=spec.postal_code)
+
+
 def _construct(spec, seed, values):
     aliases = {}
     for kind, names in (
@@ -66,6 +73,7 @@ def _construct(spec, seed, values):
         ("warehouse", tuple(row.alias for row in spec.warehouses)),
         ("order", tuple(row.alias for row in spec.orders)),
         ("line", tuple(line.alias for order in spec.orders for line in order.lines)),
+        ("payment", tuple(row.alias for row in spec.payment_methods)),
     ):
         for alias in names:
             aliases[alias] = _identifier(seed, kind, alias)
@@ -118,18 +126,25 @@ def _construct(spec, seed, values):
         orders[order_id] = Order(
             id=order_id, merchant_id=merchant, customer_id=customer,
             paid_cents=sum(lines[aliases[row.alias]].allocated_paid_cents for row in order.lines),
-            payment_channel="original-card",
+            payment_channel=aliases[order.payment_alias] if order.payment_alias else "original-card",
+            payment_method_id=aliases[order.payment_alias] if order.payment_alias else None,
+            shipping_address=_address(order.shipping_address),
             delivered_at=clock - offset if order.fulfillment_status == "delivered" else clock + offset,
             fulfillment_status=order.fulfillment_status,
             ordered_at=(clock - timedelta(days=order.ordered_days_ago)
                         if order.ordered_days_ago is not None else None))
+    addresses = {row.customer_alias: _address(row.address) for row in spec.default_addresses}
+    methods = {aliases[row.alias]: PaymentMethod(
+        id=aliases[row.alias], customer_id=aliases[row.customer_alias], kind=row.kind,
+        balance_cents=row.balance_cents, opening_balance_cents=row.balance_cents) for row in spec.payment_methods}
     return World(
         seed=seed, clock=clock,
-        customers={aliases[name]: Customer(id=aliases[name], name="Customer " + str(index + 1))
+        customers={aliases[name]: Customer(id=aliases[name], name="Customer " + str(index + 1),
+                                           default_address=addresses.get(name))
                    for index, name in enumerate(spec.customer_aliases)},
         merchants={merchant: Merchant(id=merchant, refund_approval_limit_cents=spec.refund_approval_limit_cents)},
         skus=skus, warehouses=warehouses, routes=routes, inventory=inventory,
-        orders=orders, lines=lines, evidence=evidence), tuple(sorted(aliases.items()))
+        orders=orders, lines=lines, evidence=evidence, payment_methods=methods), tuple(sorted(aliases.items()))
 
 
 def _assignment_hash(values):

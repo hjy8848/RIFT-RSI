@@ -1118,7 +1118,7 @@ def _common(parser):
     parser.add_argument('--run-root', required=True)
     parser.add_argument('--verl-config-dir', required=True)
     parser.add_argument('--episode-budget-config')
-    parser.add_argument('--tool-profile', default='full9', choices=('full9', 'core4'))
+    parser.add_argument('--tool-profile', default='full9', choices=('full9', 'core4', 'retail'))
     parser.add_argument('--task-registry-from',
         help='start from the certified tasks of an earlier run (its task_registry directory); '
              'generator tasks already in it are not proved again')

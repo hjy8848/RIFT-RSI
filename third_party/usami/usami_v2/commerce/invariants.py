@@ -13,7 +13,8 @@ def invariants(world):
 
     collections = ("customers", "merchants", "skus", "warehouses", "inventory", "routes",
                    "orders", "lines", "evidence", "cases", "quotes", "delegations", "consents",
-                   "returns", "ledger", "settlements", "fulfillments", "external_events")
+                   "returns", "ledger", "settlements", "fulfillments", "external_events",
+                   "payment_methods", "modifications")
     for collection in collections:
         for key, row in getattr(world, collection).items():
             if key != row.id:
@@ -158,7 +159,9 @@ def invariants(world):
             bad("LEDGER_SCOPE_INVALID", entry.id)
             continue
         expected = quote.refund_cents if entry.kind == "refund" else quote.extra_charge_cents
-        if entry.amount_cents != expected or entry.channel != order.payment_channel:
+        owned_channel = (world.payment_methods.get(entry.channel) is not None
+                         and world.payment_methods[entry.channel].customer_id == order.customer_id)
+        if entry.amount_cents != expected or (entry.channel != order.payment_channel and not owned_channel):
             bad("LEDGER_AMOUNT_OR_CHANNEL_INVALID", entry.id)
         debit, credit = (("merchant", order.customer_id) if entry.kind == "refund" else (order.customer_id, "merchant"))
         if (entry.debit_account, entry.credit_account) != (debit, credit):
@@ -228,6 +231,44 @@ def invariants(world):
                      if row.line_id == line.id and row.remedy == "cancel" for i in row.unit_indices}
             if units != set(range(line.quantity)):
                 bad("ORDER_CANCELLATION_PARTIAL", line.id)
+    for method in world.payment_methods.values():
+        if method.customer_id not in world.customers:
+            bad("PAYMENT_METHOD_OWNER_MISSING", method.id)
+    for order in world.orders.values():
+        if order.payment_method_id is not None:
+            method = world.payment_methods.get(order.payment_method_id)
+            if method is None or method.customer_id != order.customer_id or order.payment_channel != method.id:
+                bad("ORDER_PAYMENT_METHOD_INVALID", order.id)
+    locked = Counter(row.order_id for row in world.modifications.values())
+    for order in world.orders.values():
+        if (locked[order.id] > 0) != order.items_locked or locked[order.id] > 1:
+            bad("ORDER_LOCK_MODIFICATION_MISMATCH", order.id)
+        if order.items_locked and order.fulfillment_status != "unshipped":
+            bad("LOCKED_ORDER_NOT_UNSHIPPED", order.id)
+    for mod in world.modifications.values():
+        order = world.orders.get(mod.order_id)
+        if (not order or order.customer_id != mod.customer_id or order.paid_cents != mod.new_paid_cents
+                or mod.new_paid_cents - mod.old_paid_cents != mod.extra_charge_cents - mod.refund_cents
+                or (mod.refund_cents and mod.extra_charge_cents)):
+            bad("MODIFICATION_SCOPE_INVALID", mod.id)
+            continue
+        owned = world.payment_methods.get(mod.channel)
+        if mod.channel != order.payment_channel and (owned is None or owned.customer_id != order.customer_id):
+            bad("MODIFICATION_CHANNEL_INVALID", mod.id)
+        for change in mod.changes:
+            line = world.lines.get(change.line_id)
+            if (not line or line.order_id != mod.order_id or line.sku_id != change.to_sku_id
+                    or line.reserved_inventory_id != change.inventory_id):
+                bad("MODIFICATION_LINE_MISMATCH", mod.id)
+    for method in world.payment_methods.values():
+        if method.kind != "gift_card":
+            continue
+        net = sum(row.amount_cents if row.kind == "refund" else -row.amount_cents
+                  for row in world.ledger.values() if row.channel == method.id)
+        net += sum(row.refund_cents - row.extra_charge_cents for row in world.modifications.values()
+                   if row.channel == method.id)
+        if method.balance_cents != method.opening_balance_cents + net:
+            bad("GIFT_CARD_BALANCE_NOT_CONSERVED", method.id)
     for ret in world.returns.values():
         case = world.cases.get(ret.case_id)
         if not case or not case.committed_quote_id:

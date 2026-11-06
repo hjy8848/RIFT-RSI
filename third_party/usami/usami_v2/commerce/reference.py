@@ -5,13 +5,46 @@ Shared code is limited to schemas, stable identifiers and integer allocation.
 """
 from datetime import timedelta
 
-from usami_harness.models import Decision
+from usami_harness.models import Decision, digest
 from .invariants import invariants
 from .models import public_sku
 from .models import (
-    RETURN_LABEL_SLOT, Fulfillment, LedgerEntry, PREPARATIONS, Quote, RemedyCase, Return, Settlement,
-    case_id, quote_id, unit_credit,
+    CUSTOMER_SCOPED, RETURN_LABEL_SLOT, Address, Fulfillment, LedgerEntry, Modification, ModificationChange,
+    PREPARATIONS, Quote, RemedyCase, Return, Settlement, case_id, quote_id, unit_credit,
 )
+
+
+def _payment_route(world, order, requested, refund, charge):
+    """Independent payment rule: (channel, error). Refund: original or an owned gift card; charge: any
+    owned instrument, a gift card must cover it."""
+    channel = order.payment_channel
+    if requested != "original":
+        owned = world.payment_methods.get(requested)
+        if owned is None or owned.customer_id != order.customer_id:
+            return None, ("PAYMENT_METHOD_NOT_FOUND" if world.payment_methods else "PAYMENT_METHOD_UNSUPPORTED")
+        channel = owned.id
+        if refund and owned.kind != "gift_card" and channel != order.payment_channel:
+            return None, "REFUND_DESTINATION_NOT_ALLOWED"
+    held = world.payment_methods.get(channel)
+    if charge and held is not None and held.kind == "gift_card" and held.balance_cents < charge:
+        return None, "INSUFFICIENT_BALANCE"
+    return channel, None
+
+
+def _pay_timing(world, channel):
+    held = world.payment_methods.get(channel)
+    return "immediate" if held is not None and held.kind == "gift_card" else "5-7 business days"
+
+
+def _project_cash(expected, channel, refund, charge):
+    held = expected.payment_methods.get(channel)
+    if held is not None and held.kind == "gift_card":
+        held.balance_cents = held.balance_cents + refund - charge
+
+
+def _order_cancelled(world, order_id):
+    lines = {k for k in world.lines if world.lines[k].order_id == order_id}
+    return any(row.line_id in lines and row.remedy == "cancel" for row in world.settlements.values())
 
 
 def _expected_query(world, actor, op):
@@ -57,6 +90,17 @@ def _expected_query(world, actor, op):
                 continue
             selected.append(public_sku(sku))
         return {"skus": selected}
+    if op.name == "get_customer_profile":
+        rows = []
+        for method_id in sorted(world.payment_methods):
+            method = world.payment_methods[method_id]
+            if method.customer_id != actor:
+                continue
+            row = {"id": method.id, "kind": method.kind}
+            if method.kind == "gift_card":
+                row["balance_cents"] = method.balance_cents
+            rows.append(row)
+        return {"customer": world.customers[actor].model_dump(mode="json"), "payment_methods": rows}
     if op.name == "get_sku_details":
         return {"sku": public_sku(world.skus[key])}
     if op.name == "get_inventory":
@@ -148,12 +192,14 @@ def _project_settlement(expected, quote, pre_reserved):
             id=lid, line_id=line.id, quote_id=quote.id, kind="refund",
             amount_cents=quote.refund_cents, channel=quote.payment_channel,
             debit_account="merchant", credit_account=customer)
+        _project_cash(expected, quote.payment_channel, quote.refund_cents, 0)
     if quote.extra_charge_cents:
         lid = "extra_charge_" + quote.id
         expected.ledger[lid] = LedgerEntry(
             id=lid, line_id=line.id, quote_id=quote.id, kind="extra_charge",
             amount_cents=quote.extra_charge_cents, channel=quote.payment_channel,
             debit_account=customer, credit_account="merchant")
+        _project_cash(expected, quote.payment_channel, 0, quote.extra_charge_cents)
     sid = "settlement_" + case.id
     expected.settlements[sid] = Settlement(
         id=sid, case_id=case.id, line_id=line.id, quote_id=quote.id,
@@ -188,6 +234,8 @@ def _decide_cancellation(world, actor, order):
     if order.fulfillment_status != "unshipped":
         # Shipped or delivered goods are handled as returns, never as a cancellation.
         return deny("ORDER_NOT_CANCELLABLE")
+    if order.items_locked:
+        return deny("ORDER_LOCKED")
     open_cases = [row for row in world.cases.values() if row.line_id in owned and row.status != "cancelled"]
     if previous or open_cases:
         return deny("CANCELLATION_CONFLICT")
@@ -210,9 +258,112 @@ def _decide_cancellation(world, actor, order):
             balance.available = world.inventory[balance.id].available + line.quantity
             balance.revision = world.inventory[balance.id].revision + 1
     total = sum(row.allocated_paid_cents for row in order_lines)
-    return Decision(allowed=True, expected_state=expected,
-                    data={"status": "order_cancelled", "order_id": order.id, "refund_cents": total,
-                          "payment_channel": order.payment_channel})
+    data = {"status": "order_cancelled", "order_id": order.id, "refund_cents": total,
+            "payment_channel": order.payment_channel}
+    if world.payment_methods:
+        data["refund_timing"] = _pay_timing(world, order.payment_channel)
+    return Decision(allowed=True, expected_state=expected, data=data)
+
+
+def _decide_retail(world, actor, op, order):
+    """Independent policy for the address and pending-order-items operations."""
+    def deny(code):
+        return Decision(allowed=False, error_code=code)
+
+    p = op.params
+    if op.name == "update_default_address":
+        active = any(row.customer_id == actor and not row.withdrawn and row.expires_at >= world.clock
+                     and row.source_customer_event_hash for row in world.delegations.values())
+        if not active:
+            return deny("BUSINESS_DELEGATION_REQUIRED")
+        expected = world.clone()
+        expected.customers[actor].default_address = Address(**p)
+        return Decision(allowed=True, expected_state=expected,
+                        data={"status": "default_address_updated", "address": dict(p)})
+    order_lines = sorted(k for k in world.lines if world.lines[k].order_id == order.id)
+    if op.name == "modify_order_address":
+        if not _delegated(world, actor, order_lines):
+            return deny("BUSINESS_DELEGATION_REQUIRED")
+        if _order_cancelled(world, order.id):
+            return deny("ORDER_ALREADY_CANCELLED")
+        if order.fulfillment_status != "unshipped":
+            return deny("ORDER_NOT_MODIFIABLE")
+        expected = world.clone()
+        expected.orders[order.id].shipping_address = Address(**p)
+        return Decision(allowed=True, expected_state=expected, data={
+            "status": "address_updated", "order_id": order.id, "shipping_address": dict(p)})
+    named = [row["line_id"] for row in p["changes"]]
+    if not _delegated(world, actor, named):
+        return deny("BUSINESS_DELEGATION_REQUIRED")
+    if _order_cancelled(world, order.id):
+        return deny("ORDER_ALREADY_CANCELLED")
+    if order.fulfillment_status != "unshipped":
+        return deny("ORDER_NOT_MODIFIABLE")
+    if order.items_locked:
+        return deny("ORDER_LOCKED")
+    if len(set(named)) != len(named):
+        return deny("DUPLICATE_LINE_CHANGE")
+    if any(name not in order_lines for name in named):
+        return deny("LINE_NOT_IN_ORDER")
+    expected = world.clone()
+    targets = {row["line_id"]: row["target_sku_id"] for row in p["changes"]}
+    old_total = new_total = 0
+    records = []
+    for line_key in sorted(named):
+        line = world.lines[line_key]
+        original = world.skus[line.sku_id]
+        if (any(row.line_id == line_key for row in world.settlements.values())
+                or any(row.line_id == line_key and row.status != "cancelled" for row in world.cases.values())):
+            return deny("MODIFICATION_CONFLICT")
+        target = world.skus.get(targets[line_key])
+        if target is None or target.merchant_id != order.merchant_id:
+            return deny("EXCHANGE_TARGET_NOT_FOUND")
+        if target.product_family != original.product_family:
+            return deny("REPLACEMENT_FAMILY_MISMATCH")
+        if target.id == original.id:
+            return deny("EXCHANGE_TARGET_SAME_AS_ORIGINAL")
+        held = world.inventory.get(line.reserved_inventory_id or "")
+        if held is None:
+            return deny("MODIFICATION_NOT_REPRESENTABLE")
+        stock = next((expected.inventory[k] for k in sorted(expected.inventory)
+                      if expected.inventory[k].sku_id == target.id
+                      and expected.inventory[k].warehouse_id == held.warehouse_id), None)
+        if stock is None or stock.available < line.quantity:
+            return deny("INSUFFICIENT_STOCK")
+        released = expected.inventory[held.id]
+        released.reserved = released.reserved - line.quantity
+        released.available = released.available + line.quantity
+        released.revision = released.revision + 1
+        stock.available = stock.available - line.quantity
+        stock.reserved = stock.reserved + line.quantity
+        stock.revision = stock.revision + 1
+        new_line = expected.lines[line_key]
+        new_line.sku_id, new_line.reserved_inventory_id = target.id, stock.id
+        new_line.allocated_paid_cents = target.price_cents * line.quantity
+        records.append(ModificationChange(line_id=line_key, from_sku_id=original.id,
+                                          to_sku_id=target.id, inventory_id=stock.id))
+        old_total += line.allocated_paid_cents
+        new_total += target.price_cents * line.quantity
+    difference = new_total - old_total
+    refund, extra = (-difference, 0) if difference < 0 else (0, difference)
+    if refund > world.merchants[order.merchant_id].refund_approval_limit_cents:
+        return deny("APPROVAL_REQUIRED")
+    channel, failure = _payment_route(world, order, p["payment_method"], refund > 0, extra)
+    if failure:
+        return deny(failure)
+    total = sum(row.allocated_paid_cents for row in expected.lines.values() if row.order_id == order.id)
+    expected.orders[order.id].paid_cents = total
+    expected.orders[order.id].items_locked = True
+    mid = "modification_" + digest([order.id, [row.line_id for row in records]])[:20]
+    expected.modifications[mid] = Modification(
+        id=mid, order_id=order.id, customer_id=actor, changes=tuple(records), old_paid_cents=total - difference,
+        new_paid_cents=total, refund_cents=refund, extra_charge_cents=extra, channel=channel)
+    _project_cash(expected, channel, refund, extra)
+    data = {"status": "order_items_modified", "order_id": order.id, "refund_cents": refund,
+            "extra_charge_cents": extra, "new_total_cents": total, "payment_channel": channel}
+    if world.payment_methods and refund:
+        data["refund_timing"] = _pay_timing(world, channel)
+    return Decision(allowed=True, expected_state=expected, data=data)
 
 
 def _open_units(world, line):
@@ -338,13 +489,19 @@ def _decide_replacement(world, actor, op, line, order):
             refund = -difference
     if refund > world.merchants[order.merchant_id].refund_approval_limit_cents:
         return deny("APPROVAL_REQUIRED")
+    requested = p.get("payment_method", "original") if exchange else "original"
+    channel = order.payment_channel
+    if requested != "original" or (extra and world.payment_methods):
+        channel, failure = _payment_route(world, order, requested, refund > 0, extra)
+        if failure:
+            return deny(failure)
     cid = case_id(line.id, indices)
     qid = quote_id(cid, 1)
     arrival = world.clock + timedelta(days=route.days)
     terms = Quote(id=qid, case_id=cid, customer_id=actor, remedy="exchange" if exchange else "reship",
                   quantity=len(indices), target_sku_id=target.id, inventory_id=balance.id,
                   route_id=route.id, refund_cents=refund, extra_charge_cents=extra,
-                  payment_channel=order.payment_channel, promised_arrival=arrival,
+                  payment_channel=channel, promised_arrival=arrival,
                   return_required=False, revision=1, inventory_revision=balance.revision,
                   sku_revision=target.revision, route_revision=route.revision, status="committed",
                   valid_until=world.clock + timedelta(hours=1))
@@ -354,8 +511,10 @@ def _decide_replacement(world, actor, op, line, order):
     _project_settlement(expected, terms, False)
     data = {"status": "exchange_shipped" if exchange else "replacement_shipped", "line_id": line.id,
             "quantity": len(indices), "target_sku_id": target.id, "refund_cents": refund,
-            "extra_charge_cents": extra, "payment_channel": order.payment_channel,
+            "extra_charge_cents": extra, "payment_channel": channel,
             "promised_arrival": arrival.isoformat()}
+    if world.payment_methods and refund:
+        data["refund_timing"] = _pay_timing(world, channel)
     return Decision(allowed=True, expected_state=expected, data=data)
 
 
@@ -371,7 +530,7 @@ def decide(world, actor, op):
         return deny("MERCHANT_NOT_FOUND")
     key, p = op.resource_id, op.params
     case, quote, line, order = None, None, None, None
-    if op.name in ("list_customer_orders", "search_catalog"):
+    if op.name in CUSTOMER_SCOPED:
         if key != op.scope_id:
             return deny("MERCHANT_SCOPE_MISMATCH")
     elif op.name in ("get_sku_details", "get_inventory", "estimate_delivery"):
@@ -384,7 +543,7 @@ def decide(world, actor, op):
                     row.warehouse_id == warehouse.id for row in world.routes.values()):
                 return deny("DELIVERY_ROUTE_NOT_FOUND")
     else:
-        if op.name in ("get_order_details", "cancel_order"):
+        if op.name in ("get_order_details", "cancel_order", "modify_order_address", "modify_order_items"):
             order = world.orders.get(key)
         elif op.name in ("open_remedy_case", "get_refundable_balance", "return_delivered_order_items",
                          "list_exchange_options", "exchange_delivered_order_items",
@@ -423,9 +582,14 @@ def decide(world, actor, op):
                    and row.source_customer_event_hash
                    for row in world.delegations.values()):
             return deny("BUSINESS_DELEGATION_REQUIRED")
-        if p["payment_method"] != "original":
-            return deny("PAYMENT_METHOD_UNSUPPORTED")
         sku = world.skus[line.sku_id]
+        channel = order.payment_channel
+        if p["payment_method"] != "original":
+            channel, failure = _payment_route(world, order, p["payment_method"], True, 0)
+            if failure is None and sku.return_required:
+                failure = "PAYMENT_METHOD_UNSUPPORTED"
+            if failure:
+                return deny(failure)
         if not _delivered(order, world.clock):
             return deny("ORDER_NOT_DELIVERED")
         pending_returns = _accepted_returns(world, line.id)
@@ -466,7 +630,7 @@ def decide(world, actor, op):
         cid, qid = case_id(line.id, indices), quote_id(case_id(line.id, indices), 1)
         refund = Quote(id=qid, case_id=cid, customer_id=actor, remedy="refund",
                        quantity=len(indices), refund_cents=amount, extra_charge_cents=0,
-                       payment_channel=order.payment_channel, return_required=False,
+                       payment_channel=channel, return_required=False,
                        status="committed", revision=1,
                        valid_until=world.clock + timedelta(hours=1))
         expected.cases[cid] = RemedyCase(id=cid, line_id=line.id, unit_indices=indices,
@@ -474,10 +638,14 @@ def decide(world, actor, op):
         expected.quotes[qid] = refund
         _project_settlement(expected, refund, False)
         data = {"status": "refund_issued", "line_id": line.id, "quantity": len(indices),
-                "refund_cents": amount, "payment_channel": order.payment_channel}
+                "refund_cents": amount, "payment_channel": channel}
+        if world.payment_methods:
+            data["refund_timing"] = _pay_timing(world, channel)
         return Decision(allowed=True, expected_state=expected, data=data)
     if op.name == "cancel_order":
         return _decide_cancellation(world, actor, order)
+    if op.name in ("modify_order_address", "modify_order_items", "update_default_address"):
+        return _decide_retail(world, actor, op, order)
     if op.name in ("exchange_delivered_order_items", "reship_order_items"):
         return _decide_replacement(world, actor, op, line, order)
     if op.name == "request_item_return":

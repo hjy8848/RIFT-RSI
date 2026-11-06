@@ -59,7 +59,7 @@ class ServiceAction(Sealed):
     call_id: str = ""
 
     @classmethod
-    def from_tool_message(cls, raw, customer_id, observed_subject_ids=(), merchant_scope_ids=()):
+    def from_tool_message(cls, raw, customer_id, observed_subject_ids=(), merchant_scope_ids=(), retail=False):
         message = _one_tool_call(raw)
         call = message["tool_calls"][0]
         name, args = call["function"]["name"], _json_arguments(call["function"]["arguments"])
@@ -75,26 +75,42 @@ class ServiceAction(Sealed):
             return cls(kind="reply", message=args["message"], present_quote_id=args.get("present_quote_id"),
                        present_for=args.get("present_for") or "commit_accepted_quote", subject_ids=subjects,
                        call=completion, call_id=call["id"])
-        if name not in PUBLIC_PARAMETERS:
+        if name not in PUBLIC_PARAMETERS or (name in RETAIL_TOOLS and not retail):
             raise ServiceError("MODEL_OUTPUT_INVALID", "Service selected an unregistered commerce tool")
         scope = _single_merchant_scope(merchant_scope_ids)
-        if name == "list_customer_orders":
+        payment = args.get("payment_method") or "original"
+        if payment != "original" and not retail:
+            raise ServiceError("MODEL_OUTPUT_INVALID", "this tool profile only supports the original payment method")
+        if name in ("list_customer_orders", "get_customer_profile"):
             resource, params = scope, {}
-        elif name in ("get_order_details", "cancel_order"):
+        elif name == "update_default_address":
+            resource, params = scope, {key: args.get(key) for key in ADDRESS_FIELDS}
+        elif name in ("get_order_details", "cancel_order", "modify_order_address", "modify_order_items"):
             order_id = args.get("order_id")
             if not isinstance(order_id, str) or not order_id:
                 raise ServiceError("MODEL_OUTPUT_INVALID", name + " requires an order_id")
-            resource, params = order_id, {}
+            resource = order_id
+            if name == "modify_order_address":
+                params = {key: args.get(key) for key in ADDRESS_FIELDS}
+            elif name == "modify_order_items":
+                changes = args.get("changes")
+                if not isinstance(changes, list) or any(not isinstance(row, dict) for row in changes):
+                    raise ServiceError("MODEL_OUTPUT_INVALID", "modify_order_items requires a list of changes")
+                params = {"changes": [{"line_id": row.get("line_id"), "target_sku_id": row.get("target_sku_id")}
+                                      for row in changes], "payment_method": payment}
+            else:
+                params = {}
         else:
             line_id = args.get("line_id")
             if not isinstance(line_id, str) or not line_id:
                 raise ServiceError("MODEL_OUTPUT_INVALID", name + " requires a line_id")
             resource = line_id
             if name == "return_delivered_order_items":
-                params = {"quantity": args.get("quantity"),
-                          "payment_method": args.get("payment_method") or "original"}
+                params = {"quantity": args.get("quantity"), "payment_method": payment}
             elif name == "exchange_delivered_order_items":
                 params = {"quantity": args.get("quantity"), "target_sku_id": args.get("target_sku_id")}
+                if payment != "original":
+                    params["payment_method"] = payment
             elif name == "list_exchange_options":
                 params = {}
             else:
@@ -174,7 +190,11 @@ def _schema_with_defs(model):
 PUBLIC_TOOLS = ("list_customer_orders", "get_order_details", "return_delivered_order_items",
                 "cancel_order", "list_exchange_options", "exchange_delivered_order_items",
                 "reship_order_items", "request_item_return")
-PUBLIC_PARAMETERS = frozenset(PUBLIC_TOOLS)
+# Retail extension: only the 'retail' tool profile exposes (and parses) these.
+RETAIL_TOOLS = frozenset({"get_customer_profile", "modify_order_address", "update_default_address",
+                          "modify_order_items"})
+ADDRESS_FIELDS = ("street", "city", "state", "postal_code")
+PUBLIC_PARAMETERS = frozenset(PUBLIC_TOOLS) | RETAIL_TOOLS
 
 
 def _public_tool(name, description, properties, required):
@@ -188,7 +208,7 @@ def service_tools(profile='full9'):
     """The small Agent-facing surface; internal case/quote/consent steps stay hidden."""
     line = {"type": "string", "description": "Order line ID from get_order_details."}
     quantity = {"type": "integer", "minimum": 1, "description": "Number of purchased units."}
-    if profile not in ('core4', 'full9'):
+    if profile not in ('core4', 'full9', 'retail'):
         raise ValueError('unknown Service tool profile')
     tools = [
         _public_tool("list_customer_orders",
@@ -245,7 +265,55 @@ def service_tools(profile='full9'):
         names = {'list_customer_orders', 'get_order_details',
                  'return_delivered_order_items', 'respond_to_customer'}
         return [tool for tool in tools if tool['function']['name'] in names]
+    if profile == 'retail':
+        return _retail_tools(tools, line)
     return tools
+
+
+def _retail_tools(tools, line):
+    """The full9 surface plus address, payment-method and pending-order-item tools."""
+    from copy import deepcopy
+    tools = deepcopy(tools)
+    payment = {"type": "string", "description": "'original', or the id of a payment method from "
+               "get_customer_profile. Refunds may go to the original method or a gift card; a gift card "
+               "that pays a charge must hold enough balance."}
+    for tool in tools:
+        spec = tool["function"]
+        if spec["name"] == "return_delivered_order_items":
+            spec["parameters"]["properties"]["payment_method"] = payment
+        elif spec["name"] == "exchange_delivered_order_items":
+            spec["parameters"]["properties"]["payment_method"] = payment
+        elif spec["name"] == "cancel_order":
+            spec["description"] += " An order whose items were already modified cannot be cancelled."
+    address = {key: {"type": "string"} for key in ADDRESS_FIELDS}
+    order = {"type": "string", "description": "Order ID returned by list_customer_orders."}
+    extra = [
+        _public_tool("get_customer_profile",
+                     "Read the authenticated customer's default address and payment methods (gift-card "
+                     "balances included).", {}, []),
+        _public_tool("modify_order_address",
+                     "Change the shipping address of an order that has not shipped yet.",
+                     {"order_id": order, **address}, ["order_id", *ADDRESS_FIELDS]),
+        _public_tool("update_default_address",
+                     "Change the customer's default address on file.", address, list(ADDRESS_FIELDS)),
+        _public_tool("modify_order_items",
+                     "Change items of an order that has not shipped yet to another variant of the same "
+                     "product. This can be done ONLY ONCE per order: afterwards the order can be neither "
+                     "modified nor cancelled, so collect every change first. Any price difference is paid or "
+                     "refunded through payment_method.",
+                     {"order_id": order,
+                      "changes": {"type": "array", "minItems": 1, "items": {
+                          "type": "object", "additionalProperties": False,
+                          "properties": {"line_id": {"type": "string"},
+                                         "target_sku_id": {"type": "string",
+                                                           "description": "sku_id from list_exchange_options."}},
+                          "required": ["line_id", "target_sku_id"]}},
+                      "payment_method": payment},
+                     ["order_id", "changes"]),
+    ]
+    respond = [tool for tool in tools if tool["function"]["name"] == "respond_to_customer"]
+    rest = [tool for tool in tools if tool["function"]["name"] != "respond_to_customer"]
+    return rest + extra + respond
 
 
 CUSTOMER_TOOLS = [{"type": "function", "function": {
@@ -359,10 +427,23 @@ class OpenAIServiceAgent:
         "exactly one function call per response."
     )
 
+    RETAIL_ADDENDUM = (
+        "\nRetail rules. The customer may own several payment methods (gift card with a balance, credit card, "
+        "PayPal); read them with get_customer_profile. A refund goes back to the original method or to a gift "
+        "card of the customer. A price difference may be paid with any method of the customer, but a gift card "
+        "must hold enough balance. Gift-card refunds arrive immediately, other refunds in 5 to 7 business days. "
+        "Addresses can be changed (modify_order_address, update_default_address) only for orders that have not "
+        "shipped; look up an address the customer does not state in their profile or other orders instead of "
+        "guessing. modify_order_items works once per order and locks the order; before calling it, make sure the "
+        "customer has named every item to change."
+    )
+
     @classmethod
     def system_for_profile(cls, profile):
         if profile == 'full9':
             return cls.SYSTEM
+        if profile == 'retail':
+            return cls.SYSTEM + cls.RETAIL_ADDENDUM
         if profile == 'core4':
             return cls.CORE4_SYSTEM
         raise ValueError('unknown Service tool profile')

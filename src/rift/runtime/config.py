@@ -55,8 +55,8 @@ class ProductionConfig:
         algorithm = self.verl.get("algorithm", {})
         trainer = self.verl.get("trainer", {})
         checks = (
-            (service.get('tool_profile', 'full9') in ('core4', 'full9'),
-             'Service tool_profile must be core4 or full9'),
+            (service.get('tool_profile', 'full9') in ('core4', 'full9', 'retail'),
+             'Service tool_profile must be core4, full9 or retail'),
             (package.get("grpo_group_size") == rollout.get("n"),
              "RIFT grpo_group_size must equal VERL rollout.n"),
             (rollout.get("name") == "vllm", "production rollout backend must be vllm"),

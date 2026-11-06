@@ -33,6 +33,7 @@ def verify_world_constraints(spec, result):
     expected_aliases.update(row.alias for row in spec.warehouses)
     expected_aliases.update(row.alias for row in spec.orders)
     expected_aliases.update(line.alias for order in spec.orders for line in order.lines)
+    expected_aliases.update(row.alias for row in spec.payment_methods)
     aliases = dict(result.private_aliases)
     if (set(aliases) != expected_aliases or len(aliases) != len(result.private_aliases)
             or len(set(aliases.values())) != len(aliases)):
@@ -75,6 +76,33 @@ def verify_world_constraints(spec, result):
             or set(world.orders) != {aliases[row.alias] for row in spec.orders}
             or set(world.lines) != {aliases[row.alias] for order in spec.orders for row in order.lines}):
         raise ValueError("business entity population differs")
+    if set(world.payment_methods) != {aliases[row.alias] for row in spec.payment_methods}:
+        raise ValueError("payment method population differs")
+    for method_spec in spec.payment_methods:
+        method = world.payment_methods[aliases[method_spec.alias]]
+        if (method.customer_id != aliases[method_spec.customer_alias] or method.kind != method_spec.kind
+                or method.balance_cents != method_spec.balance_cents
+                or method.opening_balance_cents != method_spec.balance_cents):
+            raise ValueError("payment method differs from registered scenario")
+    wanted = {aliases[row.customer_alias]: row.address for row in spec.default_addresses}
+    for customer_id, customer in world.customers.items():
+        address = wanted.get(customer_id)
+        if (customer.default_address is None) != (address is None) or (address is not None and (
+                (customer.default_address.street, customer.default_address.city, customer.default_address.state,
+                 customer.default_address.postal_code) != (address.street, address.city, address.state,
+                                                           address.postal_code))):
+            raise ValueError("Customer default address differs from registered scenario")
+    for order_spec in spec.orders:
+        order = world.orders[aliases[order_spec.alias]]
+        paying = aliases[order_spec.payment_alias] if order_spec.payment_alias else None
+        shipped_to = order_spec.shipping_address
+        if (order.payment_method_id != paying
+                or (order.shipping_address is None) != (shipped_to is None)
+                or (shipped_to is not None and (order.shipping_address.street, order.shipping_address.city,
+                    order.shipping_address.state, order.shipping_address.postal_code) != (
+                    shipped_to.street, shipped_to.city, shipped_to.state, shipped_to.postal_code))
+                or order.items_locked):
+            raise ValueError("order payment or address differs from registered scenario")
     if any(getattr(world, key) for key in ("cases", "quotes", "delegations", "consents", "returns",
                                          "ledger", "settlements", "fulfillments", "external_events", "applied_events")):
         raise ValueError("initial scene contains unregistered transactions, authority or events")
@@ -125,7 +153,8 @@ def verify_world_constraints(spec, result):
         raise ValueError("initial evidence population differs")
     for order_spec in spec.orders:
         order = world.orders[aliases[order_spec.alias]]
-        if order.customer_id != aliases[order_spec.customer_alias] or order.merchant_id != merchant or order.payment_channel != "original-card":
+        if order.customer_id != aliases[order_spec.customer_alias] or order.merchant_id != merchant or order.payment_channel != (
+                    aliases[order_spec.payment_alias] if order_spec.payment_alias else "original-card"):
             raise ValueError("order Customer, merchant or payment binding differs")
         if order.fulfillment_status != order_spec.fulfillment_status:
             raise ValueError("order fulfillment status differs from the scene")

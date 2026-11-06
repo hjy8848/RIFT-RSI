@@ -74,6 +74,32 @@ class LineVariable(Sealed):
         return self
 
 
+class AddressSpec(Sealed):
+    street: str = Field(min_length=1)
+    city: str = Field(min_length=1)
+    state: str = Field(min_length=1)
+    postal_code: str = Field(min_length=1)
+
+
+class PaymentVariable(Sealed):
+    """A payment instrument of one customer; only a gift card has a (fixed) balance."""
+    alias: str = Field(min_length=1)
+    customer_alias: str
+    kind: Literal["gift_card", "credit_card", "paypal"]
+    balance_cents: Optional[int] = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="after")
+    def balance_only_for_gift_cards(self):
+        if (self.kind == "gift_card") != (self.balance_cents is not None):
+            raise ValueError("exactly gift cards carry a balance")
+        return self
+
+
+class CustomerAddress(Sealed):
+    customer_alias: str
+    address: AddressSpec
+
+
 class OrderVariable(Sealed):
     alias: str = Field(min_length=1)
     customer_alias: str
@@ -85,14 +111,17 @@ class OrderVariable(Sealed):
         default="delivered",
         description="Only an unshipped order can be cancelled; its lines reserve stock in the first stocked warehouse.")
     ordered_days_ago: Optional[int] = Field(default=None, ge=0, strict=True)
+    payment_alias: Optional[str] = None
+    shipping_address: Optional[AddressSpec] = None
 
     @model_serializer(mode="wrap")
     def _compatible_dump(self, handler):
         data = handler(self)
         if self.fulfillment_status == "delivered":
             data.pop("fulfillment_status", None)
-        if self.ordered_days_ago is None:
-            data.pop("ordered_days_ago", None)
+        for name in ("ordered_days_ago", "payment_alias", "shipping_address"):
+            if getattr(self, name) is None:
+                data.pop(name, None)
         return data
 
     @model_validator(mode="after")
@@ -181,12 +210,15 @@ class ScenarioSpec(Sealed):
     provenance_kind: Literal["synthetic_reference", "designer_exploration", "offline_fixture"]
     distribution_hash: Optional[str] = None
     history: Tuple[HistoryStep, ...] = ()
+    payment_methods: Tuple[PaymentVariable, ...] = ()
+    default_addresses: Tuple[CustomerAddress, ...] = ()
 
     @model_serializer(mode='wrap')
     def _compatible_dump(self, handler):
         data = handler(self)
-        if not self.history:
-            data.pop('history', None)
+        for name in ('history', 'payment_methods', 'default_addresses'):
+            if not getattr(self, name):
+                data.pop(name, None)
         return data
 
     @model_validator(mode="after")
@@ -196,8 +228,19 @@ class ScenarioSpec(Sealed):
         aliases += [row.alias for row in self.skus] + [row.alias for row in self.warehouses]
         aliases += [row.alias for row in self.orders]
         aliases += [line.alias for order in self.orders for line in order.lines]
+        aliases += [row.alias for row in self.payment_methods]
         if len(aliases) != len(set(aliases)):
             raise ValueError("entity aliases must be globally unique")
+        methods = {row.alias: row for row in self.payment_methods}
+        if (any(row.customer_alias not in self.customer_aliases for row in self.payment_methods)
+                or any(row.customer_alias not in self.customer_aliases for row in self.default_addresses)
+                or len({row.customer_alias for row in self.default_addresses}) != len(self.default_addresses)):
+            raise ValueError("payment method or address references an unknown or repeated Customer")
+        for order in self.orders:
+            if order.payment_alias is not None and (
+                    order.payment_alias not in methods
+                    or methods[order.payment_alias].customer_alias != order.customer_alias):
+                raise ValueError("order pays with a payment method its Customer does not own")
         sku_ids, warehouse_ids = {row.alias for row in self.skus}, {row.alias for row in self.warehouses}
         if self.default_stock.low < 0:
             raise ValueError("default stock cannot be negative")

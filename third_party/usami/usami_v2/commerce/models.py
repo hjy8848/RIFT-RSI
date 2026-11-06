@@ -18,9 +18,38 @@ def omit_default_fields(data, model, names):
     return data
 
 
+class Address(Model):
+    street: str = Field(min_length=1)
+    city: str = Field(min_length=1)
+    state: str = Field(min_length=1)
+    postal_code: str = Field(min_length=1)
+
+
 class Customer(Model):
     id: str
     name: str
+    # Retail extension: omitted while unset so every earlier world keeps its hash.
+    default_address: Optional[Address] = None
+
+    @model_serializer(mode="wrap")
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ("default_address",))
+
+
+class PaymentMethod(Model):
+    """A payment instrument the Customer owns; only a gift card carries a balance."""
+    id: str
+    customer_id: str
+    kind: Literal["gift_card", "credit_card", "paypal"]
+    # balance_cents is the live gift-card balance, opening_balance_cents what it was in the frozen world.
+    balance_cents: Optional[int] = Field(default=None, ge=0, strict=True)
+    opening_balance_cents: Optional[int] = Field(default=None, ge=0, strict=True)
+
+    @model_validator(mode="after")
+    def balance_only_for_gift_cards(self):
+        if (self.kind == "gift_card") != (self.balance_cents is not None and self.opening_balance_cents is not None):
+            raise ValueError("exactly gift cards carry a balance")
+        return self
 
 
 class Merchant(Model):
@@ -77,6 +106,11 @@ class Order(Model):
     # every pre-Phase-3 order (and its hash) a delivered order.
     fulfillment_status: Literal["unshipped", "shipped", "delivered"] = "delivered"
     ordered_at: Optional[datetime] = None
+    # Retail extension, all omitted while at their defaults.
+    shipping_address: Optional[Address] = None
+    payment_method_id: Optional[str] = None
+    # An unshipped order whose items were modified once can be neither modified nor cancelled again.
+    items_locked: bool = False
 
     @model_validator(mode="after")
     def timezone(self):
@@ -87,7 +121,8 @@ class Order(Model):
 
     @model_serializer(mode="wrap")
     def _compatible_dump(self, handler):
-        return omit_default_fields(handler(self), self, ("fulfillment_status", "ordered_at"))
+        return omit_default_fields(handler(self), self, (
+            "fulfillment_status", "ordered_at", "shipping_address", "payment_method_id", "items_locked"))
 
 
 class OrderLine(Model):
@@ -253,6 +288,26 @@ class ExternalEvent(Model):
         return self
 
 
+class ModificationChange(Model):
+    line_id: str
+    from_sku_id: str
+    to_sku_id: str
+    inventory_id: str
+
+
+class Modification(Model):
+    """One-shot change of an unshipped order's items; cash moves through ``channel``."""
+    id: str
+    order_id: str
+    customer_id: str
+    changes: Tuple[ModificationChange, ...] = Field(min_length=1)
+    old_paid_cents: int = Field(ge=0, strict=True)
+    new_paid_cents: int = Field(ge=0, strict=True)
+    refund_cents: int = Field(ge=0, strict=True)
+    extra_charge_cents: int = Field(ge=0, strict=True)
+    channel: str
+
+
 class World(WorldBase):
     domain: Literal["commerce"] = "commerce"
     version: Literal["commerce-2.0.0"] = VERSION
@@ -276,10 +331,12 @@ class World(WorldBase):
     external_events: Dict[str, ExternalEvent] = Field(default_factory=dict)
     applied_events: Tuple[str, ...] = ()
     observation_protocol: Literal['commerce-observation-v1', 'commerce-observation-v2'] = 'commerce-observation-v1'
+    payment_methods: Dict[str, PaymentMethod] = Field(default_factory=dict)
+    modifications: Dict[str, Modification] = Field(default_factory=dict)
 
     @model_serializer(mode='wrap')
     def _compatible_dump(self, handler):
-        return omit_default_fields(handler(self), self, ('observation_protocol',))
+        return omit_default_fields(handler(self), self, ('observation_protocol', 'payment_methods', 'modifications'))
 
 
 class OpenCaseInput(Model):
@@ -310,13 +367,35 @@ class PrepareQuoteInput(Model):
 
 class ReturnItemsInput(Model):
     quantity: int = Field(gt=0, strict=True)
-    # Phase 1: an ordinary refund always returns to the original payment channel.
-    payment_method: Literal["original"] = "original"
+    # "original", or the id of a payment method the Customer owns (retail worlds only).
+    payment_method: str = Field(default="original", min_length=1)
 
 
 class ExchangeItemsInput(Model):
     quantity: int = Field(gt=0, strict=True)
     target_sku_id: str = Field(min_length=1)
+    payment_method: str = Field(default="original", min_length=1)
+
+    @model_serializer(mode="wrap")
+    def _compatible_dump(self, handler):
+        return omit_default_fields(handler(self), self, ("payment_method",))
+
+
+class AddressInput(Model):
+    street: str = Field(min_length=1)
+    city: str = Field(min_length=1)
+    state: str = Field(min_length=1)
+    postal_code: str = Field(min_length=1)
+
+
+class ItemChangeInput(Model):
+    line_id: str = Field(min_length=1)
+    target_sku_id: str = Field(min_length=1)
+
+
+class ModifyItemsInput(Model):
+    changes: Tuple[ItemChangeInput, ...] = Field(min_length=1, max_length=32)
+    payment_method: str = Field(default="original", min_length=1)
 
 
 class LineQuantityInput(Model):
@@ -349,7 +428,16 @@ PARAMETERS = {
     "exchange_delivered_order_items": ExchangeItemsInput,
     "reship_order_items": LineQuantityInput,
     "request_item_return": LineQuantityInput,
+    # Retail extension.
+    "get_customer_profile": Empty,
+    "modify_order_address": AddressInput,
+    "update_default_address": AddressInput,
+    "modify_order_items": ModifyItemsInput,
 }
+# Customer-scoped tools: the resource is the merchant scope, like list_customer_orders.
+CUSTOMER_SCOPED = frozenset({"list_customer_orders", "search_catalog", "get_customer_profile",
+                             "update_default_address"})
+RETAIL_ACTIONS = frozenset({"modify_order_address", "update_default_address", "modify_order_items"})
 QUERIES = frozenset(name for name in PARAMETERS if name.startswith(("get_", "list_", "search_", "estimate_")))
 PREPARATIONS = frozenset({"open_remedy_case", "verify_submitted_evidence",
                          "request_policy_review", "prepare_remedy_quote", "cancel_pending_commitment"})

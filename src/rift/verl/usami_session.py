@@ -180,7 +180,7 @@ class NativeUsamiSession:
                         raise ServiceError('MODEL_OUTPUT_INVALID', 'tool is outside the active profile')
                     parsed = ServiceAction.from_tool_message(
                         response, self._prompt.customer_id, self._prompt.observed_subject_ids,
-                        self._prompt.available_merchant_scope_ids)
+                        self._prompt.available_merchant_scope_ids, retail=self.tool_profile == 'retail')
                 except ServiceError as exc:
                     if getattr(exc, 'code', None) != 'MODEL_OUTPUT_INVALID':
                         raise

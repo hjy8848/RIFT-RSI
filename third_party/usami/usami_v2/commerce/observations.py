@@ -38,6 +38,12 @@ def query_data(world, actor, op):
     if op.name == "get_order_details":
         return {"order": world.orders[key].model_dump(mode="json"),
                 "lines": _public_line_rows(world, key)}
+    if op.name == "get_customer_profile":
+        return {"customer": world.customers[actor].model_dump(mode="json"),
+                "payment_methods": [row.model_dump(mode="json", exclude={"opening_balance_cents", "customer_id"}
+                                                   | ({"balance_cents"} if row.kind != "gift_card" else set()))
+                                    for row in sorted(world.payment_methods.values(), key=lambda x: x.id)
+                                    if row.customer_id == actor]}
     if op.name == "search_catalog":
         return {"skus": [public_sku(row) for row in sorted(world.skus.values(), key=lambda x: x.id)
                          if row.merchant_id == op.scope_id
