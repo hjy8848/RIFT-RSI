@@ -545,7 +545,8 @@ class OpenAIServiceAgent:
         if name not in {tool['function']['name'] for tool in service_tools(self.tool_profile)}:
             raise ServiceError('MODEL_OUTPUT_INVALID', 'Service selected a tool outside the active profile')
         action = ServiceAction.from_tool_message(raw, prompt.customer_id, prompt.observed_subject_ids,
-                                                prompt.available_merchant_scope_ids)
+                                                prompt.available_merchant_scope_ids,
+                                                retail=self.tool_profile == 'retail')
         data = action.model_dump(mode="json", exclude={"record_hash"})
         data["call"] = self.last_call.model_dump(mode="json")
         return ServiceAction.model_validate(data)
