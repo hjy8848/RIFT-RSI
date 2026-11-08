@@ -27,6 +27,10 @@ in_stock. Use one to four orders, zero to eight variants and one to three tasks.
 A task has one to three requests and optional ask_total. Each request has a type:
 set_order_address (order, to), set_default_address (to), or change_items (order,
 changes [{item, want: [variant refs in preference order]}], pay_with and otherwise).
+ask_total may be true only in a task that contains a change_items request; otherwise leave
+it false. In change_items, every variant listed in a change's want must be a variant whose
+'of' is exactly that change's item (a variant of another item is rejected), and the item must
+be one of the items of the request's order.
 Addresses are exactly one of: new, profile, or order:<order ref> (write the ref itself,
 for example order:B; never profile:something). A default address can be new or order:<ref>,
 never profile. An order's address source must never be that same order.

@@ -121,3 +121,25 @@ def test_address_source_is_constrained_by_the_plan_schema():
                 {'type': 'set_default_address', 'to': 'default'}):
         with pytest.raises(PlanError):
             parse_retail_plan(plan_with(bad))
+
+
+def test_a_total_can_only_be_asked_in_a_task_that_changes_items():
+    import pytest
+    from rift.designer.format import PlanError
+    from rift.designer.retail_format import retail_plan_scene
+    base = example_retail_plans(4, 1)[0].model_dump(mode='json')
+    order = base['orders'][0]['ref']
+    value = json.loads(json.dumps(base))
+    value['tasks'] = [{'requests': [{'type': 'set_order_address', 'order': order, 'to': 'new'}], 'ask_total': True}]
+    with pytest.raises(PlanError) as caught:
+        retail_plan_scene(value)
+    assert caught.value.code == 'ASK_TOTAL_INVALID'
+    value['tasks'][0]['ask_total'] = False
+    retail_plan_scene(value)
+
+
+def test_the_designer_prompt_states_the_rules_models_broke():
+    from rift.designer.retail_prompt import SYSTEM
+    for rule in ('ask_total may be true only', "'of' is exactly that change's item", 'never profile:something',
+                 "must never be that same order"):
+        assert rule in SYSTEM

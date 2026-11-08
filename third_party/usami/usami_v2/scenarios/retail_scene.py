@@ -95,6 +95,8 @@ def validate_scene(scene, tasks=()):
     for task in tasks:
         if not 1 <= len(task.requests) <= 3:
             raise SceneError("LIMIT", "a task needs one to three requests")
+        if task.ask_total and not any(request.type == "change_items" for request in task.requests):
+            raise SceneError("ASK_TOTAL_INVALID", "a total can only be asked in a task that changes items")
         for request in task.requests:
             if request.type != "set_default_address" and request.order not in orders:
                 raise SceneError("UNKNOWN_REF", "unknown order")
