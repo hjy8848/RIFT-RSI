@@ -71,3 +71,17 @@ def test_the_run_follows_the_platform_for_rank_count_and_identity(monkeypatch, t
         rehearsal.initial_checkpoint()
     with pytest.raises(PlatformNotReady, match='Service runtime'):
         rehearsal.runtime_factory(None)
+
+
+def test_ascend_world_size_can_be_reduced_for_shared_hosts(monkeypatch):
+    import pytest
+    from rift import hardware
+    monkeypatch.setenv('RIFT_PLATFORM', 'ascend')
+    monkeypatch.delenv('RIFT_WORLD_SIZE', raising=False)
+    assert hardware.detect().world_size == 8
+    monkeypatch.setenv('RIFT_WORLD_SIZE', '4')
+    assert hardware.detect().world_size == 4
+    for bad in ('0', '9', 'x'):
+        monkeypatch.setenv('RIFT_WORLD_SIZE', bad)
+        with pytest.raises(ValueError):
+            hardware.detect()

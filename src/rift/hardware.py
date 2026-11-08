@@ -72,7 +72,13 @@ def detect():
         else:
             name = 'rehearsal'
     if name == 'ascend':
-        return Platform('ascend', 'npu', 'NPU', ASCEND_WORLD_SIZE, ASCEND_SERIALIZATION, True)
+        # Eight NPUs unless RIFT_WORLD_SIZE asks for fewer (a shared host may have only some free;
+        # ASCEND_RT_VISIBLE_DEVICES then names them).
+        forced = os.environ.get('RIFT_WORLD_SIZE')
+        if forced is not None and (not forced.isdigit() or not 1 <= int(forced) <= ASCEND_WORLD_SIZE):
+            raise ValueError('RIFT_WORLD_SIZE on Ascend must be between 1 and 8')
+        world = int(forced) if forced else ASCEND_WORLD_SIZE
+        return Platform('ascend', 'npu', 'NPU', world, ASCEND_SERIALIZATION, True)
     if name == 'cuda':
         # Verified 2026-11-04: one VERL FSDP2 + vLLM GRPO update on 2 A6000s (docs/ENV_GPU.md).
         return Platform('cuda', 'cuda', 'GPU', _cuda_world_size(), CUDA_SERIALIZATION, True)
