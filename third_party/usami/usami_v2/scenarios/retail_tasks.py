@@ -266,6 +266,23 @@ def expected_total_text(world, task):
     return "{:.2f}".format(final.orders[goal.order_id].paid_cents / 100)
 
 
+def mentions_amount(text, amount_text):
+    """Does the message state this amount (in yuan) as a number, however it is formatted?
+
+    "99", "99.00", "CNY99", "1,299.50" and "93 yuan" all count; 13,600 for a 136.00 total does not
+    (cents mistaken for yuan is a wrong answer, not a formatting difference).
+    """
+    import re
+    target = float(amount_text)
+    for raw in re.findall(r"\d[\d,]*(?:\.\d+)?", text):
+        try:
+            if abs(float(raw.replace(",", "")) - target) < 0.005:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def evaluate_retail_task(initial, final, task, service_texts=()):
     """Business-state success (final state equals the golden state) plus the told-total check."""
     if initial.state_hash != task.world_hash:
@@ -274,7 +291,7 @@ def evaluate_retail_task(initial, final, task, service_texts=()):
     state_ok = projection(final) == projection(gold) and not invariants(final)
     told = True
     if task.ask_total:
-        told = any(expected_total_text(initial, task) in text for text in service_texts)
+        told = any(mentions_amount(text, expected_total_text(initial, task)) for text in service_texts)
     return {"state_match": state_ok, "told_total": told, "success": state_ok and told}
 
 
