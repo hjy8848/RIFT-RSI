@@ -47,8 +47,10 @@ def public_episode(record):
         from rift.schemas import Outcome
         from usami_v2.runtime.retail_runner import replay_retail_episode
         verified = replay_retail_episode(record).verified
+        # Success needs the right final state AND an episode that ended normally; a customer who left,
+        # an exhausted budget or an agent error never counts as success, whatever state was reached.
         outcome = (Outcome.UNKNOWN if not verified or record.status == 'cancelled' else
-                   Outcome.SUCCESS if record.outcome.success else Outcome.FAILURE)
+                   Outcome.SUCCESS if record.outcome.success and record.status == 'completed' else Outcome.FAILURE)
         events, executions = [], iter(record.tool_executions)
         for message in record.conversation:
             if message.role == 'user':

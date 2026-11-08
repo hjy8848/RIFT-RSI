@@ -1300,7 +1300,9 @@ def main(argv=None):
     teach_parser.add_argument('--keep-every', type=int, default=5)
     teach_parser.add_argument('--drop-references', default='')
     teach_parser.add_argument('--plan-format', choices=('legacy', 'retail'), default='legacy')
-    teach_parser.add_argument('--dedup-scope', choices=('action', 'run'), default='action')
+    teach_parser.add_argument('--dedup-scope', choices=('action', 'run'), default=None,
+        help='deduplicate decision structures within one action or across the whole run '
+             '(default: action for --plan-format retail, run for legacy)')
     teach_parser.add_argument('--group-size', type=int, default=4)
     teach_parser.add_argument('--mini-batch-size', type=int, default=16)
     teach_parser.add_argument('--epochs', type=int, default=1)

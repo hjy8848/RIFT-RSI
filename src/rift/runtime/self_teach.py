@@ -219,14 +219,22 @@ def run_solver_steps(context, checkpoint, *, action, index, seed, steps, tasks_p
     return checkpoint, history, index
 
 
+def resolve_dedup_scope(plan_format, dedup_scope=None):
+    """Legacy runs keep their cumulative deduplication; retail runs deduplicate within one action."""
+    if dedup_scope is None:
+        return 'action' if plan_format == 'retail' else 'run'
+    return dedup_scope
+
+
 def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, steps, tasks_per_step, mix_fraction,
                seed, calibrate_every=5, n_recovery=64, n_retention=64, screen_groups=1, probe_groups=2,
                lambda_retention=0.5, invalid_reward=-0.1, max_tokens=4096, constrained=True, max_failures=8,
                failure_groups=1, keep_checkpoints=0, keep_every=5, drop_references=(), init_from_run=None,
                failures_file=None, resume_from=None, eval_specs=None, eval_groups=2, eval_every=1, eval_seed=7000,
-               plan_format='legacy', dedup_scope='action'):
+               plan_format='legacy', dedup_scope=None):
     from rift.runtime.curriculum_run import _drop, sample_rows
     from rift.runtime.matched_arms import parse_pairs
+    dedup_scope = resolve_dedup_scope(plan_format, dedup_scope)
     if plan_format not in ('legacy', 'retail') or dedup_scope not in ('action', 'run'):
         raise ValueError('unknown plan format or deduplication scope')
     if plan_format == 'retail':

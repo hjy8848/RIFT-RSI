@@ -61,3 +61,39 @@ def test_two_retail_actions_certify_select_and_reward_real_plans(tmp_path, monke
         seed=1, calibrate_every=0, plan_format='retail')
     assert result['status'] == 'self_teach_completed' and len(seen['solver']) == len(seen['teacher']) == 2
     assert all(any(reward == 1.0 for reward in rewards.values()) for rewards in seen['teacher'])
+
+
+def test_deduplication_scope_defaults_keep_legacy_runs_cumulative():
+    assert self_teach.resolve_dedup_scope('legacy') == 'run'
+    assert self_teach.resolve_dedup_scope('retail') == 'action'
+    assert self_teach.resolve_dedup_scope('legacy', 'action') == 'action'
+    assert self_teach.resolve_dedup_scope('retail', 'run') == 'run'
+
+
+def test_reward_needs_a_normally_ended_episode_even_when_the_state_is_right():
+    from rift.benchmark.usami import public_episode
+    from rift.schemas import Outcome
+    from usami_v2.runtime.agents import ServiceAction
+    from usami_v2.runtime.retail_runner import run_retail_episode
+    from usami_v2.scenarios.retail_tasks import generate_retail_task, gold_operations
+
+    class NoFarewell:
+        """Asks, then does the golden work, then never speaks again: the customer never gets to finish."""
+        uses_model = False
+
+        def __init__(self, operations):
+            self.operations = list(operations)
+
+        def decide(self, prompt):
+            if not any(row.role == 'user' and 'go ahead' in (row.content or '') for row in prompt.conversation):
+                return ServiceAction(kind='reply', message='Shall I proceed?')
+            done = sum(row.role == 'tool' for row in prompt.conversation)
+            if done < len(self.operations):
+                return ServiceAction(kind='operation', operation=self.operations[done])
+            return ServiceAction(kind='operation', operation=self.operations[0])    # keeps working, never replies
+
+    world, task, _ = generate_retail_task(5, 'address_stated')
+    ops = gold_operations(world, task)[0]
+    episode = run_retail_episode(world, task, NoFarewell(ops), max_service_decisions=len(ops) + 2)
+    assert episode.state_match and episode.status != 'completed'
+    assert public_episode(episode.record).outcome is Outcome.FAILURE
