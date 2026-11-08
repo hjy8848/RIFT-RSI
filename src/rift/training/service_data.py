@@ -4,6 +4,17 @@ from rift.benchmark.private_evaluation import public_business_outcome
 from rift.training.contracts import UpdateRequest
 from rift.training.records import service_rollout
 
+
+def _replayed_outcome(episode):
+    if getattr(episode, 'protocol', None) == 'retail-episode-v1':
+        from usami_v2.runtime.retail_runner import replay_retail_episode
+        from rift.benchmark.usami import public_episode
+        verified = replay_retail_episode(episode).verified
+        return verified, public_episode(episode).outcome
+    from usami_v2.runtime.runner import replay_episode
+    verified = replay_episode(episode).verified
+    return verified, public_business_outcome(episode, verified)
+
 def prepare_service_update(package_id, certified_tasks, episodes, checkpoint, recorder, *, algorithm='policy_gradient'):
     from usami_v2.runtime.runner import replay_episode
     if not certified_tasks: raise ValueError('certified tasks required')
@@ -15,9 +26,8 @@ def prepare_service_update(package_id, certified_tasks, episodes, checkpoint, re
     for episode in episodes:
         task_id = episode.task.record_hash
         if task_id not in certified_tasks: raise ValueError('episode is not from a certified package task')
-        verified = replay_episode(episode).verified
+        verified, outcome = _replayed_outcome(episode)
         if not verified: raise ValueError('episode replay failed')
-        outcome = public_business_outcome(episode, verified)
         if outcome is Outcome.UNKNOWN: continue
         calls = [c for c in episode.model_calls if c.role == 'service']
         if not calls or recorder.verify_source(episode, checkpoint) is not True:
@@ -46,8 +56,7 @@ def prepare_service_trajectory_update(package_id, certified_tasks, episodes, che
         if task_id not in certified_tasks: raise ValueError('episode is not from a certified package task')
         # An episode whose replay disagrees (seen once in ~400: a repeated refund) has an
         # UNKNOWN outcome, so its whole GRPO group is dropped below instead of ending the run.
-        verified = replay_episode(episode).verified
-        outcome = public_business_outcome(episode, verified)
+        verified, outcome = _replayed_outcome(episode)
         if capture_store.verify_trajectory(episode, checkpoint) is not True:
             raise ValueError('generation-time trajectory evidence failed verification')
         tokens = capture_store.trajectory_for(episode, checkpoint)

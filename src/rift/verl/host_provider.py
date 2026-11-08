@@ -25,6 +25,18 @@ class NativeHostProvider:
         from rift.runtime.service_protocol import service_protocol_digest
         self.protocol_digest = (None if evaluation_protocol is None else
                                 service_protocol_digest(evaluation_protocol, tool_profile))
+    def _customer(self, task_ref, task, seed):
+        from usami_v2.scenarios.retail_tasks import RetailTask
+        if isinstance(task, RetailTask):
+            import os
+            if self.tool_profile != 'retail':
+                raise ValueError('retail tasks require the retail tool profile')
+            if os.environ.get('RIFT_CUSTOMER_URL'):
+                raise ValueError('retail tasks do not yet support an LLM customer')
+            from usami_v2.runtime.retail_runner import ScriptedRetailCustomer
+            return ScriptedRetailCustomer()
+        return self.customer_factory.create(task_ref, seed=seed)
+
     async def open_rollout(self, task_ref, group_id, session_id, tokenizer, *,
                            sampling_seed, customer_seed, rollout_id,
                            expected_checkpoint=None, group_size=None):
@@ -57,7 +69,7 @@ class NativeHostProvider:
             raise ValueError('Service checkpoint failed verification')
         # Customer randomness is common within a GRPO group so the first
         # Service prompt is identical. Only model sampling varies per member.
-        customer = self.customer_factory.create(task_ref, seed=customer_seed)
+        customer = self._customer(task_ref, task, customer_seed)
         session = NativeUsamiSession.with_verl_parser(world, task, profile, customer, tokenizer,
             self.parser_format, budget=self.budget, mode=self.mode, external_events=external_events,
             group_id=group_id, group_size=group_size, rollout_id=rollout_id,
@@ -89,7 +101,7 @@ class NativeHostProvider:
             raise ValueError('Probe task authorization failed')
         if self.checkpoint_store.verify(checkpoint) is not True:
             raise ValueError('selected Probe checkpoint failed verification')
-        customer = self.customer_factory.create(task_ref, seed=seed)
+        customer = self._customer(task_ref, task, seed)
         rollout_id = sha256(f"rift-probe:{task_ref}:{checkpoint.weights_digest}:{seed}:{protocol_ref}".encode()).hexdigest()[:32]
         sampling_scope = sha256(f"rift-probe-sampling-v1:{task_ref}:{seed}:{protocol_ref}".encode()).hexdigest()
         session = NativeUsamiSession.with_verl_parser(world, task, profile, customer, tokenizer,

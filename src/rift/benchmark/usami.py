@@ -41,6 +41,25 @@ def run_episode(*args, **kwargs):
     return native_run(*args, **kwargs)
 
 def public_episode(record):
+    if getattr(record, 'protocol', None) == 'retail-episode-v1':
+        import json
+        from rift.benchmark.public_feedback import PublicEpisode, PublicEvent
+        from rift.schemas import Outcome
+        from usami_v2.runtime.retail_runner import replay_retail_episode
+        verified = replay_retail_episode(record).verified
+        outcome = (Outcome.UNKNOWN if not verified or record.status == 'cancelled' else
+                   Outcome.SUCCESS if record.outcome.success else Outcome.FAILURE)
+        events, executions = [], iter(record.tool_executions)
+        for message in record.conversation:
+            if message.role == 'user':
+                events.append(PublicEvent('user', message.content or ''))
+            elif message.role == 'assistant' and message.content:
+                events.append(PublicEvent('assistant', message.content))
+            elif message.role == 'tool':
+                execution = next(executions)
+                events.append(PublicEvent('tool_call', json.dumps(execution.operation, sort_keys=True)))
+                events.append(PublicEvent('tool_result', json.dumps(execution.result, sort_keys=True)))
+        return PublicEpisode(tuple(events), outcome)
     from usami_v2.runtime.runner import replay_episode
     verification = replay_episode(record)
     return project_events(record, verification.verified)

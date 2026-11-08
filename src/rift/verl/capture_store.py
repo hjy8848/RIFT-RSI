@@ -82,7 +82,11 @@ class NativeCaptureStore:
             raise ValueError('invalid Episode ID')
         raw = json.loads((self.root / (episode_id + '.json')).read_text(encoding='utf-8'))
         from usami_v2.runtime.runner import EpisodeRecord
-        episode = EpisodeRecord.model_validate(raw['episode_record'])
+        if raw['episode_record'].get('protocol') == 'retail-episode-v1':
+            from usami_v2.runtime.retail_runner import RetailEpisodeRecord
+            episode = RetailEpisodeRecord.model_validate(raw['episode_record'])
+        else:
+            episode = EpisodeRecord.model_validate(raw['episode_record'])
         if episode.record_hash != episode_id or raw.get('episode_id') != episode_id:
             raise ValueError('stored native Episode hash does not match its reference')
         return episode

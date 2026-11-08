@@ -117,9 +117,18 @@ class NativeUsamiSession:
                 return result
         def run_native():
             try:
-                result = run_episode(self.world, self.task, self.profile, self.customer_agent, BlockingService(),
-                    budget=self.budget, mode=self.mode, external_events=self.external_events,
-                    cancel_check=lambda: owner._parser_failure is not None)
+                from usami_v2.scenarios.retail_tasks import RetailTask
+                if isinstance(self.task, RetailTask):
+                    from usami_v2.runtime.retail_runner import run_retail_episode
+                    result = run_retail_episode(self.world, self.task, BlockingService(), self.customer_agent,
+                        max_service_decisions=self.budget.max_service_decisions,
+                        max_tool_calls=self.budget.max_service_tool_calls,
+                        max_customer_turns=self.budget.max_customer_turns, mode=self.mode,
+                        cancel_check=lambda: owner._parser_failure is not None).record
+                else:
+                    result = run_episode(self.world, self.task, self.profile, self.customer_agent, BlockingService(),
+                        budget=self.budget, mode=self.mode, external_events=self.external_events,
+                        cancel_check=lambda: owner._parser_failure is not None)
                 asyncio.run_coroutine_threadsafe(self._events.put(('finished', result)), self._loop).result()
             except BaseException as exc:
                 asyncio.run_coroutine_threadsafe(self._events.put(('error', exc)), self._loop).result()

@@ -397,6 +397,10 @@ def service_host_provider_from_config(*, config, tokenizer, processor=None):
     for name in ("split_registry", "task_registry"):
         status = Path(manifest[name]).stat()
         registry_state.append((status.st_size, status.st_mtime_ns))
+    retail_path = Path(manifest["task_registry"]).with_name('retail-tasks.json')
+    if retail_path.exists():
+        status = retail_path.stat()
+        registry_state.append((status.st_size, status.st_mtime_ns))
     key = (manifest_path, raw, checkpoint_raw, tuple(registry_state))
     with _HOST_PROVIDER_LOCK:
         provider = _HOST_PROVIDERS.get(key)
@@ -429,6 +433,10 @@ def _build_service_host_provider(manifest, checkpoint_raw):
         raise ValueError("AgentLoop checkpoint is not in the verified FSDP manifest")
     split_registry = SplitRegistry.load(manifest["split_registry"])
     task_registry = CertifiedTaskRegistry.load(manifest["task_registry"], split_registry)
+    retail_path = Path(manifest["task_registry"]).with_name('retail-tasks.json')
+    if retail_path.exists():
+        from rift.verl.retail_registry import RetailTaskRegistry, TaskResolver
+        task_registry = TaskResolver(task_registry, RetailTaskRegistry.load(retail_path, split_registry))
     attestor = VerlServingAttestor(manifest["serving_receipts"], checkpoint_store)
     if attestor.adopt_verified(checkpoint) is not True:
         raise ValueError("AgentLoop worker could not adopt the durable VERL weight-sync receipt")

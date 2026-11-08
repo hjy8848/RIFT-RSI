@@ -1,6 +1,6 @@
-Status: implementation guide, nothing below is implemented yet (2026-11-08)
+Status: local implementation completed; final full-suite run was stopped at the user's request (2026-11-09)
 Owner: RIFT-RSI maintainers
-Last verified: 2026-11-08 (against commit 7876a05)
+Last verified: 2026-11-09 (working tree based on commit c6dca5b)
 Scope: let the Designer (the shared-weight Teacher) write the new retail tasks, and let those tasks train the Solver
 
 # 让 Designer 出新格式（retail）题：实现指导书
@@ -344,3 +344,21 @@ class RetailScene(Sealed):
 | 每道题必须改变状态 | 是 | 堵住"什么都不做也得分"的漏洞 |
 | 抄袭阈值 | 0.5 | 与旧格式相同 |
 | 新题的客户 | 脚本客户 | 大模型客户以后再做 |
+
+## 实现记录（2026-11-09）
+
+已实现并完成本地 CPU 代码验证：
+- Usami 新增 `scenarios/retail_scene.py`，包含 RetailScene 模型、稳定错误码、场景校验、确定性编译和请求翻译；13 个生成题族改为经同一场景编译器生成。原 `address_delivered` 改为 `address_delivered_mixed`，并在认证时拒绝金标准不改变状态的任务。
+- 新增 `scenarios/retail_signature.py`、`designer/retail_format.py`、`designer/retail_prompt.py` 和 `designer/retail_stage0.py`，覆盖决策签名、约束解码格式、示例、抄袭检测和方案认证。
+- 新增 `verl/retail_registry.py`；`WorldKit` 支持 retail 任务登记、持久化、重新认证、双登记簿解析和 retail family specs。增加 train/probes/heldout 三份种子分离配置。
+- `retail_runner.py` 写入 `retail-episode-v1` 回合证据，重放实际工具调用并重算结果；会话桥、公开奖励、capture 读回和训练数据构建识别该协议。
+- `stage0` 和 shared-weight self-teach 增加 `--plan-format retail`；零售模式强制 `--tool-profile retail`、只接受 retail specs，并支持 action 内去重。stage0 的零售方案可被后续训练入口重新认证。
+- 失败案例生成支持 RetailTask。旧 Designer 格式仍是默认值；未修改 `commerce/*` 业务引擎。
+
+与原指导书相比的实现选择：场景 ID 映射通过 `SceneIds` 的独立属性保存客户、地址、原 SKU 和付款方式绑定，避免用户给出的 ref 覆盖编译器内部键；公开 ref 仍直接映射到订单、订单行或变体 ID。回合记录用精简的 retail 专属记录类型，不复用包含 TaskSpec/Profile 的 `EpisodeRecord`。
+
+本地验证记录：stage0 的 64 方案 dry-run 全部认证通过；一次影响范围聚焦回归 142 项通过，场景错误码测试另有 18 项通过，回合持久化/读回和两轮 self-teach 假运行时集成也通过。dry-run 使用示例文本，所以示例抄袭命中是预期行为，不构成真实 Designer 产率证据。
+
+全量测试状态：修复一次全量运行中发现的惰性导入问题后，相关聚焦测试通过。2026-11-09 发起的最终全量 `tests` 与 `third_party/usami/tests` 回归在用户要求停止测试后中断，约运行到 8%，因此不记为全量通过。未在 GPU/NPU 上运行，未访问模型服务或网络，也未提交或推送代码。
+
+本次代码接入已完成。后续工作是逐题验证 τ-bench 115 题覆盖、实现大模型客户及更自然/含噪的客户表达，并由用户决定是否开展真实模型产率和 GPU/NPU 训练实验；这些不属于本次本地代码接入。

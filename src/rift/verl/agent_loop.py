@@ -231,6 +231,7 @@ def __getattr__(name):
                             **{key: round(value, 4) for key, value in laps.items()}}) + '\n')
                 from rift.benchmark.public_feedback import service_reward
                 from rift.benchmark.usami import public_episode
+                from usami_v2.runtime.retail_runner import replay_retail_episode
                 public = public_episode(episode)
                 reward = service_reward(public.outcome) if mode == 'train' else None
                 evidence_ref = sink.evidence_ref(episode)
@@ -254,7 +255,9 @@ def __getattr__(name):
                                   'rift_protocol_ref': kwargs.get('rift_protocol_ref'),
                                   'rift_protocol_digest': kwargs.get('rift_protocol_digest'),
                                   'rift_outcome': public.outcome.value,
-                                  'rift_replay_verified': getattr(episode, 'replay_verified', False) is True,
+                                  'rift_replay_verified': (replay_retail_episode(episode).verified
+                                      if getattr(episode, 'protocol', None) == 'retail-episode-v1'
+                                      else getattr(episode, 'replay_verified', False) is True),
                                   'rift_evidence_ref': evidence_ref})
             except BaseException:
                 if hasattr(session, 'abort'):
