@@ -35,7 +35,8 @@ def failures_from_rows(context, rows, train_refs, max_cases):
     """Failure cases for the next prompt, from TRAIN-pool episodes only (never probes or Teacher tasks)."""
     from rift.designer.failures import failure_cases
     kept = [row for row in rows if row['task_ref'] in train_refs]
-    return failure_cases(kept, context.world.task_registry, context.capture_store, max_cases=max_cases)
+    return failure_cases(kept, getattr(context.world, 'task_resolver', context.world.task_registry),
+                         context.capture_store, max_cases=max_cases)
 
 
 def prune_forks(forks, *, keep_last, keep_every):
@@ -104,16 +105,20 @@ def teacher_update(context, samples, rewards, policy_before, ledger, index):
     return backend.train(request), len(request.rollouts)
 
 
-def generate_plans(context, checkpoint, failures, *, action, seed, groups, plans, max_tokens, constrained, ledger):
+def generate_plans(context, checkpoint, failures, *, action, seed, groups, plans, max_tokens, constrained, ledger,
+                   plan_format='legacy'):
     """Wake the servers on ``checkpoint``'s weights and sample ``plans`` plans for each of ``groups`` prompts."""
     import asyncio
     from rift.designer.format import plan_schema
     runtime = context.resync(checkpoint)
     tokenizer = runtime.tokenizer
+    if plan_format == 'retail':
+        from rift.designer.retail_format import retail_plan_schema
+        plan_schema = retail_plan_schema
     schema = plan_schema() if constrained else None
     group_ids = ['a%03d-g%d' % (action, g) for g in range(groups)]
     prompt_seeds = [seed + 1000 * action + g for g in range(groups)]
-    prompts = [T.teacher_prompt_ids(tokenizer, failures, seed=s) for s in prompt_seeds]
+    prompts = [T.teacher_prompt_ids(tokenizer, failures, seed=s, plan_format=plan_format) for s in prompt_seeds]
 
     def batch(client):
         async def run():
@@ -218,9 +223,19 @@ def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, ste
                seed, calibrate_every=5, n_recovery=64, n_retention=64, screen_groups=1, probe_groups=2,
                lambda_retention=0.5, invalid_reward=-0.1, max_tokens=4096, constrained=True, max_failures=8,
                failure_groups=1, keep_checkpoints=0, keep_every=5, drop_references=(), init_from_run=None,
-               failures_file=None, resume_from=None, eval_specs=None, eval_groups=2, eval_every=1, eval_seed=7000):
+               failures_file=None, resume_from=None, eval_specs=None, eval_groups=2, eval_every=1, eval_seed=7000,
+               plan_format='legacy', dedup_scope='action'):
     from rift.runtime.curriculum_run import _drop, sample_rows
     from rift.runtime.matched_arms import parse_pairs
+    if plan_format not in ('legacy', 'retail') or dedup_scope not in ('action', 'run'):
+        raise ValueError('unknown plan format or deduplication scope')
+    if plan_format == 'retail':
+        from rift.runtime.curriculum_run import parse_task_specs
+        if context.tool_profile != 'retail' or drop_references:
+            raise ValueError('retail requires the retail tool profile and does not support drop-references')
+        for specs in (train_specs, probe_specs, eval_specs):
+            if specs and any('retail_family' not in spec for spec in parse_task_specs(specs)):
+                raise ValueError('retail runs require retail-only task specifications')
     log_path = context.root / 'self-teach.jsonl'
     if log_path.exists():
         raise FileExistsError('this run directory already has a self-teach log; start a new run directory '
@@ -270,15 +285,18 @@ def self_teach(context, *, train_specs, probe_specs, actions, groups, plans, ste
          'resumed_from': str(resume_from) if resume_from else None, 'seen_structures': len(seen)})
     try:
         for action in range(first_action, first_action + actions):
+            if dedup_scope == 'action':
+                seen = set()
             started = time.perf_counter()
             fork = checkpoint
             samples, prompt_seeds = generate_plans(context, fork, failures, action=action, seed=seed, groups=groups,
                                                    plans=plans, max_tokens=max_tokens, constrained=constrained,
-                                                   ledger=ledger)
+                                                   ledger=ledger, plan_format=plan_format)
             generated = time.perf_counter()
             for group in {s.group_id: prompt_seeds[int(s.group_id.rsplit('-g', 1)[1])] for s in samples}.items():
                 members = [s for s in samples if s.group_id == group[0]]
-                T.certify_samples(context.world, members, prompt_seed=group[1], seen=seen)
+                format_options = {'plan_format': plan_format} if plan_format != 'legacy' else {}
+                T.certify_samples(context.world, members, prompt_seed=group[1], seen=seen, **format_options)
             teacher_refs = [ref for s in samples for ref in s.selected_refs()]
             context.world.save()
             certified = time.perf_counter()

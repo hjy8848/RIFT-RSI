@@ -99,9 +99,14 @@ class TeacherLedger:
 
 # -- prompt and generation ----------------------------------------------------
 
-def teacher_prompt_ids(tokenizer, failures, *, seed, examples=2, focus=True):
+def teacher_prompt_ids(tokenizer, failures, *, seed, examples=2, focus=True, plan_format='legacy'):
     """Token ids of the chat prompt that asks for one plan; ``seed`` picks the examples and the focus."""
     from rift.designer.prompt import designer_messages
+    if plan_format == 'retail':
+        from rift.designer.retail_prompt import retail_designer_messages
+        designer_messages = retail_designer_messages
+    elif plan_format != 'legacy':
+        raise ValueError('unknown Designer plan format')
     messages = designer_messages(failures, seed=seed, examples=examples, focus=focus)
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
                                          enable_thinking=False)
@@ -153,11 +158,17 @@ def make_samples(group_id, checkpoint, prompt_ids, generations, decode, *, seed)
 
 # -- certification ------------------------------------------------------------
 
-def certify_samples(world_kit, samples, *, prompt_seed, examples=2, copy_threshold=None, seen=None):
+def certify_samples(world_kit, samples, *, prompt_seed, examples=2, copy_threshold=None, seen=None, plan_format='legacy'):
     """Certify every plan, flag copies and repeated decision structures; fills ``sample.row``."""
     from rift.designer.format import PlanError, extract_json
     from rift.designer.prompt import copy_score, example_plans
     from rift.designer.stage0 import COPY_THRESHOLD, certify_designer_plan, select_tasks
+    if plan_format == 'retail':
+        from rift.designer.retail_prompt import retail_copy_score, example_retail_plans
+        from rift.designer.retail_stage0 import certify_retail_plan
+        copy_score, example_plans, certify_designer_plan = retail_copy_score, example_retail_plans, certify_retail_plan
+    elif plan_format != 'legacy':
+        raise ValueError('unknown Designer plan format')
     threshold = COPY_THRESHOLD if copy_threshold is None else copy_threshold
     rows = []
     for sample in samples:

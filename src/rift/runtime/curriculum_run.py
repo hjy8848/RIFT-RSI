@@ -44,6 +44,15 @@ def parse_task_specs(rows):
     """
     specs = []
     for row in rows:
+        if isinstance(row, dict) and 'retail_family' in row:
+            from usami_v2.scenarios.retail_tasks import FAMILIES as RETAIL_FAMILIES
+            if (set(row) != {'retail_family', 'instances', 'seed'}
+                    or row['retail_family'] not in ('all', *RETAIL_FAMILIES)
+                    or type(row['instances']) is not int or row['instances'] < 1
+                    or type(row['seed']) is not int or row['seed'] < 0):
+                raise ValueError('retail specs require a known family, positive instances and a non-negative seed')
+            specs.append(dict(row))
+            continue
         generated = isinstance(row, dict) and 'generator' in row
         allowed = ({'generator', 'instances', 'seed', *GENERATOR_OPTIONS} if generated
                    else {'family', 'knobs', 'instances', 'seed'})
@@ -66,6 +75,8 @@ def parse_task_specs(rows):
 
 
 def spec_key(spec):
+    if 'retail_family' in spec:
+        return 'retail:' + spec['retail_family']
     if 'generator' in spec:
         options = {name: spec[name] for name in GENERATOR_OPTIONS if name in spec}
         return 'gen:' + spec['generator'] + (':' + json.dumps(options, sort_keys=True, separators=(',', ':'))
@@ -123,6 +134,7 @@ class WorldKit:
         from rift.replay.splits import SplitRegistry
         from rift.schemas import INSTANCE_DISJOINT_WITHIN_FAMILY_V1
         from rift.verl.task_registry import CertifiedTaskRegistry
+        from rift.verl.retail_registry import RetailTaskRegistry, TaskResolver
         from usami_v2.runtime.runner import EpisodeBudget
         from usami_v2.scenarios.task_certification import ProofBudget
         directory = Path(root) / 'task_registry'
@@ -138,6 +150,11 @@ class WorldKit:
             self.task_registry = CertifiedTaskRegistry(self.split_registry)
         self.split_registry.persistence_path = self.splits_path
         self.task_registry.storage_path = self.tasks_path
+        self.retail_tasks_path = directory / 'retail-tasks.json'
+        self.retail_registry = (RetailTaskRegistry.load(self.retail_tasks_path, self.split_registry)
+                                if self.retail_tasks_path.exists() else RetailTaskRegistry(self.split_registry))
+        self.retail_registry.storage_path = self.retail_tasks_path
+        self.task_resolver = TaskResolver(self.task_registry, self.retail_registry)
         self.distribution = synthetic_distribution('train')
         self.proof_budget = proof_budget or ProofBudget()
         self.episode_budget = episode_budget or EpisodeBudget()
@@ -207,6 +224,29 @@ class WorldKit:
         from rift.benchmark.families import FAMILIES
         refs = {}
         for spec in parse_task_specs(specs):
+            if 'retail_family' in spec:
+                from rift.schemas import DataPurpose, Identity, Split
+                from rift.verl.retail_registry import CertifiedRetailTask
+                from usami_v2.scenarios.retail_tasks import FAMILIES as RETAIL_FAMILIES, generate_retail_task
+                families = RETAIL_FAMILIES if spec['retail_family'] == 'all' else (spec['retail_family'],)
+                if not self.tasks_path.exists():
+                    self.save()
+                for family in families:
+                    for seed in range(spec['seed'], spec['seed'] + spec['instances']):
+                        key = f'retail:{family}:{seed}'
+                        ref = self._spec_refs.get(key)
+                        if ref is not None and ref in self.retail_registry.task_refs:
+                            self.retail_registry.resolve_record(ref)
+                        else:
+                            world, task, certificate = generate_retail_task(seed, family)
+                            lineage = json.dumps({'family': family, 'seed': seed}, sort_keys=True, separators=(',', ':'))
+                            identity = Identity(world.state_hash, task.record_hash, 'retail:gen:' + family,
+                                                lineage, Split.TRAIN, DataPurpose.TRAIN)
+                            self.retail_registry.register(CertifiedRetailTask(world, task, certificate, identity))
+                            ref = task.record_hash
+                            self._spec_refs[key] = ref
+                        refs.setdefault('retail:' + family, []).append(ref)
+                continue
             if 'generator' in spec:
                 refs.setdefault(spec_key(spec), []).extend(self.certify_generated(spec))
                 continue
@@ -225,6 +265,8 @@ class WorldKit:
     def save(self):
         self.split_registry.save()
         self.task_registry.save()
+        if self.retail_registry.task_refs or self.retail_tasks_path.exists():
+            self.retail_registry.save()
         temporary = self.spec_refs_path.with_suffix('.tmp')
         temporary.write_text(json.dumps({'patience_slack': self.patience_slack, 'refs': self._spec_refs},
                                         sort_keys=True), encoding='utf-8')
@@ -736,7 +778,8 @@ def _pool_collector(context, checkpoint, index):
                 episodes, loaded, self.capture_store, algorithm='grpo', allow_partial_groups=True)
             return request, None
 
-    return PoolCollector(LazyBatch(context, checkpoint), task_registry=context.world.task_registry,
+    return PoolCollector(LazyBatch(context, checkpoint),
+        task_registry=getattr(context.world, 'task_resolver', context.world.task_registry),
         capture_store=context.capture_store, metric_sink=context.metric_sink, round_index=index)
 
 
@@ -1256,6 +1299,8 @@ def main(argv=None):
         help='delete older fork checkpoints (about 23 GB each), keeping this many and every --keep-every-th; 0 keeps all')
     teach_parser.add_argument('--keep-every', type=int, default=5)
     teach_parser.add_argument('--drop-references', default='')
+    teach_parser.add_argument('--plan-format', choices=('legacy', 'retail'), default='legacy')
+    teach_parser.add_argument('--dedup-scope', choices=('action', 'run'), default='action')
     teach_parser.add_argument('--group-size', type=int, default=4)
     teach_parser.add_argument('--mini-batch-size', type=int, default=16)
     teach_parser.add_argument('--epochs', type=int, default=1)
@@ -1366,6 +1411,11 @@ def main(argv=None):
             drop_references=tuple(item for item in args.drop_references.split(',') if item))
     elif args.command == 'self-teach':
         from rift.runtime.self_teach import self_teach
+        if args.plan_format == 'retail':
+            specs = [load_json_argument(value) for value in (args.train_specs, args.probe_specs, args.eval_specs) if value]
+            if (args.tool_profile != 'retail' or args.drop_references
+                    or any('retail_family' not in row for group in specs for row in parse_task_specs(group))):
+                parser.error('retail requires --tool-profile retail, retail-only task specs, and no --drop-references')
         budget = UpdateBudget(args.mini_batch_size, args.epochs, args.learning_rate)
         context = _context(args, budget, args.group_size, response_length=args.response_length,
                            keep_runtime=True, persist_every=0)
@@ -1381,7 +1431,8 @@ def main(argv=None):
             drop_references=tuple(item for item in args.drop_references.split(',') if item),
             init_from_run=args.init_from_run, failures_file=args.failures_file, resume_from=args.resume_from,
             eval_specs=load_json_argument(args.eval_specs) if args.eval_specs else None,
-            eval_groups=args.eval_groups, eval_every=args.eval_every)
+            eval_groups=args.eval_groups, eval_every=args.eval_every,
+            plan_format=args.plan_format, dedup_scope=args.dedup_scope)
     elif args.command == 'eval-checkpoints':
         from rift.runtime.self_teach import eval_checkpoints
         context = _context(args, UpdateBudget(world_size, 1, 1e-6), args.group_size,

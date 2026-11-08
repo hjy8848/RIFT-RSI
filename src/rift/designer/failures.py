@@ -13,6 +13,8 @@ def _describe(world, line_id, intent):
 
 def goal_rows(world, task):
     """The hidden goals of a task with their derived answers."""
+    if getattr(task, 'protocol', None) == 'retail-task-v1':
+        return retail_goal_rows(world, task)
     intents = {row.goal_id: row for row in getattr(task.request_bundle, 'requests', ())}
     rows = []
     for goal in task.remedy_goals:
@@ -26,6 +28,37 @@ def goal_rows(world, task):
         rows.append({'item': _describe(world, goal.line_ids[0], intent), 'action': goal.requested_action,
                      'quantity': intent.quantity if intent is not None else 1,
                      'answer': f'refuse ({goal.reason_code})'})
+    return rows
+
+
+def retail_goal_rows(world, task):
+    from usami_v2.scenarios.retail_tasks import _item, _order_phrase, delegated, gold_operations
+    current, rows = delegated(world, task.customer_id), []
+    for goal in task.goals:
+        isolated = task.model_copy(update={'world_hash': current.state_hash, 'goals': (goal,), 'ask_total': False})
+        ops, next_world = gold_operations(current, isolated)
+        item = (_order_phrase(current, task.customer_id, goal.order_id)
+                if goal.order_id else 'default profile address')
+        if goal.action == 'change_items':
+            item = ' and '.join(_item(current, wish.line_id) for wish in goal.wishes)
+        if not ops:
+            answer = 'leave unchanged; requested operation is not permitted or feasible'
+        elif ops[0].name == 'cancel_order':
+            answer = 'cancel the whole order'
+        elif ops[0].name in ('modify_order_address', 'update_default_address'):
+            p = ops[0].params
+            answer = 'change address to %s, %s' % (p['street'], p['city'])
+        else:
+            op = ops[0]
+            chosen = [current.skus[row['target_sku_id']] for row in op.params['changes']]
+            names = [' '.join([*sku.attributes.values(), sku.product_family]) for sku in chosen]
+            payment = op.params['payment_method']
+            if payment == 'original':
+                payment = current.orders[goal.order_id].payment_method_id
+            method = current.payment_methods.get(payment)
+            answer = 'change to ' + ', '.join(names) + '; payment: ' + (method.kind if method else 'original')
+        rows.append({'item': item, 'action': goal.action.replace('_', ' '), 'quantity': 1, 'answer': answer})
+        current = next_world
     return rows
 
 

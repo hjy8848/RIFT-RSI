@@ -119,7 +119,7 @@ def summarize(rows):
 
 
 def vllm_generate(model, messages_list, *, seed, temperature=1.0, max_tokens=4096, tensor_parallel_size=1,
-                  constrained=True, enforce_eager=False, gpu_memory_utilization=0.9):
+                  constrained=True, enforce_eager=False, gpu_memory_utilization=0.9, plan_format='legacy'):
     """Generate one Designer response per prompt with vLLM, constrained to the plan schema."""
     from vllm import LLM, SamplingParams
     llm = LLM(model=str(model), tensor_parallel_size=tensor_parallel_size, seed=seed,
@@ -129,7 +129,11 @@ def vllm_generate(model, messages_list, *, seed, temperature=1.0, max_tokens=409
                                              enable_thinking=False) for messages in messages_list]
     extra = {}
     if constrained:
-        schema = plan_schema()
+        if plan_format == 'retail':
+            from rift.designer.retail_format import retail_plan_schema
+            schema = retail_plan_schema()
+        else:
+            schema = plan_schema()
         try:
             from vllm.sampling_params import StructuredOutputsParams
             extra = {'structured_outputs': StructuredOutputsParams(json=schema)}
@@ -141,35 +145,47 @@ def vllm_generate(model, messages_list, *, seed, temperature=1.0, max_tokens=409
     return [output.outputs[0].text for output in llm.generate(prompts, params)]
 
 
-def dry_run_generate(messages_list, *, seed):
+def dry_run_generate(messages_list, *, seed, plan_format='legacy'):
     """Generator examples in place of model output, for a CPU rehearsal of everything else."""
-    return [json.dumps(example_plans(seed + index, 1)[0].model_dump(mode='json'))
+    if plan_format == 'retail':
+        from rift.designer.retail_prompt import example_retail_plans as examples
+    else:
+        examples = example_plans
+    return [json.dumps(examples(seed + index, 1)[0].model_dump(mode='json'))
             for index in range(len(messages_list))]
 
 
-def run(world_kit, generate, failures, *, samples, seed, out_dir, examples=2, signatures=True, focus=False):
+def run(world_kit, generate, failures, *, samples, seed, out_dir, examples=2, signatures=True, focus=False, plan_format='legacy'):
+    messages_fn, certify_fn, copy_fn, examples_fn = designer_messages, certify_designer_plan, copy_score, example_plans
+    if plan_format == 'retail':
+        from rift.designer.retail_prompt import retail_designer_messages, retail_copy_score, example_retail_plans
+        from rift.designer.retail_stage0 import certify_retail_plan
+        messages_fn, certify_fn, copy_fn, examples_fn = (retail_designer_messages, certify_retail_plan,
+                                                         retail_copy_score, example_retail_plans)
+    elif plan_format != 'legacy':
+        raise ValueError('unknown Designer plan format')
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     plans_path = out_dir / 'designer-plans.jsonl'
     if plans_path.exists():
         raise FileExistsError('this run directory already has Designer plans; use a new one')
-    prompts = [designer_messages(failures, seed=seed + index, examples=examples, focus=focus)
+    prompts = [messages_fn(failures, seed=seed + index, examples=examples, focus=focus)
                for index in range(samples)]
     texts = generate(prompts)
     if len(texts) != len(prompts):
         raise ValueError('the generator returned a different number of responses')
     rows = []
     for index, text in enumerate(texts):
-        row = certify_designer_plan(world_kit, text, f'designer-{seed}-{index:04d}', seed + index,
+        row = certify_fn(world_kit, text, f'designer-{seed}-{index:04d}', seed + index,
                                     signatures=signatures)
         row['response'] = text
         parsed = None
         try:
             parsed = extract_json(text)
-            row['copy_score'] = copy_score(parsed, example_plans(seed + index, examples))
+            row['copy_score'] = copy_fn(parsed, examples_fn(seed + index, examples))
         except PlanError:
             row['copy_score'] = None
-        if focus:
+        if focus and plan_format == 'legacy':
             from rift.designer.focus import focus_for, focus_hit
             row['focus'] = focus_for(seed + index)
             row['focus_hit'] = None if parsed is None else focus_hit(row['focus'], parsed)
@@ -201,6 +217,18 @@ def certify_saved_plans(world_kit, path, *, selected_only=False):
         if not row['task_refs']:
             continue
         plan = row['plan']
+        if 'gift_card_balance_cents' in plan:
+            from rift.designer.retail_stage0 import certify_retail_plan
+            result = certify_retail_plan(world_kit, plan, row['plan_id'], row['world_seed'], signatures=False)
+            found = result['task_refs']
+            if result['status'] != 'certified' or found != row['task_refs']:
+                raise ValueError(f"retail plan {row['plan_id']} no longer certifies to the same tasks")
+            if selected_only:
+                if 'selected' not in row:
+                    raise ValueError('this stage-0 file has no selection; rerun stage 0 or drop --designer-selected-only')
+                found = [ref for ref, keep in zip(found, row['selected']) if keep]
+            refs.extend(found)
+            continue
         proposal = Proposal(row['plan_id'], plan['hypothesis'], world_draft=plan['world_draft'],
                             challenges=tuple(plan['challenges']))
         result = world_kit.certify_plan(proposal, row['world_seed'],
@@ -239,20 +267,22 @@ def main(argv=None):
     parser.add_argument('--focus', action='store_true',
         help='tell each plan what to cover (action, rule, structure, side, naming), chosen by seed')
     parser.add_argument('--dry-run', action='store_true', help='use generator examples instead of a model')
+    parser.add_argument('--plan-format', choices=('legacy', 'retail'), default='legacy')
     args = parser.parse_args(argv)
     failures = json.loads(Path(args.failures).read_text(encoding='utf-8'))['cases'] if args.failures else []
     if args.dry_run:
-        generate = lambda prompts: dry_run_generate(prompts, seed=args.seed)
+        generate = lambda prompts: dry_run_generate(prompts, seed=args.seed, plan_format=args.plan_format)
     elif args.designer_model:
         generate = lambda prompts: vllm_generate(args.designer_model, prompts, seed=args.seed,
             temperature=args.temperature, max_tokens=args.max_tokens,
             tensor_parallel_size=args.tensor_parallel_size, constrained=not args.unconstrained,
-            enforce_eager=args.enforce_eager, gpu_memory_utilization=args.gpu_memory_utilization)
+            enforce_eager=args.enforce_eager, gpu_memory_utilization=args.gpu_memory_utilization,
+            plan_format=args.plan_format)
     else:
         parser.error('--designer-model is required unless --dry-run')
     kit = WorldKit(args.run_root, patience_slack=args.patience_slack)
     report = run(kit, generate, failures, samples=args.samples, seed=args.seed, out_dir=args.run_root,
-                 examples=args.examples, signatures=not args.no_signatures, focus=args.focus)
+                 examples=args.examples, signatures=not args.no_signatures, focus=args.focus, plan_format=args.plan_format)
     print(json.dumps(report, indent=2, sort_keys=True))
 
 
