@@ -17,7 +17,7 @@ def test_every_family_generates_certifies_and_is_reproducible(family):
         assert evidence["certified"]
         again_world, again_task, _ = generate_retail_task(seed, family)
         assert again_task == task and again_world == world
-        assert evidence["changes_state"] == (family != "address_delivered")
+        assert evidence["changes_state"]
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -88,8 +88,8 @@ def test_addresses_come_from_other_orders_and_the_profile():
     world, task, _ = generate_retail_task(5, "address_profile")
     _, gold = gold_operations(world, task)
     assert gold.orders[task.goals[0].order_id].shipping_address == world.customers[task.customer_id].default_address
-    world, task, _ = generate_retail_task(5, "address_delivered")
-    assert "address" in task.customer_request and projection(gold_operations(world, task)[1]) == projection(world)
+    world, task, _ = generate_retail_task(5, "address_delivered_mixed")
+    assert "address" in task.customer_request and projection(gold_operations(world, task)[1]) != projection(world)
 
 
 def test_public_text_names_no_internal_ids_and_is_deterministic():

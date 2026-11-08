@@ -7,10 +7,12 @@ customer's own lines, as the structured request would.
 """
 import json
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 
-from usami_v2.runtime.agents import AgentMessage, ServicePrompt
-from usami_v2.runtime.runner import _execution, _public_ids
+from usami_v2.commerce.models import Operation, World
+from usami_v2.contracts import Sealed
+from usami_v2.runtime.agents import AgentCall, AgentMessage, ServicePrompt
+from usami_v2.runtime.runner import ToolExecution, _execution, _public_ids
 from usami_v2.scenarios.retail_tasks import RetailTask, delegated, evaluate_retail_task
 
 
@@ -38,10 +40,65 @@ class RetailEpisode:
     transcript: List[Any] = field(default_factory=list)
     tool_log: List[Tuple[str, dict]] = field(default_factory=list)
     final_world: Any = None
+    record: Any = None
+
+
+class RetailMessage(Sealed):
+    text: str
+
+
+class RetailOutcome(Sealed):
+    state_match: bool
+    told_total: bool
+    success: bool
+
+
+class RetailEpisodeRecord(Sealed):
+    protocol: Literal["retail-episode-v1"] = "retail-episode-v1"
+    task: RetailTask
+    initial_world: World
+    max_service_decisions: int
+    max_tool_calls: int
+    max_customer_turns: int
+    model_calls: Tuple[AgentCall, ...]
+    tool_executions: Tuple[ToolExecution, ...]
+    service_messages: Tuple[RetailMessage, ...]
+    conversation: Tuple[AgentMessage, ...]
+    status: str
+    terminal_reason: str
+    final_world: World
+    outcome: RetailOutcome
+
+
+class RetailEpisodeReplay(Sealed):
+    verified: bool
+    errors: Tuple[str, ...] = ()
+
+
+def replay_retail_episode(record):
+    errors = []
+    current = delegated(record.initial_world, record.task.customer_id)
+    try:
+        if record.initial_world.state_hash != record.task.world_hash:
+            raise ValueError("task and initial world differ")
+        for saved in record.tool_executions:
+            operation = Operation.model_validate(saved.operation)
+            current, actual = _execution(current, record.task.customer_id, operation, saved.request["id"], "reference")
+            if actual != saved:
+                raise ValueError("tool execution evidence differs")
+        if current != record.final_world:
+            raise ValueError("final world differs")
+        expected = evaluate_retail_task(record.initial_world, current, record.task,
+                                        [message.text for message in record.service_messages])
+        if RetailOutcome(**expected) != record.outcome:
+            raise ValueError("retail outcome differs")
+    except (ValueError, KeyError, TypeError) as exc:
+        errors.append(str(exc))
+    return RetailEpisodeReplay(verified=not errors, errors=tuple(errors))
 
 
 def run_retail_episode(world, task: RetailTask, service, customer=None, *, max_service_decisions=24,
-                       max_tool_calls=16, max_customer_turns=6, patience=None, mode="reference"):
+                       max_tool_calls=16, max_customer_turns=6, patience=None, mode="reference", cancel_check=None):
     task = task.checked()
     if world.state_hash != task.world_hash:
         raise ValueError("task belongs to another world")
@@ -50,6 +107,7 @@ def run_retail_episode(world, task: RetailTask, service, customer=None, *, max_s
     conversation = [AgentMessage(role="user", content=task.customer_request)]
     observed = {task.customer_id}
     service_texts, tool_log = [], []
+    executions, calls = [], []
     decisions = tools = turns = 0
     status, reason = "budget_exhausted", "service_decision_budget_exhausted"
     while decisions < max_service_decisions and tools < max_tool_calls:
@@ -63,11 +121,19 @@ def run_retail_episode(world, task: RetailTask, service, customer=None, *, max_s
         try:
             action = service.decide(prompt)
         except Exception as exc:
-            status, reason = "agent_error", type(exc).__name__ + ": " + str(exc)
+            call = getattr(service, "last_call", None)
+            if call is not None:
+                calls.append(call)
+            status = "cancelled" if cancel_check is not None and cancel_check() else "agent_error"
+            reason = type(exc).__name__ + ": " + str(exc)
             break
         decisions += 1
+        call = action.call or getattr(service, "last_call", None)
+        if call is not None:
+            calls.append(call)
         if action.kind == "operation" and action.operation is not None:
             current, row = _execution(current, task.customer_id, action.operation, "retail_request_%d" % tools, mode)
+            executions.append(row)
             tools += 1
             tool_log.append((action.operation.name, row.result))
             observed.update(_public_ids(row.result))
@@ -95,7 +161,12 @@ def run_retail_episode(world, task: RetailTask, service, customer=None, *, max_s
             status, reason = "service_protocol_error", "invalid Service decision"
             break
     outcome = evaluate_retail_task(world, current, task, service_texts)
+    record = RetailEpisodeRecord(task=task, initial_world=world, max_service_decisions=max_service_decisions,
+        max_tool_calls=max_tool_calls, max_customer_turns=max_customer_turns, model_calls=tuple(calls),
+        tool_executions=tuple(executions), service_messages=tuple(RetailMessage(text=text) for text in service_texts),
+        conversation=tuple(conversation), status=status, terminal_reason=reason, final_world=current,
+        outcome=RetailOutcome(**outcome))
     return RetailEpisode(status=status, terminal_reason=reason, success=outcome["success"] and status == "completed",
                          state_match=outcome["state_match"], told_total=outcome["told_total"],
                          service_decisions=decisions, tool_calls=tools, transcript=conversation, tool_log=tool_log,
-                         final_world=current)
+                         final_world=current, record=record)

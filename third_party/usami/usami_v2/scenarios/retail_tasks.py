@@ -111,7 +111,8 @@ def _order_phrase(world, customer_id, order_id):
 
 def _variant_phrase(world, original_sku_id, target_sku_id):
     original, target = world.skus[original_sku_id], world.skus[target_sku_id]
-    names = sorted(name for name, value in target.attributes.items() if original.attributes.get(name) != value)
+    different = sorted(name for name, value in target.attributes.items() if original.attributes.get(name) != value)
+    names = different + sorted(name for name in target.attributes if name not in different)
     rivals = [row for row in world.skus.values() if row.product_family == original.product_family
               and row.merchant_id == original.merchant_id and row.id != original.id]
     for size in range(1, len(names) + 1):
@@ -328,6 +329,8 @@ def certify_retail_task(world, task):
     if invariants(gold):
         errors.append("golden state violates invariants")
     changes = projection(gold) != projection(world)
+    if not changes:
+        raise ValueError("TASK_NO_STATE_CHANGE: the golden state equals the initial state")
     # A trap: doing what the customer asked first, literally, without reading the situation, ends elsewhere.
     naive = delegated(world, task.customer_id)
     for goal in task.goals:
@@ -344,7 +347,7 @@ def certify_retail_task(world, task):
             naive = decision.expected_state
     trap = projection(naive) != projection(gold)
     if errors:
-        raise ValueError("; ".join(errors))
+        raise ValueError("ENGINE_REFERENCE_MISMATCH: " + "; ".join(errors))
     return {"certified": True, "gold_operations": [op.model_dump(mode="json") for op in ops],
             "changes_state": changes, "has_trap": trap}
 
@@ -360,7 +363,7 @@ def retail_task(world, customer_id, family, goals, *, ask_total=False, task_id=N
 
 # --------------------------------------------------------------------------- generator
 
-FAMILIES = ("address_stated", "address_from_order", "address_profile", "default_from_order", "address_delivered",
+FAMILIES = ("address_stated", "address_from_order", "address_profile", "default_from_order", "address_delivered_mixed",
             "address_all_pending", "items_simple", "items_gift_card_fallback", "items_stock_fallback",
             "items_two_lines", "items_cheaper_to_gift_card", "items_fallback_cancel", "items_ask_total")
 
@@ -382,124 +385,67 @@ def _address(rng, used):
             return AddressFields(street=street, city=city, state=state, postal_code=postal)
 
 
-def generate_retail_task(seed, family):
-    """(world, task, evidence) for one family; every number and name derives from the seed."""
-    from .builder import build_world
-    from .schema import (Attribute, AddressSpec, BuildBudget, CustomerAddress, IntegerRange, LineVariable,
-                         OrderVariable, PaymentVariable, ScenarioSpec, SKUVariable, StockConstraint,
-                         WarehouseVariable)
+def family_scene(family, rng):
+    """Sample the decision variables for a family; compilation supplies the world."""
+    from .retail_scene import (RetailScene, SceneChange, SceneItem, SceneOrder, SceneRequest,
+                               SceneTask, SceneVariant)
     if family not in FAMILIES:
         raise ValueError("unknown retail family")
-    rng = random.Random("retail:{}:{}".format(family, seed))
-
-    def fixed(value):
-        return IntegerRange(low=value, high=value)
-
     names = rng.sample(_PRODUCTS, 4)
-    base = {n: rng.randrange(30, 90) * 100 for n in names}
-    up = {n: rng.randrange(8, 25) * 100 for n in names}
-    down = {n: rng.randrange(5, 15) * 100 for n in names}
-    colors = {n: rng.sample(_COLORS, 3) for n in names}
-    price = {}
-    skus, stock = [], []
-    # which variants have no stock: decided by the family
-    dead = {"items_stock_fallback": {(0, 1)}, "items_fallback_cancel": {(0, 1), (0, 2), (1, 1), (1, 2)}}.get(family, set())
-    for fi, name in enumerate(names):
-        for vi, delta in enumerate((0, up[name], -down[name])):
-            alias = "{}{}".format("abcd"[fi], vi)
-            price[alias] = base[name] + delta
-            skus.append(SKUVariable(alias=alias, family=name, price_cents=fixed(price[alias]), attributes=(
-                Attribute(name="color", value=colors[name][vi]), Attribute(name="tier", value=_TIERS[vi]))))
-            if (fi, vi) in dead:
-                stock.append(StockConstraint(sku_alias=alias, warehouse_alias="w", quantity=fixed(0)))
-    extra_up = price["a1"] - price["a0"]
-    if family == "items_gift_card_fallback":
-        balance = rng.randrange(1, max(2, extra_up // 100)) * 100 - 100 if extra_up > 200 else 0
-        balance = max(0, min(balance, extra_up - 100))
-    elif family == "items_cheaper_to_gift_card":
-        balance = rng.randrange(0, 40) * 100
-    else:
-        balance = rng.randrange(60, 200) * 100
-    used = set()
-    home, a1, a2, a3 = (_address(rng, used) for _ in range(4))
-
-    def line(alias, sku, qty=1):
-        return LineVariable(alias=alias, original_sku=sku, quantity=fixed(qty), paid_cents=fixed(price[sku] * qty))
-
-    def addr(value):
-        return AddressSpec(street=value.street, city=value.city, state=value.state, postal_code=value.postal_code)
-
-    spec = ScenarioSpec(
-        scenario_id="retail-" + family, provenance_kind="offline_fixture", customer_aliases=("me",),
-        skus=tuple(skus),
-        warehouses=(WarehouseVariable(alias="w", delivery_days=fixed(2), delivery_fee_cents=fixed(0)),),
-        orders=(
-            OrderVariable(alias="o1", customer_alias="me", delivered_days_ago=fixed(3), fulfillment_status="unshipped",
-                          lines=(line("l1", "a0"), line("l2", "b0")), payment_alias="cc", shipping_address=addr(a1)),
-            OrderVariable(alias="o2", customer_alias="me", delivered_days_ago=fixed(4), fulfillment_status="unshipped",
-                          lines=(line("l3", "c0"),), payment_alias="pp", shipping_address=addr(a2)),
-            OrderVariable(alias="o3", customer_alias="me", delivered_days_ago=fixed(5),
-                          lines=(line("l4", "d0"),), payment_alias="gc", shipping_address=addr(a3)),
-        ),
-        payment_methods=(PaymentVariable(alias="gc", customer_alias="me", kind="gift_card", balance_cents=balance),
-                         PaymentVariable(alias="cc", customer_alias="me", kind="credit_card"),
-                         PaymentVariable(alias="pp", customer_alias="me", kind="paypal")),
-        default_addresses=(CustomerAddress(customer_alias="me", address=addr(home)),),
-        default_stock=fixed(3), stock=tuple(stock))
-    built = build_world(spec, seed, BuildBudget(max_nodes=8))
-    if built.status != "SAT":
-        raise ValueError("retail scene is not constructible: " + built.reason)
-    world, ids = built.world, dict(built.private_aliases)
-    me = ids["me"]
-
-    def goal(**kw):
-        kw.setdefault("goal_id", "g{}".format(len(goals) + 1))
-        return RetailGoal(**kw)
-
-    goals = []
-    target = _address(rng, used)
+    base = [rng.randrange(30, 90) * 100 for _ in names]
+    up = [rng.randrange(8, 25) * 100 for _ in names]
+    down = [rng.randrange(5, 15) * 100 for _ in names]
+    items = [SceneItem(ref=f"I{i}", product=name, price_cents=base[i]) for i, name in enumerate(names)]
+    orders = (SceneOrder(ref="A", status="unshipped", pays_with="credit_card", items=tuple(items[:2])),
+              SceneOrder(ref="B", status="unshipped", pays_with="paypal", items=(items[2],)),
+              SceneOrder(ref="C", status="delivered", pays_with="gift_card", items=(items[3],)))
+    # Only variants that can actually appear in requests are needed.
+    variants = []
+    for i in range(2):
+        for v, delta in enumerate((up[i], -down[i]), 1):
+            dead = (family == "items_stock_fallback" and i == 0 and v == 1) or family == "items_fallback_cancel"
+            variants.append(SceneVariant(ref=f"V{i}{v}", of=f"I{i}", price_cents=base[i] + delta,
+                                         in_stock=not dead))
+    balance = rng.randrange(0, max(1, up[0] // 100)) * 100 if family == "items_gift_card_fallback" else rng.randrange(60, 200) * 100
+    scene = RetailScene(gift_card_balance_cents=balance, orders=orders, variants=tuple(variants))
+    def address(order, to):
+        return SceneRequest(type="set_order_address", order=order, to=to)
+    def change(changes, pay=("original",), fallback="nothing"):
+        return SceneRequest(type="change_items", order="A", changes=tuple(SceneChange(item=item, want=tuple(want))
+                            for item, want in changes), pay_with=pay, otherwise=fallback)
     ask = False
     if family == "address_stated":
-        goals.append(goal(action="set_order_address", order_id=ids["o1"], address=target))
+        requests = (address("A", "new"),)
     elif family == "address_from_order":
-        goals.append(goal(action="set_order_address", order_id=ids["o2"], address=a3, address_source="other_order",
-                          source_order_id=ids["o3"]))
+        requests = (address("B", "order:C"),)
     elif family == "address_profile":
-        goals.append(goal(action="set_order_address", order_id=ids["o1"], address=home, address_source="profile"))
+        requests = (address("A", "profile"),)
     elif family == "default_from_order":
-        goals.append(goal(action="set_default_address", address=a2, address_source="other_order",
-                          source_order_id=ids["o2"]))
-    elif family == "address_delivered":
-        goals.append(goal(action="set_order_address", order_id=ids["o3"], address=target))
+        requests = (SceneRequest(type="set_default_address", to="order:B"),)
+    elif family == "address_delivered_mixed":
+        requests = (address("C", "new"), address("A", "new"))
     elif family == "address_all_pending":
-        goals.append(goal(action="set_order_address", order_id=ids["o1"], address=target))
-        goals.append(goal(action="set_order_address", order_id=ids["o2"], address=target))
+        requests = (address("A", "new"), address("B", "new"))
     elif family in ("items_simple", "items_ask_total"):
-        goals.append(goal(action="change_items", order_id=ids["o1"],
-                          wishes=(ItemWish(line_id=ids["l1"], targets=(ids["a1"],)),),
-                          payment_preferences=("original",)))
+        requests = (change((("I0", ("V01",)),)),)
         ask = family == "items_ask_total"
     elif family == "items_gift_card_fallback":
-        goals.append(goal(action="change_items", order_id=ids["o1"],
-                          wishes=(ItemWish(line_id=ids["l1"], targets=(ids["a1"],)),),
-                          payment_preferences=(ids["gc"], ids["pp"])))
+        requests = (change((("I0", ("V01",)),), ("gift_card", "paypal")),)
     elif family == "items_stock_fallback":
-        goals.append(goal(action="change_items", order_id=ids["o1"],
-                          wishes=(ItemWish(line_id=ids["l1"], targets=(ids["a1"], ids["a2"])),),
-                          payment_preferences=("original",)))
+        requests = (change((("I0", ("V01", "V02")),)),)
     elif family == "items_two_lines":
-        goals.append(goal(action="change_items", order_id=ids["o1"],
-                          wishes=(ItemWish(line_id=ids["l1"], targets=(ids["a1"],)),
-                                  ItemWish(line_id=ids["l2"], targets=(ids["b2"],))),
-                          payment_preferences=("original",)))
+        requests = (change((("I0", ("V01",)), ("I1", ("V12",)))),)
     elif family == "items_cheaper_to_gift_card":
-        goals.append(goal(action="change_items", order_id=ids["o1"],
-                          wishes=(ItemWish(line_id=ids["l1"], targets=(ids["a2"],)),),
-                          payment_preferences=(ids["gc"], "original")))
-    else:                                                                    # items_fallback_cancel
-        goals.append(goal(action="change_items", order_id=ids["o1"],
-                          wishes=(ItemWish(line_id=ids["l1"], targets=(ids["a1"], ids["a2"])),
-                                  ItemWish(line_id=ids["l2"], targets=(ids["b1"], ids["b2"]))),
-                          payment_preferences=("original",), fallback="cancel_order"))
-    task = retail_task(world, me, family, tuple(goals), ask_total=ask, task_id="{}-{}".format(family, seed))
+        requests = (change((("I0", ("V02",)),), ("gift_card", "original")),)
+    else:
+        requests = (change((("I0", ("V01", "V02")), ("I1", ("V11", "V12"))), fallback="cancel_order"),)
+    return scene, SceneTask(requests=requests, ask_total=ask)
+
+
+def generate_retail_task(seed, family):
+    """Generate via the same scene compiler used for Designer-authored tasks."""
+    from .retail_scene import compile_scene, scene_task
+    scene, description = family_scene(family, random.Random(f"retail:{family}:{seed}"))
+    world, ids = compile_scene(scene, seed)
+    task = scene_task(world, ids, description, scene=scene, family=family, task_id=f"{family}-{seed}")
     return world, task, certify_retail_task(world, task)
