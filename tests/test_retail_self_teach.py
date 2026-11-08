@@ -97,3 +97,27 @@ def test_reward_needs_a_normally_ended_episode_even_when_the_state_is_right():
     episode = run_retail_episode(world, task, NoFarewell(ops), max_service_decisions=len(ops) + 2)
     assert episode.state_match and episode.status != 'completed'
     assert public_episode(episode.record).outcome is Outcome.FAILURE
+
+
+def test_address_source_is_constrained_by_the_plan_schema():
+    import pytest
+    from rift.designer.format import PlanError
+    from rift.designer.retail_format import parse_retail_plan
+    base = example_retail_plans(3, 1)[0].model_dump(mode='json')
+    order = base['orders'][0]['ref']
+
+    def plan_with(request):
+        value = json.loads(json.dumps(base))
+        value['tasks'] = [{'requests': [request], 'ask_total': False}]
+        return value
+    for good in ({'type': 'set_order_address', 'order': order, 'to': 'new'},
+                 {'type': 'set_order_address', 'order': order, 'to': 'profile'},
+                 {'type': 'set_order_address', 'order': order, 'to': 'order:' + order},   # schema allows it; validate_scene refuses
+                 {'type': 'set_default_address', 'to': 'new'}):
+        parse_retail_plan(plan_with(good))
+    for bad in ({'type': 'set_order_address', 'order': order, 'to': 'profile:1'},
+                {'type': 'set_order_address', 'order': order, 'to': 'order:'},
+                {'type': 'set_default_address', 'to': 'profile'},
+                {'type': 'set_default_address', 'to': 'default'}):
+        with pytest.raises(PlanError):
+            parse_retail_plan(plan_with(bad))

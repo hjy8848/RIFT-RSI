@@ -31,15 +31,19 @@ class PlanChange(_Strict):
     want: List[str] = Field(min_length=1)
 
 
+REF = r"[A-Za-z0-9_-]{1,24}"
+
+
 class PlanOrderAddress(_Strict):
     type: Literal["set_order_address"]
     order: str
-    to: str
+    # Constrained decoding enforces this pattern: no free-form "profile:1" and the like.
+    to: str = Field(pattern=r"^(new|profile|order:%s)$" % REF)
 
 
 class PlanDefaultAddress(_Strict):
     type: Literal["set_default_address"]
-    to: str
+    to: str = Field(pattern=r"^(new|order:%s)$" % REF)
 
 
 class PlanChangeItems(_Strict):
