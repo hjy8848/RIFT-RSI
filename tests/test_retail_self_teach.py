@@ -143,3 +143,37 @@ def test_the_designer_prompt_states_the_rules_models_broke():
     for rule in ('ask_total may be true only', "'of' is exactly that change's item", 'never profile:something',
                  "must never be that same order"):
         assert rule in SYSTEM
+
+
+def test_episode_diagnostics_understand_retail_records():
+    from rift.runtime.diagnose_episodes import classify_episode, confirmation_order_compliance, episode_metrics
+    from usami_v2.runtime.agents import ServiceAction
+    from usami_v2.runtime.retail_runner import run_retail_episode
+    from usami_v2.scenarios.retail_tasks import generate_retail_task, gold_operations
+
+    class Script:
+        uses_model = False
+
+        def __init__(self, ops, ask_first):
+            self.ops, self.ask_first = list(ops), ask_first
+
+        def decide(self, prompt):
+            confirmed = any(row.role == 'user' and 'go ahead' in (row.content or '') for row in prompt.conversation)
+            if self.ask_first and not confirmed:
+                return ServiceAction(kind='reply', message='Shall I proceed?')
+            done = sum(row.role == 'tool' for row in prompt.conversation)
+            if done < len(self.ops):
+                return ServiceAction(kind='operation', operation=self.ops[done])
+            return ServiceAction(kind='reply', message='Done.')
+
+    world, task, _ = generate_retail_task(6, 'address_stated')
+    ops = gold_operations(world, task)[0]
+    asked = run_retail_episode(world, task, Script(ops, True)).record
+    assert confirmation_order_compliance(asked) is True
+    assert classify_episode(asked) == 'success'
+    assert episode_metrics(asked)['tool_calls'] == len(ops)
+    rushed = run_retail_episode(world, task, Script(ops, False)).record
+    assert confirmation_order_compliance(rushed) is False
+    idle = run_retail_episode(world, task, Script([], True)).record
+    assert confirmation_order_compliance(idle) is None
+    assert classify_episode(idle) == 'customer_finished_unsuccessful'

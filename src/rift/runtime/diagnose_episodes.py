@@ -4,7 +4,13 @@ import argparse
 from pathlib import Path
 
 
+def _is_retail(episode):
+    return getattr(episode, "protocol", None) == "retail-episode-v1"
+
+
 def _business_success(episode):
+    if _is_retail(episode):
+        return bool(episode.outcome.success) and episode.status == "completed"
     return getattr(episode.outcome, "business_goal_success", None)
 
 
@@ -35,7 +41,7 @@ def classify_episode(episode):
         return "agent_error"
     if status == "budget_exhausted":
         return "budget_exhausted"
-    if status == "customer_finished":
+    if status == "customer_finished" or (_is_retail(episode) and status == "completed"):
         if _business_success(episode) is True:
             return "success"
         if _business_success(episode) is False:
@@ -75,6 +81,19 @@ def episode_metrics(episode):
 def confirmation_order_compliance(episode):
     """Return whether a reply and Customer turn preceded the first state-changing tool."""
     reply_seen = customer_after_reply = False
+    if _is_retail(episode):
+        # A retail record keeps the public conversation: tool messages and executions are in step.
+        executions = iter(episode.tool_executions)
+        for message in episode.conversation[1:]:
+            if message.role == "assistant" and message.content and not message.tool_calls:
+                reply_seen = True
+            elif message.role == "user" and reply_seen:
+                customer_after_reply = True
+            elif message.role == "tool":
+                execution = next(executions, None)
+                if execution is not None and execution.before_state_hash != execution.after_state_hash:
+                    return reply_seen and customer_after_reply
+        return None
     for event in episode.events:
         if event.kind == 'service_reply':
             reply_seen = True
