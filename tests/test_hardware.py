@@ -85,3 +85,23 @@ def test_ascend_world_size_can_be_reduced_for_shared_hosts(monkeypatch):
         monkeypatch.setenv('RIFT_WORLD_SIZE', bad)
         with pytest.raises(ValueError):
             hardware.detect()
+
+
+def test_ascend_rollout_parallelism_defaults_to_all_ranks_and_can_be_overridden(monkeypatch):
+    import pytest
+    from rift.runtime import ascend_910b3 as runtime
+    from rift import hardware
+    monkeypatch.setenv('RIFT_PLATFORM', 'ascend')
+    monkeypatch.setenv('RIFT_WORLD_SIZE', '4')
+    hardware.reset()
+    monkeypatch.delenv('RIFT_ROLLOUT_TP', raising=False)
+    assert runtime._rollout_tensor_parallel_size(4) == 4
+    monkeypatch.setenv('RIFT_ROLLOUT_TP', '1')
+    assert runtime._rollout_tensor_parallel_size(4) == 1
+    monkeypatch.setenv('RIFT_ROLLOUT_TP', '2')
+    assert runtime._rollout_tensor_parallel_size(4) == 2
+    for bad in ('3', '8', 'x'):
+        monkeypatch.setenv('RIFT_ROLLOUT_TP', bad)
+        with pytest.raises(ValueError):
+            runtime._rollout_tensor_parallel_size(4)
+    hardware.reset()

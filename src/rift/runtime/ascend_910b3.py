@@ -55,9 +55,12 @@ def _rollout_tensor_parallel_size(world_size):
     GPU; replicas then use every rank whatever the (often odd) number of free GPUs.
     """
     from rift import hardware
-    if hardware.current().name == "ascend":
-        return world_size
     forced = os.environ.get("RIFT_ROLLOUT_TP")
+    if hardware.current().name == "ascend" and not forced:
+        return world_size
+    if hardware.current().name == "ascend" and (not forced.isdigit() or int(forced) not in (1, 2, 4, 8)
+                                                or world_size % int(forced)):
+        raise ValueError(f"rollout tensor parallelism {forced} must be 1, 2, 4 or 8 and divide {world_size} ranks")
     size = int(forced) if forced else 1
     if size not in (1, 2, 4, 8) or world_size % size:
         raise ValueError(f"rollout tensor parallelism {size} must be 1, 2, 4 or 8 and divide {world_size} ranks")
